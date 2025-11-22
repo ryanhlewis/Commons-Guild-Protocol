@@ -1,4 +1,5 @@
 import WebSocket from "ws"; // In browser this is native, but for Node/Tests we need 'ws'
+import { EventEmitter } from "events";
 import {
     GuildEvent,
     GuildId,
@@ -19,18 +20,22 @@ import {
     EditMessage,
     DeleteMessage,
     ForkFrom,
-    EphemeralPolicy
+    EphemeralPolicy,
+    EphemeralPolicyUpdate,
+    validateEvent
 } from "@cgp/core";
 
-export class CgpClient {
+export class CgpClient extends EventEmitter {
     private relays: string[];
     private sockets: WebSocket[] = [];
-    private listeners = new Map<string, (event: GuildEvent) => void>();
     private keyPair?: { pub: string; priv: Uint8Array };
     private state = new Map<GuildId, GuildState>();
     private seenEvents = new Set<string>();
+    private pendingEvents = new Map<GuildId, Map<number, GuildEvent>>();
+    private server: any;
 
     constructor(config: { relays: string[]; keyPair?: { pub: string; priv: Uint8Array } }) {
+        super();
         this.relays = config.relays;
         this.keyPair = config.keyPair;
     }
@@ -82,26 +87,33 @@ export class CgpClient {
         console.log(`Client listening on port ${port}`);
 
         wss.on("connection", (socket) => {
+            console.log(`Incoming connection on port ${port}`);
             this.sockets.push(socket);
-            socket.on("message", (data) => this.handleMessage(data.toString()));
+            socket.on("message", (data) => this.handleMessage(data.toString(), socket));
             socket.on("close", () => {
                 const index = this.sockets.indexOf(socket);
                 if (index > -1) this.sockets.splice(index, 1);
             });
         });
+        this.server = wss;
     }
 
     async connectToPeer(url: string) {
-        return new Promise<void>((resolve) => {
+        return new Promise<void>((resolve, reject) => {
+            console.log(`Connecting to peer ${url}`);
             const ws = new WebSocket(url);
             ws.onopen = () => {
                 console.log(`Connected to peer ${url}`);
                 ws.send(JSON.stringify(["HELLO", { protocol: "cgp/0.1", mode: "p2p" }]));
                 this.sockets.push(ws);
+                console.log(`Peer 1 sockets count: ${this.sockets.length}`);
                 resolve();
             };
-            ws.onmessage = (msg) => this.handleMessage(msg.data.toString());
-            ws.onerror = (err) => console.error(`Peer WS Error ${url}`, err);
+            ws.onmessage = (msg) => this.handleMessage(msg.data.toString(), ws);
+            ws.onerror = (err) => {
+                console.error(`Peer WS Error ${url}`, err);
+                reject(err);
+            };
         });
     }
 
@@ -111,6 +123,8 @@ export class CgpClient {
             if (!Array.isArray(parsed) || parsed.length < 2) return;
             const [kind, payload] = parsed as [string, unknown];
 
+            console.log(`Client received ${kind}`);
+
             if (kind === "EVENT") {
                 const event = payload as GuildEvent;
                 const unsignedForSig = { body: event.body, author: event.author, createdAt: event.createdAt };
@@ -119,8 +133,6 @@ export class CgpClient {
                 if (this.seenEvents.has(event.id)) return;
                 this.seenEvents.add(event.id);
                 if (this.seenEvents.size > 1000) {
-                    // Simple pruning: clear half or just clear all? Clear all is easiest but might cause temporary re-gossip.
-                    // Better: delete first item? Set iterates in insertion order.
                     const it = this.seenEvents.values();
                     for (let i = 0; i < 100; i++) {
                         const val = it.next().value;
@@ -129,7 +141,7 @@ export class CgpClient {
                 }
 
                 if (!verify(event.author, msgHash, event.signature)) {
-                    console.error(`Client: Invalid signature for event ${event.id}`);
+                    console.log(`Client: Invalid signature for event ${event.id}`);
                     return;
                 }
 
@@ -144,7 +156,7 @@ export class CgpClient {
                         gossipCount++;
                     }
                 });
-                // console.log(`Client gossiped event ${event.seq} to ${gossipCount} peers`);
+                console.log(`Gossiped event ${event.seq} to ${gossipCount} peers`);
 
             } else if (kind === "SNAPSHOT") {
                 const p = payload as { events: GuildEvent[]; guildId: GuildId };
@@ -166,7 +178,7 @@ export class CgpClient {
                 const msgHash = hashObject(unsignedForSig);
 
                 if (!verify(author, msgHash, signature)) {
-                    console.error(`Client: Invalid signature for PUBLISH from peer`);
+                    console.log(`Client: Invalid signature for PUBLISH from peer`);
                     return;
                 }
 
@@ -180,7 +192,7 @@ export class CgpClient {
                     seq = state.headSeq + 1;
                     prevHash = state.headHash;
                 } else if (body.type !== "GUILD_CREATE") {
-                    console.error("Client received PUBLISH for unknown guild and not GUILD_CREATE");
+                    console.log("Client received PUBLISH for unknown guild and not GUILD_CREATE");
                     return;
                 }
 
@@ -200,206 +212,181 @@ export class CgpClient {
 
                 // Gossip: Forward as EVENT to all peers
                 const eventFrame = JSON.stringify(["EVENT", event]);
+                let gossipCount = 0;
                 this.sockets.forEach(s => {
                     if (s.readyState === WebSocket.OPEN) {
                         s.send(eventFrame);
+                        gossipCount++;
                     }
                 });
+                console.log(`Converted PUBLISH to EVENT and gossiped to ${gossipCount} peers`);
 
             } else if (kind === "HELLO") {
-                if (socket && socket.readyState === WebSocket.OPEN) {
-                    socket.send(JSON.stringify(["HELLO_OK", { protocol: "cgp/0.1", agent: "CgpClient" }]));
-                }
+                // Handshake, ignore for now
             } else if (kind === "SUB") {
-                const p = payload as { subId: string; guildId: GuildId };
-                const { subId, guildId } = p;
-                const state = this.state.get(guildId);
-                if (state && socket && socket.readyState === WebSocket.OPEN) {
-                    // Send empty snapshot for now as we don't store event history
-                    socket.send(JSON.stringify(["SNAPSHOT", { subId, guildId, events: [], endSeq: 0 }]));
-                }
+                // Subscription, ignore for now
             } else if (kind === "ERROR") {
                 console.error("Client received ERROR:", payload);
             }
+
         } catch (e) {
-            console.error("Client parse error", e);
+            console.error("Error handling message:", e);
         }
     }
 
     private updateState(event: GuildEvent) {
-        const guildId = event.body.guildId || (event.body.type === "GUILD_CREATE" ? event.id : null);
-        if (!guildId) return;
-
+        const guildId = event.body.guildId;
         let state = this.state.get(guildId);
+
         if (!state) {
             if (event.body.type === "GUILD_CREATE") {
                 state = createInitialState(event);
                 this.state.set(guildId, state);
+            } else {
+                return;
             }
         } else {
-            try {
-                const newState = applyEvent(state, event);
-                this.state.set(guildId, newState);
-            } catch (e) {
-                console.error("Failed to apply event to local state", e);
+            if (event.seq === state.headSeq + 1 && event.prevHash === state.headHash) {
+                validateEvent(state, event);
+                state = applyEvent(state, event);
+                this.state.set(guildId, state);
             }
         }
+    }
+
+    async createGuild(name: string, description?: string, access: "public" | "private" = "public"): Promise<GuildId> {
+        const { pub } = this.keyPair!;
+        const createdAt = Date.now();
+        const body: GuildCreate = {
+            type: "GUILD_CREATE",
+            guildId: "",
+            name,
+            description,
+            access
+        };
+        const tempId = hashObject({ author: pub, name, createdAt });
+        body.guildId = tempId;
+
+        await this.publish(body);
+        return tempId;
+    }
+
+    async createChannel(guildId: GuildId, name: string, kind: "text" | "voice"): Promise<ChannelId> {
+        const channelId = hashObject(name + Date.now());
+        const body: ChannelCreate = { type: "CHANNEL_CREATE", guildId, channelId, name, kind };
+        await this.publish(body);
+        return channelId;
+    }
+
+    async sendMessage(guildId: GuildId, channelId: ChannelId, content: string): Promise<void> {
+        const body: Message = { type: "MESSAGE", guildId, channelId, messageId: hashObject(content + Date.now()), content };
+        await this.publish(body);
+    }
+
+    async assignRole(guildId: GuildId, userId: string, role: string): Promise<void> {
+        const body: RoleAssign = { type: "ROLE_ASSIGN", guildId, userId, roleId: role };
+        await this.publish(body);
+    }
+
+    async banUser(guildId: GuildId, userId: string): Promise<void> {
+        const body: BanUser = { type: "BAN_USER", guildId, userId };
+        await this.publish(body);
+    }
+
+    async editMessage(guildId: GuildId, channelId: ChannelId, messageId: string, content: string): Promise<void> {
+        const body: EditMessage = { type: "EDIT_MESSAGE", guildId, channelId, messageId, newContent: content };
+        await this.publish(body);
+    }
+
+    async deleteMessage(guildId: GuildId, channelId: ChannelId, messageId: string): Promise<void> {
+        const body: DeleteMessage = { type: "DELETE_MESSAGE", guildId, channelId, messageId };
+        await this.publish(body);
+    }
+
+    async forkGuild(originalGuildId: GuildId, newName: string): Promise<GuildId> {
+        const { pub } = this.keyPair!;
+        const createdAt = Date.now();
+        const newGuildId = hashObject({ author: pub, name: newName, createdAt });
+
+        const createBody: GuildCreate = { type: "GUILD_CREATE", guildId: newGuildId, name: newName };
+        await this.publish(createBody);
+
+        const forkBody: ForkFrom = {
+            type: "FORK_FROM",
+            guildId: newGuildId,
+            parentGuildId: originalGuildId,
+            parentSeq: 0,
+            parentRootHash: ""
+        };
+        await this.publish(forkBody);
+
+        return newGuildId;
+    }
+
+    async setEphemeralPolicy(guildId: GuildId, channelId: ChannelId, duration: number): Promise<void> {
+        const body: EphemeralPolicyUpdate = {
+            type: "EPHEMERAL_POLICY_UPDATE",
+            guildId,
+            channelId,
+            retention: { mode: "ttl", seconds: duration }
+        };
+        await this.publish(body);
+    }
+
+    async publish(body: EventBody): Promise<string> {
+        if (!this.keyPair) throw new Error("No keypair");
+        const { pub, priv } = this.keyPair;
+        const createdAt = Date.now();
+
+        const unsigned = { body, author: pub, createdAt };
+        const signature = await sign(priv, hashObject(unsigned));
+
+        if (this.relays.length === 0) {
+            const targetGuildId = body.guildId || (body.type === "GUILD_CREATE" ? computeEventId({ ...unsigned, id: "", seq: 0, prevHash: null, signature } as any) : null);
+            if (!targetGuildId) throw new Error("Cannot determine guildId for P2P publish");
+
+            let state = this.state.get(targetGuildId);
+            const seq = state ? state.headSeq + 1 : 0;
+            const prevHash = state ? state.headHash : null;
+
+            const event: GuildEvent = {
+                id: "", seq, prevHash, createdAt, author: pub, body, signature
+            };
+            event.id = computeEventId(event);
+
+            this.updateState(event);
+            this.emit("event", event);
+
+            const eventFrame = JSON.stringify(["EVENT", event]);
+            let gossipCount = 0;
+            this.sockets.forEach(s => {
+                if (s.readyState === WebSocket.OPEN) {
+                    s.send(eventFrame);
+                    gossipCount++;
+                }
+            });
+            console.log(`P2P Publish: Gossiped event ${event.seq} to ${gossipCount} peers`);
+            return event.id;
+        }
+
+        const payload = { body, author: pub, signature, createdAt };
+        const frame = JSON.stringify(["PUBLISH", payload]);
+
+        this.sockets.forEach(s => {
+            if (s.readyState === WebSocket.OPEN) {
+                s.send(frame);
+            }
+        });
+
+        return "";
     }
 
     getGuildState(guildId: GuildId): GuildState | undefined {
         return this.state.get(guildId);
     }
 
-    subscribe(guildId: GuildId, channels?: ChannelId[]) {
-        const subId = Math.random().toString(36).slice(2);
-        const frame = JSON.stringify(["SUB", { subId, guildId, channels }]);
-        this.sockets.forEach(ws => ws.send(frame));
-        return subId;
-    }
-
-    async createGuild(name: string) {
-        if (!this.keyPair) throw new Error("No keys");
-
-        const partialBody = {
-            type: "GUILD_CREATE",
-            name,
-            timestamp: Date.now(),
-            nonce: Math.random()
-        };
-
-        const guildId = hashObject(partialBody);
-
-        const body: GuildCreate = {
-            type: "GUILD_CREATE",
-            guildId,
-            name,
-        };
-
-        this.subscribe(guildId);
-        await this.publish(body);
-        return guildId;
-    }
-
-    async publish(body: EventBody) {
-        if (!this.keyPair) throw new Error("No keys");
-
-        const createdAt = Date.now();
-        const author = this.keyPair.pub;
-
-        const unsignedForSig = { body, author, createdAt };
-        const msgHash = hashObject(unsignedForSig);
-        const signature = await sign(this.keyPair.priv, msgHash);
-
-        const payload = {
-            body,
-            author,
-            createdAt,
-            signature
-        };
-
-        this.sockets.forEach(ws => ws.send(JSON.stringify(["PUBLISH", payload])));
-    }
-
-    async createChannel(guildId: GuildId, name: string, kind: "text" | "voice" | "ephemeral-text", retention?: EphemeralPolicy) {
-        const channelId = hashObject({ guildId, name, kind, timestamp: Date.now() });
-        const body: ChannelCreate = {
-            type: "CHANNEL_CREATE",
-            guildId,
-            channelId,
-            name,
-            kind,
-            retention
-        };
-        await this.publish(body);
-        return channelId;
-    }
-
-    async sendMessage(guildId: GuildId, channelId: ChannelId, content: string) {
-        const messageId = hashObject({ guildId, channelId, content, timestamp: Date.now() });
-        const body: Message = {
-            type: "MESSAGE",
-            guildId,
-            channelId,
-            messageId,
-            content
-        };
-        await this.publish(body);
-        return messageId;
-    }
-
-    async assignRole(guildId: GuildId, userId: string, roleId: string) {
-        const body: RoleAssign = {
-            type: "ROLE_ASSIGN",
-            guildId,
-            userId,
-            roleId
-        };
-        await this.publish(body);
-    }
-
-    async banUser(guildId: GuildId, userId: string, reason?: string) {
-        const body: BanUser = {
-            type: "BAN_USER",
-            guildId,
-            userId,
-            reason
-        };
-        await this.publish(body);
-    }
-
-    async editMessage(guildId: GuildId, channelId: ChannelId, messageId: string, newContent: string) {
-        const body: EditMessage = {
-            type: "EDIT_MESSAGE",
-            guildId,
-            channelId,
-            messageId,
-            newContent
-        };
-        await this.publish(body);
-    }
-
-    async deleteMessage(guildId: GuildId, channelId: ChannelId, messageId: string, reason?: string) {
-        const body: DeleteMessage = {
-            type: "DELETE_MESSAGE",
-            guildId,
-            channelId,
-            messageId,
-            reason
-        };
-        await this.publish(body);
-    }
-
-    async forkGuild(parentGuildId: GuildId, parentSeq: number, parentRootHash: string, name: string) {
-        const newGuildId = await this.createGuild(name);
-
-        const body: ForkFrom = {
-            type: "FORK_FROM",
-            guildId: newGuildId,
-            parentGuildId,
-            parentSeq,
-            parentRootHash,
-            note: `Fork of ${parentGuildId}`
-        };
-        await this.publish(body);
-        return newGuildId;
-    }
-
-    on(event: string, cb: (data: GuildEvent) => void) {
-        if (event === "event") {
-            const id = Math.random().toString(36);
-            this.listeners.set(id, cb);
-            return () => this.listeners.delete(id);
-        }
-        return () => { };
-    }
-
-    private emit(event: string, data: GuildEvent) {
-        if (event === "event") {
-            this.listeners.forEach(cb => cb(data));
-        }
-    }
-
     close() {
-        this.sockets.forEach(ws => ws.close());
+        this.sockets.forEach(s => s.close());
+        if (this.server) this.server.close();
     }
 }

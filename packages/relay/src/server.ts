@@ -16,7 +16,8 @@ import {
     EventBody,
     Message,
     Checkpoint,
-    EphemeralPolicyUpdate
+    EphemeralPolicyUpdate,
+    validateEvent
 } from "@cgp/core";
 import { LevelStore } from "./store_level";
 import { Store } from "./store";
@@ -170,6 +171,7 @@ export class RelayServer {
                 continue;
             }
 
+            const seqsToDelete: number[] = [];
             for (const event of events) {
                 if (event.body.type === "MESSAGE") {
                     const body = event.body as Message;
@@ -177,10 +179,14 @@ export class RelayServer {
                     if (channel && channel.retention && channel.retention.mode === "ttl" && channel.retention.seconds) {
                         const ageSeconds = (now - event.createdAt) / 1000;
                         if (ageSeconds > channel.retention.seconds) {
-                            await this.store.deleteEvent(guildId, event.seq);
+                            seqsToDelete.push(event.seq);
                         }
                     }
                 }
+            }
+
+            for (const seq of seqsToDelete) {
+                await this.store.deleteEvent(guildId, seq);
             }
         }
     }
@@ -250,7 +256,7 @@ export class RelayServer {
                 }
 
                 try {
-                    this.validateEvent(state, fullEvent);
+                    validateEvent(state, fullEvent);
                     // Optimistically apply to cache
                     const newState = applyEvent(state, fullEvent);
                     this.stateCache.set(targetGuildId, newState);
@@ -276,36 +282,6 @@ export class RelayServer {
         }
     }
 
-    private validateEvent(state: GuildState, event: GuildEvent) {
-        const { body, author } = event;
-
-        const isOwner = state.ownerId === author;
-        const member = state.members.get(author);
-        const isAdmin = member?.roles.has("admin") || member?.roles.has("owner");
-        const hasPermission = isOwner || isAdmin;
-
-        switch (body.type) {
-            case "CHANNEL_CREATE":
-            case "ROLE_ASSIGN":
-            case "ROLE_REVOKE":
-            case "BAN_USER":
-            case "UNBAN_USER":
-            case "EPHEMERAL_POLICY_UPDATE":
-                if (!hasPermission) {
-                    throw new Error(`User ${author} does not have permission for ${body.type}`);
-                }
-                break;
-            case "MESSAGE":
-                const msgBody = body as Message;
-                if (!state.channels.has(msgBody.channelId)) {
-                    throw new Error(`Channel ${msgBody.channelId} does not exist`);
-                }
-                if (state.bans.has(author)) {
-                    throw new Error(`User ${author} is banned`);
-                }
-                break;
-        }
-    }
 
     private broadcast(guildId: GuildId, event: GuildEvent) {
         let count = 0;

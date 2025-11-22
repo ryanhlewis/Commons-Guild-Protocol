@@ -29,6 +29,7 @@ export interface GuildCreate {
     flags?: {
         allowForksBy?: "any" | "mods" | "owner-only";
     };
+    access?: "public" | "private"; // Default public
 }
 
 export interface EphemeralPolicy {
@@ -140,6 +141,7 @@ export interface SerializableGuildState {
     members: Array<[UserId, SerializableMember]>; // Map as array of entries
     roles: Array<[string, Role]>;           // Map as array of entries
     bans: Array<[UserId, Ban]>;             // Map as array of entries
+    access: "public" | "private";
 }
 
 export interface Checkpoint {
