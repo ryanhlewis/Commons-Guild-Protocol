@@ -1,7 +1,7 @@
 import express from "express";
 import { MerkleTree } from "merkletreejs";
 import { sha256 } from "@noble/hashes/sha256";
-import { GuildId, PublicKeyHex, HashHex, hashObject } from "@cgp/core";
+import { GuildId, PublicKeyHex, HashHex, hashObject, verify } from "@cgp/core";
 import { Level } from "level";
 
 interface DirectoryValue {
@@ -23,8 +23,23 @@ export class DirectoryService {
         this.ready = this.rebuildTree();
     }
 
-    async register(handle: string, guildId: GuildId, guildPubkey: PublicKeyHex, relays?: string[]) {
+    async register(handle: string, guildId: GuildId, guildPubkey: PublicKeyHex, signature: string, timestamp: number, relays?: string[]) {
         await this.ready;
+
+        // Verify signature
+        // Message: "REGISTER:<handle>:<guildId>:<timestamp>"
+        const msg = `REGISTER:${handle}:${guildId}:${timestamp}`;
+        const msgHash = hashObject(msg);
+        if (!verify(guildPubkey, msgHash, signature)) {
+            throw new Error("Invalid signature");
+        }
+
+        // Check timestamp to prevent replay attacks (allow 5 minute window)
+        const now = Date.now();
+        if (Math.abs(now - timestamp) > 5 * 60 * 1000) {
+            throw new Error("Timestamp out of bounds");
+        }
+
         const value: DirectoryValue = { handle, guildId, guildPubkey, relays };
         await this.db.put(handle, JSON.stringify(value));
         await this.rebuildTree();
@@ -85,12 +100,16 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     app.use(express.json());
 
     app.post("/register", async (req, res) => {
-        const { handle, guildId, guildPubkey, relays } = req.body;
-        if (!handle || !guildId || !guildPubkey) {
+        const { handle, guildId, guildPubkey, signature, timestamp, relays } = req.body;
+        if (!handle || !guildId || !guildPubkey || !signature || !timestamp) {
             return res.status(400).json({ error: "Missing fields" });
         }
-        await service.register(handle, guildId, guildPubkey, relays);
-        res.json({ success: true });
+        try {
+            await service.register(handle, guildId, guildPubkey, signature, timestamp, relays);
+            res.json({ success: true });
+        } catch (e: any) {
+            res.status(400).json({ error: e.message });
+        }
     });
 
     app.get("/lookup", async (req, res) => {

@@ -31,6 +31,7 @@ export interface GuildState {
     bans: Map<UserId, Ban>;
     createdAt: number;
     headSeq: number;
+    headHash: string;
 }
 
 export function createInitialState(event: GuildEvent): GuildState {
@@ -48,7 +49,8 @@ export function createInitialState(event: GuildEvent): GuildState {
         members: new Map([[event.author, { userId: event.author, roles: new Set(["owner"]), joinedAt: event.createdAt }]]),
         bans: new Map(),
         createdAt: event.createdAt,
-        headSeq: event.seq
+        headSeq: event.seq,
+        headHash: event.id
     };
 }
 
@@ -71,7 +73,7 @@ export function serializeState(state: GuildState): SerializableGuildState {
     };
 }
 
-export function deserializeState(serialized: SerializableGuildState, headSeq: number, createdAt: number): GuildState {
+export function deserializeState(serialized: SerializableGuildState, headSeq: number, headHash: string, createdAt: number): GuildState {
     const members = new Map<UserId, Member>();
     for (const [id, sMember] of serialized.members) {
         members.set(id, {
@@ -90,6 +92,7 @@ export function deserializeState(serialized: SerializableGuildState, headSeq: nu
         roles: new Map(serialized.roles),
         bans: new Map(serialized.bans),
         headSeq,
+        headHash,
         createdAt
     };
 }
@@ -107,6 +110,7 @@ export function applyEvent(state: GuildState, event: GuildEvent): GuildState {
     newState.members = new Map(state.members);
     newState.bans = new Map(state.bans);
     newState.headSeq = event.seq;
+    newState.headHash = event.id;
 
     const body = event.body;
 

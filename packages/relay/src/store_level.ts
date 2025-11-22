@@ -1,7 +1,8 @@
 import { Level } from "level";
 import { GuildEvent, GuildId } from "@cgp/core";
+import { Store } from "./store";
 
-export class LevelStore {
+export class LevelStore implements Store {
     private db: Level<string, string>;
 
     constructor(path: string) {

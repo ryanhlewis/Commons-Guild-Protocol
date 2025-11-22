@@ -19,6 +19,7 @@ import {
     EphemeralPolicyUpdate
 } from "@cgp/core";
 import { LevelStore } from "./store_level";
+import { Store } from "./store";
 
 interface Subscription {
     guildId: GuildId;
@@ -27,16 +28,21 @@ interface Subscription {
 
 export class RelayServer {
     private wss: WebSocketServer;
-    private store: LevelStore;
+    private store: Store;
     private subscriptions = new Map<WebSocket, Map<string, Subscription>>();
     private messageQueues = new Map<WebSocket, Promise<void>>();
+    private stateCache = new Map<GuildId, GuildState>();
 
     private pruneTimer: NodeJS.Timeout;
     private checkpointTimer: NodeJS.Timeout;
     private keyPair: { publicKey: string; privateKey: Uint8Array };
 
-    constructor(port: number, dbPath: string = "./relay-db") {
-        this.store = new LevelStore(dbPath);
+    constructor(port: number, dbPathOrStore: string | Store = "./relay-db") {
+        if (typeof dbPathOrStore === "string") {
+            this.store = new LevelStore(dbPathOrStore);
+        } else {
+            this.store = dbPathOrStore;
+        }
         this.wss = new WebSocketServer({ port });
 
         // Generate a random keypair for the relay (in production, load from config)
@@ -58,9 +64,14 @@ export class RelayServer {
                         const raw = data.toString();
                         const [kind, payload] = JSON.parse(raw);
                         await this.handleMessage(socket, kind, payload);
-                    } catch (e) {
+                    } catch (e: any) {
                         console.error("Error handling message", e);
-                        socket.send(JSON.stringify(["ERROR", { code: "INVALID_FRAME", message: "Parse error" }]));
+                        if (e instanceof SyntaxError) {
+                            console.error("Invalid payload:", data.toString());
+                            socket.send(JSON.stringify(["ERROR", { code: "INVALID_FRAME", message: "Parse error" }]));
+                        } else {
+                            socket.send(JSON.stringify(["ERROR", { code: "INTERNAL_ERROR", message: e.message }]));
+                        }
                     }
                 });
                 this.messageQueues.set(socket, nextTask);
@@ -221,19 +232,28 @@ export class RelayServer {
             }
 
             if (seq > 0) {
-                const history = await this.store.getLog(targetGuildId);
-                if (history.length === 0) {
-                    console.error("Validation error: Missing history for non-genesis event");
-                    return;
-                }
+                let state = this.stateCache.get(targetGuildId);
 
-                let state = createInitialState(history[0]);
-                for (let i = 1; i < history.length; i++) {
-                    state = applyEvent(state, history[i]);
+                if (!state || state.headSeq !== seq - 1) {
+                    // Cache miss or out of sync, rebuild from history
+                    const history = await this.store.getLog(targetGuildId);
+                    if (history.length === 0) {
+                        console.error("Validation error: Missing history for non-genesis event");
+                        return;
+                    }
+
+                    state = createInitialState(history[0]);
+                    for (let i = 1; i < history.length; i++) {
+                        state = applyEvent(state, history[i]);
+                    }
+                    this.stateCache.set(targetGuildId, state);
                 }
 
                 try {
                     this.validateEvent(state, fullEvent);
+                    // Optimistically apply to cache
+                    const newState = applyEvent(state, fullEvent);
+                    this.stateCache.set(targetGuildId, newState);
                 } catch (e: any) {
                     console.error(`Validation failed for guild ${targetGuildId}: ${e.message}`);
                     socket.send(JSON.stringify(["ERROR", { code: "VALIDATION_FAILED", message: e.message }]));
@@ -244,10 +264,13 @@ export class RelayServer {
                     console.error("Validation failed: First event must be GUILD_CREATE");
                     return;
                 }
+                // Initialize cache for new guild
+                const state = createInitialState(fullEvent);
+                this.stateCache.set(targetGuildId, state);
             }
 
             await this.store.append(targetGuildId, fullEvent);
-            console.log(`Relay appended event ${fullEvent.id} type ${body.type}`);
+            // console.log(`Relay appended event ${fullEvent.id} type ${body.type}`);
 
             this.broadcast(targetGuildId, fullEvent);
         }
@@ -285,13 +308,16 @@ export class RelayServer {
     }
 
     private broadcast(guildId: GuildId, event: GuildEvent) {
+        let count = 0;
         for (const [socket, subs] of this.subscriptions) {
             for (const sub of subs.values()) {
                 if (sub.guildId === guildId) {
                     socket.send(JSON.stringify(["EVENT", event]));
+                    count++;
                 }
             }
         }
+        // console.log(`Broadcasted event ${event.seq} to ${count} clients`);
     }
 
     public async close() {

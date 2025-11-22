@@ -28,6 +28,7 @@ export class CgpClient {
     private listeners = new Map<string, (event: GuildEvent) => void>();
     private keyPair?: { pub: string; priv: Uint8Array };
     private state = new Map<GuildId, GuildState>();
+    private seenEvents = new Set<string>();
 
     constructor(config: { relays: string[]; keyPair?: { pub: string; priv: Uint8Array } }) {
         this.relays = config.relays;
@@ -115,6 +116,18 @@ export class CgpClient {
                 const unsignedForSig = { body: event.body, author: event.author, createdAt: event.createdAt };
                 const msgHash = hashObject(unsignedForSig);
 
+                if (this.seenEvents.has(event.id)) return;
+                this.seenEvents.add(event.id);
+                if (this.seenEvents.size > 1000) {
+                    // Simple pruning: clear half or just clear all? Clear all is easiest but might cause temporary re-gossip.
+                    // Better: delete first item? Set iterates in insertion order.
+                    const it = this.seenEvents.values();
+                    for (let i = 0; i < 100; i++) {
+                        const val = it.next().value;
+                        if (val) this.seenEvents.delete(val);
+                    }
+                }
+
                 if (!verify(event.author, msgHash, event.signature)) {
                     console.error(`Client: Invalid signature for event ${event.id}`);
                     return;
@@ -124,11 +137,14 @@ export class CgpClient {
                 this.emit("event", event);
 
                 // Gossip: Forward to all other peers
+                let gossipCount = 0;
                 this.sockets.forEach(s => {
                     if (s !== socket && s.readyState === WebSocket.OPEN) {
                         s.send(data);
+                        gossipCount++;
                     }
                 });
+                // console.log(`Client gossiped event ${event.seq} to ${gossipCount} peers`);
 
             } else if (kind === "SNAPSHOT") {
                 const p = payload as { events: GuildEvent[]; guildId: GuildId };
@@ -154,10 +170,24 @@ export class CgpClient {
                     return;
                 }
 
+                let seq = 0;
+                let prevHash: string | null = null;
+
+                const targetGuildId = body.guildId;
+                const state = this.state.get(targetGuildId);
+
+                if (state) {
+                    seq = state.headSeq + 1;
+                    prevHash = state.headHash;
+                } else if (body.type !== "GUILD_CREATE") {
+                    console.error("Client received PUBLISH for unknown guild and not GUILD_CREATE");
+                    return;
+                }
+
                 const event: GuildEvent = {
                     id: "",
-                    seq: 0,
-                    prevHash: "",
+                    seq,
+                    prevHash,
                     createdAt,
                     author,
                     body,

@@ -68,7 +68,7 @@ describe("Checkpoint Tests", () => {
 
         // 5. Verify State Reconstruction from Checkpoint
         const serializedState = checkpointEvent.body.state;
-        const reconstructedState = deserializeState(serializedState, checkpointEvent.seq, checkpointEvent.createdAt);
+        const reconstructedState = deserializeState(serializedState, checkpointEvent.seq, checkpointEvent.id, checkpointEvent.createdAt);
 
         expect(reconstructedState.guildId).toBe(guildId);
         expect(reconstructedState.name).toBe("Checkpoint Guild");
