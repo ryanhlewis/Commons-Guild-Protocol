@@ -1,0 +1,14 @@
+{
+    "name": "@cgp/tests",
+    "version": "0.1.0",
+    "private": true,
+    "scripts": {
+        "test": "vitest"
+    },
+    "dependencies": {
+        "@cgp/core": "*",
+        "@cgp/relay": "*",
+        "@cgp/client": "*",
+        "vitest": "^1.2.0"
+    }
+}

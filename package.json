@@ -1,0 +1,19 @@
+{
+  "name": "commons-guild-protocol",
+  "version": "0.0.1",
+  "description": "Commons Guild Protocol monorepo",
+  "private": true,
+  "scripts": {
+    "test": "vitest run",
+    "dev:relay": "npm run dev --workspace=@cgp/relay",
+    "dev:client": "npm run dev --workspace=@cgp/client"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "vitest": "^1.0.0",
+    "@types/node": "^20.0.0"
+  }
+}
