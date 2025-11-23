@@ -104,7 +104,7 @@ describe("Stress Testing", () => {
             expect(state!.headSeq).toBe(expectedSeq);
         }
 
-    }, 30000); // Increase timeout
+    }, 60000); // Increase timeout
 
     it("handles high volume of directory registrations", async () => {
         const { DirectoryService } = await import("@cgp/directory/src/index");

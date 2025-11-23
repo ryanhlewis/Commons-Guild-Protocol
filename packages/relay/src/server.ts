@@ -33,6 +33,7 @@ export class RelayServer {
     private subscriptions = new Map<WebSocket, Map<string, Subscription>>();
     private messageQueues = new Map<WebSocket, Promise<void>>();
     private stateCache = new Map<GuildId, GuildState>();
+    private mutexes = new Map<GuildId, Promise<void>>();
 
     private pruneTimer: NodeJS.Timeout;
     private checkpointTimer: NodeJS.Timeout;
@@ -211,74 +212,85 @@ export class RelayServer {
             const { body, author, signature, createdAt } = p;
 
             const targetGuildId = body.guildId;
-            const lastEvent = await this.store.getLastEvent(targetGuildId);
 
-            const seq = lastEvent ? lastEvent.seq + 1 : 0;
-            const prevHash = lastEvent ? lastEvent.id : null;
+            // Mutex: Serialize processing per guild to prevent race conditions on seq/prevHash
+            const processEvent = async () => {
+                const lastEvent = await this.store.getLastEvent(targetGuildId);
 
-            const fullEvent: GuildEvent = {
-                id: "",
-                seq,
-                prevHash,
-                createdAt,
-                author,
-                body,
-                signature
-            };
+                const seq = lastEvent ? lastEvent.seq + 1 : 0;
+                const prevHash = lastEvent ? lastEvent.id : null;
 
-            fullEvent.id = computeEventId({ ...fullEvent });
+                const fullEvent: GuildEvent = {
+                    id: "",
+                    seq,
+                    prevHash,
+                    createdAt,
+                    author,
+                    body,
+                    signature
+                };
 
-            const unsignedForSig = { body, author, createdAt };
-            const msgHash = hashObject(unsignedForSig);
+                fullEvent.id = computeEventId({ ...fullEvent });
 
-            if (!verify(author, msgHash, signature)) {
-                console.error(`Invalid signature for event ${fullEvent.id}`);
-                socket.send(JSON.stringify(["ERROR", { code: "INVALID_SIGNATURE", message: "Signature verification failed" }]));
-                return;
-            }
+                const unsignedForSig = { body, author, createdAt };
+                const msgHash = hashObject(unsignedForSig);
 
-            if (seq > 0) {
-                let state = this.stateCache.get(targetGuildId);
+                if (!verify(author, msgHash, signature)) {
+                    console.error(`Invalid signature for event ${fullEvent.id}`);
+                    socket.send(JSON.stringify(["ERROR", { code: "INVALID_SIGNATURE", message: "Signature verification failed" }]));
+                    return;
+                }
 
-                if (!state || state.headSeq !== seq - 1) {
-                    // Cache miss or out of sync, rebuild from history
-                    const history = await this.store.getLog(targetGuildId);
-                    if (history.length === 0) {
-                        console.error("Validation error: Missing history for non-genesis event");
+                if (seq > 0) {
+                    let state = this.stateCache.get(targetGuildId);
+
+                    if (!state || state.headSeq !== seq - 1) {
+                        // Cache miss or out of sync, rebuild from history
+                        const history = await this.store.getLog(targetGuildId);
+                        if (history.length === 0) {
+                            console.error("Validation error: Missing history for non-genesis event");
+                            return;
+                        }
+
+                        state = createInitialState(history[0]);
+                        for (let i = 1; i < history.length; i++) {
+                            state = applyEvent(state, history[i]);
+                        }
+                        this.stateCache.set(targetGuildId, state);
+                    }
+
+                    try {
+                        validateEvent(state, fullEvent);
+                        // Optimistically apply to cache
+                        const newState = applyEvent(state, fullEvent);
+                        this.stateCache.set(targetGuildId, newState);
+                    } catch (e: any) {
+                        console.error(`Validation failed for guild ${targetGuildId}: ${e.message}`);
+                        console.error(`Event body:`, JSON.stringify(body));
+                        socket.send(JSON.stringify(["ERROR", { code: "VALIDATION_FAILED", message: e.message }]));
                         return;
                     }
-
-                    state = createInitialState(history[0]);
-                    for (let i = 1; i < history.length; i++) {
-                        state = applyEvent(state, history[i]);
+                } else {
+                    if (body.type !== "GUILD_CREATE") {
+                        console.error("Validation failed: First event must be GUILD_CREATE");
+                        return;
                     }
+                    // Initialize cache for new guild
+                    const state = createInitialState(fullEvent);
                     this.stateCache.set(targetGuildId, state);
                 }
 
-                try {
-                    validateEvent(state, fullEvent);
-                    // Optimistically apply to cache
-                    const newState = applyEvent(state, fullEvent);
-                    this.stateCache.set(targetGuildId, newState);
-                } catch (e: any) {
-                    console.error(`Validation failed for guild ${targetGuildId}: ${e.message}`);
-                    socket.send(JSON.stringify(["ERROR", { code: "VALIDATION_FAILED", message: e.message }]));
-                    return;
-                }
-            } else {
-                if (body.type !== "GUILD_CREATE") {
-                    console.error("Validation failed: First event must be GUILD_CREATE");
-                    return;
-                }
-                // Initialize cache for new guild
-                const state = createInitialState(fullEvent);
-                this.stateCache.set(targetGuildId, state);
-            }
+                await this.store.append(targetGuildId, fullEvent);
+                // console.log(`Relay appended event ${fullEvent.id} type ${body.type} seq ${fullEvent.seq}`);
 
-            await this.store.append(targetGuildId, fullEvent);
-            // console.log(`Relay appended event ${fullEvent.id} type ${body.type}`);
+                this.broadcast(targetGuildId, fullEvent);
+            };
 
-            this.broadcast(targetGuildId, fullEvent);
+            // Execute with lock
+            const prev = this.mutexes.get(targetGuildId) || Promise.resolve();
+            const next = prev.catch(() => { }).then(processEvent);
+            this.mutexes.set(targetGuildId, next);
+            await next;
         }
     }
 

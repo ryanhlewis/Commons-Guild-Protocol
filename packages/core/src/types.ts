@@ -30,6 +30,7 @@ export interface GuildCreate {
         allowForksBy?: "any" | "mods" | "owner-only";
     };
     access?: "public" | "private"; // Default public
+    encryptedGroupKey?: string;
 }
 
 export interface EphemeralPolicy {
@@ -54,6 +55,8 @@ export interface Message {
     messageId: HashHex; // SHA256 of (guildId, channelId, seq, author, content)
     content: string;
     replyTo?: HashHex;
+    iv?: string;
+    encrypted?: boolean;
 }
 
 export interface EditMessage {
@@ -77,6 +80,7 @@ export interface RoleAssign {
     guildId: GuildId;
     userId: UserId;
     roleId: string;
+    encryptedGroupKey?: string;
 }
 
 export interface RoleRevoke {

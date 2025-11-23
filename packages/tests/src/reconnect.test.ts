@@ -5,7 +5,7 @@ import { generatePrivateKey, getPublicKey } from "@cgp/core";
 import fs from "fs";
 
 const DB_PATH = "./test-relay-db-reconnect";
-const PORT = 8087;
+const PORT = 8088;
 
 describe("Client Reconnection", () => {
     let relay: RelayServer | undefined;
