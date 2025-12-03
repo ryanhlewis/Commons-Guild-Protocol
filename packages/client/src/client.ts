@@ -35,6 +35,9 @@ export class CgpClient extends EventEmitter {
     private keyPair?: { pub: string; priv: Uint8Array };
     private state = new Map<GuildId, GuildState>();
     private seenEvents = new Set<string>();
+    private seenEventsQueue: string[] = []; // Track insertion order for efficient cleanup
+    private readonly MAX_SEEN_EVENTS = 1000;
+    private readonly CLEANUP_THRESHOLD = 900;
     private pendingEvents = new Map<GuildId, Map<number, GuildEvent>>();
     private groupKeys = new Map<GuildId, string>(); // Hex encoded symmetric keys
     private server: any;
@@ -138,17 +141,18 @@ export class CgpClient extends EventEmitter {
 
                     if (this.seenEvents.has(event.id)) return;
                     this.seenEvents.add(event.id);
+                    this.seenEventsQueue.push(event.id);
                     
-                    // Efficient cleanup: Remove oldest entries when size exceeds threshold
-                    if (this.seenEvents.size > 1000) {
-                        // Convert to array and keep the most recent 900 entries
-                        // This is more efficient than deleting individual items
-                        const entries = Array.from(this.seenEvents);
-                        this.seenEvents.clear();
-                        // Keep the last 900 entries (most recent)
-                        for (let i = entries.length - 900; i < entries.length; i++) {
-                            this.seenEvents.add(entries[i]);
+                    // Efficient cleanup: Remove oldest entries when threshold is exceeded
+                    if (this.seenEventsQueue.length > this.MAX_SEEN_EVENTS) {
+                        // Remove oldest entries until we're back to CLEANUP_THRESHOLD
+                        const toRemove = this.seenEventsQueue.length - this.CLEANUP_THRESHOLD;
+                        for (let i = 0; i < toRemove; i++) {
+                            const oldId = this.seenEventsQueue[i];
+                            this.seenEvents.delete(oldId);
                         }
+                        // Keep only the recent entries in the queue
+                        this.seenEventsQueue = this.seenEventsQueue.slice(toRemove);
                     }
 
                     if (!verify(event.author, msgHash, event.signature)) {

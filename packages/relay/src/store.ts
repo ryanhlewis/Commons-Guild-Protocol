@@ -53,13 +53,17 @@ export class MemoryStore implements Store {
         const index = guildIndex.get(seq);
         if (index !== undefined && index < log.length && log[index]?.seq === seq) {
             log.splice(index, 1);
-            // Rebuild index for this guild after deletion
-            this.rebuildGuildIndex(guildId, log);
+            // Update index: remove deleted entry and shift subsequent entries
+            guildIndex.delete(seq);
+            for (let i = index; i < log.length; i++) {
+                guildIndex.set(log[i].seq, i);
+            }
         } else {
             // Fallback to linear search if index is stale
             const fallbackIndex = log.findIndex(e => e.seq === seq);
             if (fallbackIndex !== -1) {
                 log.splice(fallbackIndex, 1);
+                // Rebuild index for this guild after deletion
                 this.rebuildGuildIndex(guildId, log);
             }
         }

@@ -189,11 +189,9 @@ export function applyEvent(state: GuildState, event: GuildEvent): GuildState {
     }
 
     // Only create a new state object if something actually changed
-    if (newChannels === state.channels && newRoles === state.roles && 
-        newMembers === state.members && newBans === state.bans &&
-        event.seq === state.headSeq && event.id === state.headHash) {
-        return state;
-    }
+    // Note: headSeq and headHash always change, so we focus on collection changes
+    const collectionsChanged = newChannels !== state.channels || newRoles !== state.roles || 
+        newMembers !== state.members || newBans !== state.bans;
 
     return {
         ...state,
