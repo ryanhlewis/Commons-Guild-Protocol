@@ -138,11 +138,16 @@ export class CgpClient extends EventEmitter {
 
                     if (this.seenEvents.has(event.id)) return;
                     this.seenEvents.add(event.id);
+                    
+                    // Efficient cleanup: Remove oldest entries when size exceeds threshold
                     if (this.seenEvents.size > 1000) {
-                        const it = this.seenEvents.values();
-                        for (let i = 0; i < 100; i++) {
-                            const val = it.next().value;
-                            if (val) this.seenEvents.delete(val);
+                        // Convert to array and keep the most recent 900 entries
+                        // This is more efficient than deleting individual items
+                        const entries = Array.from(this.seenEvents);
+                        this.seenEvents.clear();
+                        // Keep the last 900 entries (most recent)
+                        for (let i = entries.length - 900; i < entries.length; i++) {
+                            this.seenEvents.add(entries[i]);
                         }
                     }
 

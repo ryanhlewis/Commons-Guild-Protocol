@@ -102,23 +102,33 @@ export class RelayServer {
         const guilds = await this.store.getGuildIds();
 
         for (const guildId of guilds) {
-            const events = await this.store.getLog(guildId);
-            if (events.length === 0) continue;
+            // Try to use cached state first
+            let state = this.stateCache.get(guildId);
+            let lastEvent: GuildEvent | undefined;
 
-            // Rebuild state
-            let state: GuildState;
-            try {
-                state = createInitialState(events[0]);
-                for (let i = 1; i < events.length; i++) {
-                    state = applyEvent(state, events[i]);
+            if (!state) {
+                // No cache, need to rebuild
+                const events = await this.store.getLog(guildId);
+                if (events.length === 0) continue;
+
+                try {
+                    state = createInitialState(events[0]);
+                    for (let i = 1; i < events.length; i++) {
+                        state = applyEvent(state, events[i]);
+                    }
+                    this.stateCache.set(guildId, state);
+                } catch (e) {
+                    console.error(`Failed to rebuild state for guild ${guildId} during checkpoint:`, e);
+                    continue;
                 }
-            } catch (e) {
-                console.error(`Failed to rebuild state for guild ${guildId} during checkpoint:`, e);
-                continue;
+                lastEvent = events[events.length - 1];
+            } else {
+                // Use cached state, fetch last event
+                lastEvent = await this.store.getLastEvent(guildId);
+                if (!lastEvent) continue;
             }
 
-            // Create checkpoint event
-            const lastEvent = events[events.length - 1];
+            // Skip if last event is already a checkpoint
             if (lastEvent.body.type === "CHECKPOINT") {
                 continue;
             }
@@ -149,6 +159,11 @@ export class RelayServer {
 
             await this.store.append(guildId, fullEvent);
             console.log(`Relay created checkpoint for guild ${guildId} at seq ${fullEvent.seq}`);
+            
+            // Update cache with checkpoint applied
+            const newState = applyEvent(state, fullEvent);
+            this.stateCache.set(guildId, newState);
+            
             this.broadcast(guildId, fullEvent);
         }
     }
@@ -158,21 +173,30 @@ export class RelayServer {
         const now = Date.now();
 
         for (const guildId of guilds) {
-            const events = await this.store.getLog(guildId);
-            if (events.length === 0) continue;
+            // Try to use cached state first
+            let state = this.stateCache.get(guildId);
+            
+            if (!state) {
+                // No cache, need to rebuild
+                const events = await this.store.getLog(guildId);
+                if (events.length === 0) continue;
 
-            let state: GuildState;
-            try {
-                state = createInitialState(events[0]);
-                for (let i = 1; i < events.length; i++) {
-                    state = applyEvent(state, events[i]);
+                try {
+                    state = createInitialState(events[0]);
+                    for (let i = 1; i < events.length; i++) {
+                        state = applyEvent(state, events[i]);
+                    }
+                    this.stateCache.set(guildId, state);
+                } catch (e) {
+                    console.error(`Failed to rebuild state for guild ${guildId} during prune:`, e);
+                    continue;
                 }
-            } catch (e) {
-                console.error(`Failed to rebuild state for guild ${guildId} during prune:`, e);
-                continue;
             }
 
+            // Get events for pruning
+            const events = await this.store.getLog(guildId);
             const seqsToDelete: number[] = [];
+            
             for (const event of events) {
                 if (event.body.type === "MESSAGE") {
                     const body = event.body as Message;
