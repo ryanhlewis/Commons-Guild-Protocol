@@ -294,6 +294,25 @@ export class RelayServer {
             if (fullEvent) {
                 await this.runOnEventAppended(fullEvent, socket);
             }
+        } else if (kind === "GET_MEMBERS") {
+            const p = payload as { subId: string; guildId: string };
+            const { subId, guildId } = p;
+
+            // Query plugins for members
+            for (const plugin of this.plugins) {
+                try {
+                    const members = await plugin.onGetMembers?.({ guildId, socket }, this.pluginCtx);
+                    if (members) {
+                        socket.send(JSON.stringify(["MEMBERS", { subId, guildId, members }]));
+                        return;
+                    }
+                } catch (e: any) {
+                    console.error(`Relay plugin ${plugin.name} failed onGetMembers:`, e);
+                }
+            }
+
+            // If no plugin handled it, return empty or error? For now, empty list or ignore.
+            socket.send(JSON.stringify(["MEMBERS", { subId, guildId, members: [] }]));
         }
     }
 

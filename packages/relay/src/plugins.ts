@@ -1,5 +1,5 @@
 import type { WebSocket } from "ws";
-import type { GuildEvent, EventBody, GuildId } from "@cgp/core";
+import type { GuildEvent, EventBody, GuildId, SerializableMember } from "@cgp/core";
 import type { Store } from "./store";
 
 export interface RelayPluginContext {
@@ -33,6 +33,7 @@ export interface RelayPlugin {
 
     onInit?: (ctx: RelayPluginContext) => void | Promise<void>;
     onConfig?: (args: { socket: WebSocket; config: any }, ctx: RelayPluginContext) => void | Promise<void>;
+    onGetMembers?: (args: { guildId: string; socket?: WebSocket }, ctx: RelayPluginContext) => Promise<SerializableMember[] | undefined>;
     onFrame?: (args: { socket: WebSocket; kind: string; payload: unknown }, ctx: RelayPluginContext) => boolean | Promise<boolean>;
     onEventAppended?: (args: { event: GuildEvent; socket?: WebSocket }, ctx: RelayPluginContext) => void | Promise<void>;
     onClose?: (ctx: RelayPluginContext) => void | Promise<void>;

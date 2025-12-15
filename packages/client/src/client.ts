@@ -26,7 +26,8 @@ import {
     getSharedSecret,
     encrypt,
     decrypt,
-    generateSymmetricKey
+    generateSymmetricKey,
+    SerializableMember
 } from "@cgp/core";
 
 export class CgpClient extends EventEmitter {
@@ -269,6 +270,8 @@ export class CgpClient extends EventEmitter {
                 } else if (kind === "ERROR") {
                     console.error("Client received ERROR:", payload);
                     this.emit("error_frame", payload);
+                } else if (kind === "MEMBERS") {
+                    this.emit("members_response", payload);
                 }
 
             } catch (e) {
@@ -499,6 +502,38 @@ export class CgpClient extends EventEmitter {
             if (s.readyState === WebSocket.OPEN) {
                 s.send(frame);
             }
+        });
+    }
+
+    async getMembers(guildId: string): Promise<SerializableMember[]> {
+        const subId = Math.random().toString(36).slice(2);
+        const frame = JSON.stringify(["GET_MEMBERS", { subId, guildId }]);
+
+        return new Promise<SerializableMember[]>((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                cleanup();
+                reject(new Error("Timeout waiting for members"));
+            }, 10000);
+
+            const handler = (data: { subId: string, members: SerializableMember[] }) => {
+                if (data.subId === subId) {
+                    cleanup();
+                    resolve(data.members);
+                }
+            };
+
+            const cleanup = () => {
+                clearTimeout(timeout);
+                this.off("members_response", handler);
+            };
+
+            this.on("members_response", handler);
+
+            this.sockets.forEach(s => {
+                if (s.readyState === WebSocket.OPEN) {
+                    s.send(frame);
+                }
+            });
         });
     }
 

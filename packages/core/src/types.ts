@@ -16,6 +16,8 @@ export interface MemberUpdate {
     guildId: GuildId;
     nickname?: string;
     avatar?: string;
+    banner?: string;
+    bio?: string;
 }
 
 export interface GuildEvent {
@@ -128,6 +130,8 @@ export interface Member {
     roles: Set<string>;
     nickname?: string;
     avatar?: string;
+    banner?: string;
+    bio?: string;
     joinedAt: number;
 }
 
@@ -142,6 +146,8 @@ export interface SerializableMember {
     roles: string[]; // Serialized as array
     nickname?: string;
     avatar?: string;
+    banner?: string;
+    bio?: string;
     joinedAt: number;
 }
 
