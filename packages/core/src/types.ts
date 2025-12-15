@@ -11,6 +11,13 @@ export interface GuildEventBodyBase {
     [key: string]: any;
 }
 
+export interface MemberUpdate {
+    type: "MEMBER_UPDATE";
+    guildId: GuildId;
+    nickname?: string;
+    avatar?: string;
+}
+
 export interface GuildEvent {
     id: HashHex;                // SHA256 of canonical encoding of `unsigned`
     seq: number;                // monotonically increasing integer >= 0
@@ -120,6 +127,7 @@ export interface Member {
     userId: UserId;
     roles: Set<string>;
     nickname?: string;
+    avatar?: string;
     joinedAt: number;
 }
 
@@ -133,6 +141,7 @@ export interface SerializableMember {
     userId: UserId;
     roles: string[]; // Serialized as array
     nickname?: string;
+    avatar?: string;
     joinedAt: number;
 }
 
@@ -184,4 +193,5 @@ export type EventBody =
     | BanUser
     | UnbanUser
     | Checkpoint
-    | EphemeralPolicyUpdate;
+    | EphemeralPolicyUpdate
+    | MemberUpdate;

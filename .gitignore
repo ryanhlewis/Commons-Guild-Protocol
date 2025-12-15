@@ -136,3 +136,5 @@ dist
 .pnp.*
 /relay-db
 *.txt
+/packages/relay/relay-db
+/packages/tests/relay-db

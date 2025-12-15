@@ -12,6 +12,7 @@ import {
     UnbanUser,
     EphemeralPolicy,
     EphemeralPolicyUpdate,
+    MemberUpdate,
     Channel,
     Role,
     Member,
@@ -174,6 +175,14 @@ export function applyEvent(state: GuildState, event: GuildEvent): GuildState {
                     retention: b.retention
                 });
             }
+            break;
+        }
+        case "MEMBER_UPDATE": {
+            const b = body as MemberUpdate;
+            const member = newState.members.get(event.author) || { userId: event.author, roles: new Set(), joinedAt: event.createdAt };
+            if (b.nickname !== undefined) member.nickname = b.nickname;
+            if (b.avatar !== undefined) member.avatar = b.avatar;
+            newState.members.set(event.author, member);
             break;
         }
         case "CHECKPOINT": {

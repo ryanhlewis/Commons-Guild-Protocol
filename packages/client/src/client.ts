@@ -38,6 +38,8 @@ export class CgpClient extends EventEmitter {
     private pendingEvents = new Map<GuildId, Map<number, GuildEvent>>();
     private groupKeys = new Map<GuildId, string>(); // Hex encoded symmetric keys
     private server: any;
+    public availablePlugins: any[] = [];
+    private isClosed = false;
 
     constructor(config: { relays: string[]; keyPair?: { pub: string; priv: Uint8Array } }) {
         super();
@@ -50,11 +52,23 @@ export class CgpClient extends EventEmitter {
         await Promise.all(promises);
     }
 
+    async configurePlugin(pluginName: string, config: any) {
+        const frame = JSON.stringify(["PLUGIN_CONFIG", { pluginName, config }]);
+        this.sockets.forEach(s => {
+            if (s.readyState === WebSocket.OPEN) s.send(frame);
+        });
+    }
+
     private async connectToRelay(url: string, retryCount = 0) {
         return new Promise<void>((resolve) => {
+            if (this.isClosed) return resolve();
             const ws = new WebSocket(url);
 
             ws.onopen = () => {
+                if (this.isClosed) {
+                    ws.close();
+                    return resolve();
+                }
                 console.log(`Connected to relay ${url}`);
                 ws.send(JSON.stringify(["HELLO", { protocol: "cgp/0.1" }]));
                 this.sockets.push(ws);
@@ -234,11 +248,27 @@ export class CgpClient extends EventEmitter {
                     // console.log(`Converted PUBLISH to EVENT and gossiped to ${gossipCount} peers`);
 
                 } else if (kind === "HELLO") {
-                    // Handshake, ignore for now
-                } else if (kind === "SUB") {
-                    // Subscription, ignore for now
+                    // P2P Handshake
+                } else if (kind === "HELLO_OK") {
+                    const p = payload as any;
+                    if (p.plugins) {
+                        this.availablePlugins = p.plugins;
+                        this.emit("plugins_loaded", this.availablePlugins);
+                    }
+                } else if (kind === "PLUGIN_CONFIG_OK") {
+                    this.emit("plugin_config_ok", payload);
+                } else if (kind === "BATCH") {
+                    const events = payload as GuildEvent[];
+                    if (Array.isArray(events)) {
+                        console.log(`Client received BATCH with ${events.length} events`);
+                        for (const event of events) {
+                            await this.updateState(event);
+                            this.emit("event", event);
+                        }
+                    }
                 } else if (kind === "ERROR") {
                     console.error("Client received ERROR:", payload);
+                    this.emit("error_frame", payload);
                 }
 
             } catch (e) {
@@ -546,6 +576,7 @@ export class CgpClient extends EventEmitter {
     }
 
     close() {
+        this.isClosed = true;
         this.sockets.forEach(s => s.close());
         this.sockets = [];
         if (this.server) {
