@@ -6,6 +6,7 @@ export interface RelayPluginContext {
     relayPublicKey: string;
     store: Store;
     publishAsRelay: (body: EventBody, createdAt?: number) => Promise<GuildEvent | undefined>;
+    broadcast: (guildId: string, event: GuildEvent) => void;
     getLog: (guildId: GuildId) => Promise<GuildEvent[]>;
 }
 

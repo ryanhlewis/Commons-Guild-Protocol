@@ -386,7 +386,7 @@ export class CgpClient extends EventEmitter {
         return channelId;
     }
 
-    async sendMessage(guildId: GuildId, channelId: ChannelId, content: string): Promise<string> {
+    async sendMessage(guildId: GuildId, channelId: ChannelId, content: string, external?: any): Promise<string> {
         let finalContent = content;
         let iv: string | undefined;
         let encrypted: boolean | undefined;
@@ -428,7 +428,9 @@ export class CgpClient extends EventEmitter {
             messageId,
             content: finalContent,
             iv,
-            encrypted
+            encrypted,
+            // @ts-ignore
+            external
         };
         await this.publish(body);
         return messageId;

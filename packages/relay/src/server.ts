@@ -66,6 +66,9 @@ export class RelayServer {
             publishAsRelay: async (body: EventBody, createdAt?: number) => {
                 return this.publishAsRelay(body, createdAt);
             },
+            broadcast: (guildId: string, event: GuildEvent) => {
+                this.broadcast(guildId, event);
+            },
             getLog: async (guildId: GuildId) => {
                 return await this.store.getLog(guildId);
             }
@@ -237,6 +240,7 @@ export class RelayServer {
     }
 
     private async handleMessage(socket: WebSocket, kind: string, payload: unknown) {
+        console.log(`[RelayServer] handleMessage: ${kind}`);
         await this.pluginsReady;
 
         for (const plugin of this.plugins) {
@@ -401,7 +405,7 @@ export class RelayServer {
         // Execute with lock
         const prev = this.mutexes.get(targetGuildId) || Promise.resolve();
         const next = prev.catch(() => { }).then(processEvent);
-        this.mutexes.set(targetGuildId, next);
+        this.mutexes.set(targetGuildId, next.then(() => { }));
         return await next;
     }
 
