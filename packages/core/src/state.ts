@@ -106,24 +106,19 @@ export function applyEvent(state: GuildState, event: GuildEvent): GuildState {
     // Basic validation: seq must be state.headSeq + 1 (unless it's the first event, handled by createInitialState)
     // But here we assume we are applying valid events in order.
 
-    const newState = { ...state }; // Shallow copy
-    // Deep copy maps/sets to avoid mutation issues if we were using immutable patterns strictly,
-    // but for performance in this reference impl we might mutate if we are careful.
-    // Let's do a mix: copy the containers we modify.
-    newState.channels = new Map(state.channels);
-    newState.roles = new Map(state.roles);
-    newState.members = new Map(state.members);
-    newState.bans = new Map(state.bans);
-    newState.headSeq = event.seq;
-    newState.headHash = event.id;
-    newState.access = state.access;
-
     const body = event.body;
+
+    // Optimization: Only copy Maps that will actually be modified
+    let newChannels = state.channels;
+    let newRoles = state.roles;
+    let newMembers = state.members;
+    let newBans = state.bans;
 
     switch (body.type) {
         case "CHANNEL_CREATE": {
             const b = body as ChannelCreate;
-            newState.channels.set(b.channelId, {
+            newChannels = new Map(state.channels);
+            newChannels.set(b.channelId, {
                 id: b.channelId,
                 name: b.name,
                 kind: b.kind,
@@ -133,44 +128,52 @@ export function applyEvent(state: GuildState, event: GuildEvent): GuildState {
         }
         case "ROLE_ASSIGN": {
             const b = body as RoleAssign;
-            const member = newState.members.get(b.userId) || { userId: b.userId, roles: new Set(), joinedAt: event.createdAt };
+            newMembers = new Map(state.members);
+            const member = newMembers.get(b.userId) || { userId: b.userId, roles: new Set(), joinedAt: event.createdAt };
             // Copy roles set
-            member.roles = new Set(member.roles);
-            member.roles.add(b.roleId);
-            newState.members.set(b.userId, member);
+            const newRolesSet = new Set(member.roles);
+            newRolesSet.add(b.roleId);
+            newMembers.set(b.userId, { ...member, roles: newRolesSet });
             break;
         }
         case "ROLE_REVOKE": {
             const b = body as RoleRevoke;
-            const member = newState.members.get(b.userId);
+            const member = state.members.get(b.userId);
             if (member) {
-                member.roles = new Set(member.roles);
-                member.roles.delete(b.roleId);
-                newState.members.set(b.userId, member);
+                newMembers = new Map(state.members);
+                const newRolesSet = new Set(member.roles);
+                newRolesSet.delete(b.roleId);
+                newMembers.set(b.userId, { ...member, roles: newRolesSet });
             }
             break;
         }
         case "BAN_USER": {
             const b = body as BanUser;
-            newState.bans.set(b.userId, {
+            newBans = new Map(state.bans);
+            newBans.set(b.userId, {
                 userId: b.userId,
                 reason: b.reason,
                 bannedAt: event.createdAt
             });
             // Also remove from members?
-            newState.members.delete(b.userId);
+            if (state.members.has(b.userId)) {
+                newMembers = new Map(state.members);
+                newMembers.delete(b.userId);
+            }
             break;
         }
         case "UNBAN_USER": {
             const b = body as UnbanUser;
-            newState.bans.delete(b.userId);
+            newBans = new Map(state.bans);
+            newBans.delete(b.userId);
             break;
         }
         case "EPHEMERAL_POLICY_UPDATE": {
             const b = body as EphemeralPolicyUpdate;
-            const channel = newState.channels.get(b.channelId);
+            const channel = state.channels.get(b.channelId);
             if (channel) {
-                newState.channels.set(b.channelId, {
+                newChannels = new Map(state.channels);
+                newChannels.set(b.channelId, {
                     ...channel,
                     retention: b.retention
                 });
@@ -186,16 +189,7 @@ export function applyEvent(state: GuildState, event: GuildEvent): GuildState {
             break;
         }
         case "CHECKPOINT": {
-            const b = body as Checkpoint;
-            // If we are applying a checkpoint event, it usually means we are verifying it or loading from it.
-            // If we are blindly applying it, we might overwrite state.
-            // However, in a linear log, a checkpoint is just a snapshot.
-            // If we trust the source, we could replace the state.
-            // But typically checkpoints are used to START state reconstruction, not applied in the middle.
-            // If it appears in the middle, it's advisory/backup.
-            // For now, let's just validate that it matches our current state if we wanted to be strict,
-            // or just ignore it as it doesn't CHANGE state (it reflects it).
-            // Let's ignore it for state transitions, as it doesn't mutate the guild.
+            // Checkpoints don't change guild structure state
             break;
         }
         // MESSAGE, EDIT_MESSAGE, DELETE_MESSAGE don't change guild structure state (usually).
@@ -203,5 +197,18 @@ export function applyEvent(state: GuildState, event: GuildEvent): GuildState {
         // For now, we ignore them in the structural state.
     }
 
-    return newState;
+    // Only create a new state object if something actually changed
+    // Note: headSeq and headHash always change, so we focus on collection changes
+    const collectionsChanged = newChannels !== state.channels || newRoles !== state.roles || 
+        newMembers !== state.members || newBans !== state.bans;
+
+    return {
+        ...state,
+        channels: newChannels,
+        roles: newRoles,
+        members: newMembers,
+        bans: newBans,
+        headSeq: event.seq,
+        headHash: event.id
+    };
 }

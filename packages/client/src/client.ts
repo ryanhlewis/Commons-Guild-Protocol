@@ -36,6 +36,9 @@ export class CgpClient extends EventEmitter {
     private keyPair?: { pub: string; priv: Uint8Array };
     private state = new Map<GuildId, GuildState>();
     private seenEvents = new Set<string>();
+    private seenEventsQueue: string[] = []; // Track insertion order for efficient cleanup
+    private readonly MAX_SEEN_EVENTS = 1000;
+    private readonly CLEANUP_THRESHOLD = 900;
     private pendingEvents = new Map<GuildId, Map<number, GuildEvent>>();
     private groupKeys = new Map<GuildId, string>(); // Hex encoded symmetric keys
     private server: any;
@@ -153,12 +156,18 @@ export class CgpClient extends EventEmitter {
 
                     if (this.seenEvents.has(event.id)) return;
                     this.seenEvents.add(event.id);
-                    if (this.seenEvents.size > 1000) {
-                        const it = this.seenEvents.values();
-                        for (let i = 0; i < 100; i++) {
-                            const val = it.next().value;
-                            if (val) this.seenEvents.delete(val);
+                    this.seenEventsQueue.push(event.id);
+                    
+                    // Efficient cleanup: Remove oldest entries when threshold is exceeded
+                    if (this.seenEventsQueue.length > this.MAX_SEEN_EVENTS) {
+                        // Remove oldest entries until we're back to CLEANUP_THRESHOLD
+                        const toRemove = this.seenEventsQueue.length - this.CLEANUP_THRESHOLD;
+                        for (let i = 0; i < toRemove; i++) {
+                            const oldId = this.seenEventsQueue[i];
+                            this.seenEvents.delete(oldId);
                         }
+                        // Keep only the recent entries in the queue
+                        this.seenEventsQueue = this.seenEventsQueue.slice(toRemove);
                     }
 
                     if (!verify(event.author, msgHash, event.signature)) {

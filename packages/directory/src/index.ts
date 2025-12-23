@@ -16,6 +16,7 @@ export class DirectoryService {
     private db: Level<string, string>;
     private tree: MerkleTree;
     private ready: Promise<void>;
+    private leafCache = new Map<string, Buffer>(); // handle -> leaf hash
 
     constructor(dbPath: string = "./directory-db") {
         this.db = new Level(dbPath);
@@ -42,6 +43,14 @@ export class DirectoryService {
 
         const value: DirectoryValue = { handle, guildId, guildPubkey, relays };
         await this.db.put(handle, JSON.stringify(value));
+        
+        // Update leaf cache and tree incrementally
+        const leaf = this.hashEntry(value);
+        this.leafCache.set(handle, leaf);
+        
+        // Rebuild tree with updated leaves
+        // Note: MerkleTree doesn't support incremental updates natively,
+        // but we can optimize by maintaining the leaf list
         await this.rebuildTree();
     }
 
@@ -58,9 +67,8 @@ export class DirectoryService {
 
     async getProof(handle: string) {
         await this.ready;
-        const entry = await this.getEntry(handle);
-        if (!entry) return null;
-        const leaf = this.hashEntry(entry);
+        const leaf = this.leafCache.get(handle);
+        if (!leaf) return null;
         return this.tree.getHexProof(leaf);
     }
 
@@ -71,10 +79,14 @@ export class DirectoryService {
 
     private async rebuildTree() {
         const leaves: Buffer[] = [];
+        this.leafCache.clear();
+        
         // Scan all entries
         for await (const [key, value] of this.db.iterator()) {
             const entry = JSON.parse(value);
-            leaves.push(this.hashEntry(entry));
+            const leaf = this.hashEntry(entry);
+            leaves.push(leaf);
+            this.leafCache.set(entry.handle, leaf);
         }
 
         this.tree = new MerkleTree(leaves, sha256, { sortPairs: true });
