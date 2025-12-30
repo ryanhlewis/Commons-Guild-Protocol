@@ -40,6 +40,7 @@ export class CgpClient extends EventEmitter {
     private groupKeys = new Map<GuildId, string>(); // Hex encoded symmetric keys
     private server: any;
     public availablePlugins: any[] = [];
+    private pluginsBySocket = new Map<WebSocket, any[]>();
     private isClosed = false;
 
     constructor(config: { relays: string[]; keyPair?: { pub: string; priv: Uint8Array } }) {
@@ -55,8 +56,18 @@ export class CgpClient extends EventEmitter {
 
     async configurePlugin(pluginName: string, config: any) {
         const frame = JSON.stringify(["PLUGIN_CONFIG", { pluginName, config }]);
+        const hasPluginMap = this.pluginsBySocket.size > 0;
         this.sockets.forEach(s => {
-            if (s.readyState === WebSocket.OPEN) s.send(frame);
+            if (s.readyState !== WebSocket.OPEN) return;
+            const plugins = this.pluginsBySocket.get(s);
+            if (plugins) {
+                const supportsPlugin = plugins.some((p: any) => p && p.name === pluginName);
+                if (supportsPlugin) s.send(frame);
+                return;
+            }
+            if (!hasPluginMap) {
+                s.send(frame);
+            }
         });
     }
 
@@ -76,7 +87,7 @@ export class CgpClient extends EventEmitter {
                 resolve();
             };
 
-            ws.onmessage = (msg) => this.handleMessage(msg.data.toString());
+            ws.onmessage = (msg) => this.handleMessage(msg.data.toString(), ws);
 
             ws.onerror = (err) => {
                 console.error(`WS Error on ${url}`, err);
@@ -88,6 +99,8 @@ export class CgpClient extends EventEmitter {
                 if (index > -1) {
                     this.sockets.splice(index, 1);
                 }
+                this.pluginsBySocket.delete(ws);
+                this.updateAvailablePlugins();
 
                 const delay = Math.min(1000 * Math.pow(2, retryCount), 30000);
                 console.log(`Reconnecting to ${url} in ${delay}ms...`);
@@ -113,6 +126,8 @@ export class CgpClient extends EventEmitter {
             socket.on("close", () => {
                 const index = this.sockets.indexOf(socket);
                 if (index > -1) this.sockets.splice(index, 1);
+                this.pluginsBySocket.delete(socket);
+                this.updateAvailablePlugins();
             });
         });
         this.server = wss;
@@ -134,9 +149,29 @@ export class CgpClient extends EventEmitter {
                 console.error(`Peer WS Error ${url}`, err);
                 reject(err);
             };
+            ws.onclose = () => {
+                const index = this.sockets.indexOf(ws);
+                if (index > -1) this.sockets.splice(index, 1);
+                this.pluginsBySocket.delete(ws);
+                this.updateAvailablePlugins();
+            };
         });
     }
     private messageQueue = Promise.resolve();
+
+    private updateAvailablePlugins() {
+        const merged = new Map<string, any>();
+        for (const plugins of this.pluginsBySocket.values()) {
+            if (!Array.isArray(plugins)) continue;
+            for (const plugin of plugins) {
+                if (plugin && typeof plugin.name === "string" && !merged.has(plugin.name)) {
+                    merged.set(plugin.name, plugin);
+                }
+            }
+        }
+        this.availablePlugins = Array.from(merged.values());
+        this.emit("plugins_loaded", this.availablePlugins);
+    }
 
     private async handleMessage(data: string, socket?: WebSocket) {
         // Chain the processing to ensure sequential execution
@@ -145,6 +180,7 @@ export class CgpClient extends EventEmitter {
                 const parsed = JSON.parse(data);
                 if (!Array.isArray(parsed) || parsed.length < 2) return;
                 const [kind, payload] = parsed as [string, unknown];
+                this.emit("frame", { kind, payload });
 
                 if (kind === "EVENT") {
                     const event = payload as GuildEvent;
@@ -252,9 +288,9 @@ export class CgpClient extends EventEmitter {
                     // P2P Handshake
                 } else if (kind === "HELLO_OK") {
                     const p = payload as any;
-                    if (p.plugins) {
-                        this.availablePlugins = p.plugins;
-                        this.emit("plugins_loaded", this.availablePlugins);
+                    if (Array.isArray(p.plugins) && socket) {
+                        this.pluginsBySocket.set(socket, p.plugins);
+                        this.updateAvailablePlugins();
                     }
                 } else if (kind === "PLUGIN_CONFIG_OK") {
                     this.emit("plugin_config_ok", payload);
@@ -616,6 +652,8 @@ export class CgpClient extends EventEmitter {
         this.isClosed = true;
         this.sockets.forEach(s => s.close());
         this.sockets = [];
+        this.pluginsBySocket.clear();
+        this.availablePlugins = [];
         if (this.server) {
             this.server.close();
         }
