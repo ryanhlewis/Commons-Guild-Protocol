@@ -18,6 +18,7 @@ export interface PluginInputSchema {
     sensitive?: boolean;
     description: string;
     placeholder?: string;
+    scope?: "relay" | "client" | "both";
 }
 
 export interface PluginMetadata {
@@ -25,6 +26,10 @@ export interface PluginMetadata {
     description?: string;
     icon?: string; // URL or base64
     version?: string;
+    clientExtension?: string;
+    clientExtensionDescription?: string;
+    clientExtensionUrl?: string;
+    clientExtensionRequiresBrowserExtension?: boolean;
 }
 
 export interface RelayPlugin {
@@ -39,4 +44,3 @@ export interface RelayPlugin {
     onEventAppended?: (args: { event: GuildEvent; socket?: WebSocket }, ctx: RelayPluginContext) => void | Promise<void>;
     onClose?: (ctx: RelayPluginContext) => void | Promise<void>;
 }
-
