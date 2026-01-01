@@ -426,6 +426,63 @@ Server behavior:
 
 ---
 
+### 5.5 Relay plugins (optional extension)
+
+CGP core does not require relay plugins, but relays may advertise optional plugins for integration features.
+If supported, `HELLO_OK` may include a `plugins` array:
+
+```ts
+interface RelayPluginDescriptor {
+  name: string;
+  metadata?: PluginMetadata;
+  inputs?: PluginInputSchema[];
+}
+
+interface PluginMetadata {
+  name: string;
+  description?: string;
+  icon?: string;
+  version?: string;
+  clientExtension?: string;
+  clientExtensionDescription?: string;
+  clientExtensionUrl?: string;
+  clientExtensionRequiresBrowserExtension?: boolean;
+  clientExtensionBrowserInstallUrl?: string;
+  clientExtensionBrowserInstallLabel?: string;
+  clientExtensionBrowserInstallHint?: string;
+}
+
+interface PluginInputSchema {
+  name: string;
+  type: "string" | "number" | "boolean" | "object";
+  required: boolean;
+  sensitive?: boolean;
+  description?: string;
+  placeholder?: string;
+  scope?: "relay" | "client" | "both";
+}
+```
+
+Clients may configure a plugin by sending:
+
+```ts
+["PLUGIN_CONFIG", { pluginName: string; config: any }]
+```
+
+Relays acknowledge with:
+
+```ts
+["PLUGIN_CONFIG_OK", { pluginName: string }]
+```
+
+or an `["ERROR", { code: "PLUGIN_NOT_FOUND" | "PLUGIN_CONFIG_ERROR", message: string }]`.
+
+If `clientExtensionUrl` is relative, clients resolve it against the relay HTTP origin (if the relay serves extension bundles).
+If `clientExtensionUrl` is absolute, clients fetch directly. HTTP hosting of extension bundles is optional and not part of the WebSocket protocol.
+Relay implementations may also expose plugin-provided static assets under `/extensions/{clientExtension}/...` as a convenience.
+
+---
+
 ## 6. P2P mode (optional extension)
 
 In pure P2P mode (no relay reachable):

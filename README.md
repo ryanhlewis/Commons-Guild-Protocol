@@ -41,6 +41,20 @@ Instead, it borrows the **ledger idea** and applies it to community governance, 
 
 ---
 
+## Relay plugins and client extensions (optional)
+
+Relays may load optional plugins to integrate with external systems. When enabled, a relay can advertise plugin metadata in `HELLO_OK` (see `SPEC.md`), including optional client extension information.
+
+Relay implementations may optionally expose plugin-provided extension bundles over HTTP at:
+
+```
+http://<relay-host>/extensions/<clientExtension>/index.js
+```
+
+This hosting is optional; clients may also load extensions from absolute URLs.
+
+---
+
 ## Status
 
 - **Spec:** draft 0.1.

@@ -1,4 +1,8 @@
 import { WebSocketServer, WebSocket } from "ws";
+import { createServer, IncomingMessage, ServerResponse } from "http";
+import { createReadStream } from "fs";
+import { stat } from "fs/promises";
+import path from "path";
 import {
     GuildEvent,
     computeEventId,
@@ -30,6 +34,7 @@ interface Subscription {
 
 export class RelayServer {
     private wss: WebSocketServer;
+    private httpServer: ReturnType<typeof createServer>;
     private store: Store;
     private plugins: RelayPlugin[];
     private pluginCtx: RelayPluginContext;
@@ -50,7 +55,18 @@ export class RelayServer {
             this.store = dbPathOrStore;
         }
         this.plugins = plugins;
-        this.wss = new WebSocketServer({ port });
+        this.httpServer = createServer((req, res) => {
+            void this.handleHttp(req, res).catch((err) => {
+                console.error("Relay HTTP handler failed:", err);
+                if (!res.headersSent) {
+                    res.statusCode = 500;
+                    res.end("Internal error");
+                } else {
+                    res.end();
+                }
+            });
+        });
+        this.wss = new WebSocketServer({ server: this.httpServer });
 
         // Generate a random keypair for the relay (in production, load from config)
         const privateKey = generatePrivateKey();
@@ -115,6 +131,7 @@ export class RelayServer {
             this.createCheckpoints().catch(err => console.error("Checkpoint failed:", err));
         }, 60000);
 
+        this.httpServer.listen(port);
         console.log(`Relay listening on port ${port}`);
     }
 
@@ -122,6 +139,133 @@ export class RelayServer {
         const addr = this.wss.address();
         if (!addr || typeof addr === "string") return NaN;
         return addr.port;
+    }
+
+    private setExtensionHeaders(res: ServerResponse, contentType?: string, length?: number) {
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+        res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+        res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+        res.setHeader("Cache-Control", "no-store");
+        if (contentType) res.setHeader("Content-Type", contentType);
+        if (typeof length === "number") res.setHeader("Content-Length", length);
+    }
+
+    private getContentType(filePath: string) {
+        const ext = path.extname(filePath).toLowerCase();
+        switch (ext) {
+            case ".js":
+            case ".mjs":
+                return "application/javascript; charset=utf-8";
+            case ".json":
+            case ".map":
+                return "application/json; charset=utf-8";
+            case ".css":
+                return "text/css; charset=utf-8";
+            case ".svg":
+                return "image/svg+xml";
+            case ".png":
+                return "image/png";
+            case ".jpg":
+            case ".jpeg":
+                return "image/jpeg";
+            case ".gif":
+                return "image/gif";
+            default:
+                return "application/octet-stream";
+        }
+    }
+
+    private findExtensionPlugin(extensionName: string): RelayPlugin | undefined {
+        if (!extensionName) return undefined;
+        return (
+            this.plugins.find((plugin) => plugin.metadata?.clientExtension === extensionName) ||
+            this.plugins.find((plugin) => plugin.name === extensionName)
+        );
+    }
+
+    private async handleHttp(req: IncomingMessage, res: ServerResponse) {
+        const rawUrl = req.url || "/";
+        const pathname = rawUrl.split("?")[0] || "/";
+        if (!pathname.startsWith("/extensions/")) {
+            res.statusCode = 404;
+            res.end("Not found");
+            return;
+        }
+
+        if (req.method === "OPTIONS") {
+            this.setExtensionHeaders(res);
+            res.statusCode = 204;
+            res.end();
+            return;
+        }
+
+        if (req.method !== "GET" && req.method !== "HEAD") {
+            this.setExtensionHeaders(res);
+            res.statusCode = 405;
+            res.end("Method not allowed");
+            return;
+        }
+
+        let relPath = pathname.slice("/extensions/".length);
+        try {
+            relPath = decodeURIComponent(relPath);
+        } catch {
+            this.setExtensionHeaders(res);
+            res.statusCode = 400;
+            res.end("Bad request");
+            return;
+        }
+
+        relPath = relPath.replace(/^\/+/, "");
+        const segments = relPath.split("/").filter(Boolean);
+        const extensionName = segments.shift() || "";
+        const plugin = this.findExtensionPlugin(extensionName);
+        if (!plugin || !plugin.staticDir) {
+            this.setExtensionHeaders(res);
+            res.statusCode = 404;
+            res.end("Extension not available");
+            return;
+        }
+
+        const filePath = segments.length > 0 ? segments.join("/") : "index.js";
+        const baseDir = path.resolve(plugin.staticDir);
+        const resolved = path.resolve(baseDir, filePath);
+        if (!resolved.startsWith(baseDir)) {
+            this.setExtensionHeaders(res);
+            res.statusCode = 403;
+            res.end("Forbidden");
+            return;
+        }
+
+        let fileStat;
+        try {
+            fileStat = await stat(resolved);
+        } catch {
+            this.setExtensionHeaders(res);
+            res.statusCode = 404;
+            res.end("Not found");
+            return;
+        }
+
+        if (!fileStat.isFile()) {
+            this.setExtensionHeaders(res);
+            res.statusCode = 404;
+            res.end("Not found");
+            return;
+        }
+
+        const contentType = this.getContentType(resolved);
+        this.setExtensionHeaders(res, contentType, fileStat.size);
+
+        if (req.method === "HEAD") {
+            res.statusCode = 200;
+            res.end();
+            return;
+        }
+
+        res.statusCode = 200;
+        createReadStream(resolved).pipe(res);
     }
 
     private async initPlugins() {
@@ -437,6 +581,7 @@ export class RelayServer {
         clearInterval(this.pruneTimer);
         clearInterval(this.checkpointTimer);
         this.wss.close();
+        this.httpServer.close();
         await this.pluginsReady;
         for (const plugin of this.plugins) {
             try {

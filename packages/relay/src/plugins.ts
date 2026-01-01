@@ -30,12 +30,16 @@ export interface PluginMetadata {
     clientExtensionDescription?: string;
     clientExtensionUrl?: string;
     clientExtensionRequiresBrowserExtension?: boolean;
+    clientExtensionBrowserInstallUrl?: string;
+    clientExtensionBrowserInstallLabel?: string;
+    clientExtensionBrowserInstallHint?: string;
 }
 
 export interface RelayPlugin {
     name: string;
     metadata?: PluginMetadata;
     inputs?: PluginInputSchema[];
+    staticDir?: string;
 
     onInit?: (ctx: RelayPluginContext) => void | Promise<void>;
     onConfig?: (args: { socket: WebSocket; config: any }, ctx: RelayPluginContext) => void | Promise<void>;
