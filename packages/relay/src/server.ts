@@ -187,24 +187,87 @@ export class RelayServer {
     private async handleHttp(req: IncomingMessage, res: ServerResponse) {
         const rawUrl = req.url || "/";
         const pathname = rawUrl.split("?")[0] || "/";
-        if (!pathname.startsWith("/extensions/")) {
-            res.statusCode = 404;
-            res.end("Not found");
+        await this.pluginsReady;
+
+        if (await this.handlePluginHttp(req, res, rawUrl, pathname)) {
             return;
+        }
+
+        if (await this.handleExtensionHttp(req, res, pathname)) {
+            return;
+        }
+
+        res.statusCode = 404;
+        res.end("Not found");
+    }
+
+    private async handlePluginHttp(req: IncomingMessage, res: ServerResponse, rawUrl: string, pathname: string) {
+        if (!pathname.startsWith("/plugins/")) {
+            return false;
+        }
+
+        let relPath = pathname.slice("/plugins/".length);
+        try {
+            relPath = decodeURIComponent(relPath);
+        } catch {
+            res.statusCode = 400;
+            res.end("Bad request");
+            return true;
+        }
+
+        relPath = relPath.replace(/^\/+/, "");
+        const pathSegments = relPath.split("/").filter(Boolean);
+        const pluginName = pathSegments[0] || "";
+        const plugin = this.plugins.find((candidate) => candidate.name === pluginName);
+        if (!plugin || !plugin.onHttp) {
+            res.statusCode = 404;
+            res.end("Plugin route not found");
+            return true;
+        }
+
+        try {
+            const handled = await plugin.onHttp(
+                {
+                    req,
+                    res,
+                    rawUrl,
+                    pathname,
+                    pathSegments
+                },
+                this.pluginCtx
+            );
+            if (!handled && !res.writableEnded) {
+                res.statusCode = 404;
+                res.end("Plugin route not found");
+            }
+        } catch (e: any) {
+            console.error(`Relay plugin ${plugin.name} failed handling HTTP route ${pathname}:`, e);
+            if (!res.writableEnded) {
+                res.statusCode = 500;
+                res.end(e?.message || "Internal plugin error");
+            }
+        }
+
+        return true;
+    }
+
+    private async handleExtensionHttp(req: IncomingMessage, res: ServerResponse, pathname: string) {
+        if (!pathname.startsWith("/extensions/")) {
+            return false;
         }
 
         if (req.method === "OPTIONS") {
             this.setExtensionHeaders(res);
             res.statusCode = 204;
             res.end();
-            return;
+            return true;
         }
 
         if (req.method !== "GET" && req.method !== "HEAD") {
             this.setExtensionHeaders(res);
             res.statusCode = 405;
             res.end("Method not allowed");
-            return;
+            return true;
         }
 
         let relPath = pathname.slice("/extensions/".length);
@@ -214,7 +277,7 @@ export class RelayServer {
             this.setExtensionHeaders(res);
             res.statusCode = 400;
             res.end("Bad request");
-            return;
+            return true;
         }
 
         relPath = relPath.replace(/^\/+/, "");
@@ -225,7 +288,7 @@ export class RelayServer {
             this.setExtensionHeaders(res);
             res.statusCode = 404;
             res.end("Extension not available");
-            return;
+            return true;
         }
 
         const filePath = segments.length > 0 ? segments.join("/") : "index.js";
@@ -235,7 +298,7 @@ export class RelayServer {
             this.setExtensionHeaders(res);
             res.statusCode = 403;
             res.end("Forbidden");
-            return;
+            return true;
         }
 
         let fileStat;
@@ -245,14 +308,14 @@ export class RelayServer {
             this.setExtensionHeaders(res);
             res.statusCode = 404;
             res.end("Not found");
-            return;
+            return true;
         }
 
         if (!fileStat.isFile()) {
             this.setExtensionHeaders(res);
             res.statusCode = 404;
             res.end("Not found");
-            return;
+            return true;
         }
 
         const contentType = this.getContentType(resolved);
@@ -261,11 +324,12 @@ export class RelayServer {
         if (req.method === "HEAD") {
             res.statusCode = 200;
             res.end();
-            return;
+            return true;
         }
 
         res.statusCode = 200;
         createReadStream(resolved).pipe(res);
+        return true;
     }
 
     private async initPlugins() {

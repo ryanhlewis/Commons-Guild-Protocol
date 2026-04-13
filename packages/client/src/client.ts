@@ -35,6 +35,7 @@ export class CgpClient extends EventEmitter {
     private sockets: WebSocket[] = [];
     private keyPair?: { pub: string; priv: Uint8Array };
     private state = new Map<GuildId, GuildState>();
+    private desiredSubscriptions = new Set<GuildId>();
     private seenEvents = new Set<string>();
     private pendingEvents = new Map<GuildId, Map<number, GuildEvent>>();
     private groupKeys = new Map<GuildId, string>(); // Hex encoded symmetric keys
@@ -71,6 +72,18 @@ export class CgpClient extends EventEmitter {
         });
     }
 
+    private sendSubscription(socket: WebSocket, guildId: GuildId) {
+        if (socket.readyState !== WebSocket.OPEN) return;
+        const subId = Math.random().toString(36).slice(2);
+        socket.send(JSON.stringify(["SUB", { subId, guildId }]));
+    }
+
+    private replaySubscriptions(socket: WebSocket) {
+        for (const guildId of this.desiredSubscriptions) {
+            this.sendSubscription(socket, guildId);
+        }
+    }
+
     private async connectToRelay(url: string, retryCount = 0) {
         return new Promise<void>((resolve) => {
             if (this.isClosed) return resolve();
@@ -84,6 +97,7 @@ export class CgpClient extends EventEmitter {
                 console.log(`Connected to relay ${url}`);
                 ws.send(JSON.stringify(["HELLO", { protocol: "cgp/0.1" }]));
                 this.sockets.push(ws);
+                this.replaySubscriptions(ws);
                 resolve();
             };
 
@@ -122,6 +136,7 @@ export class CgpClient extends EventEmitter {
         wss.on("connection", (socket) => {
             console.log(`Incoming connection on port ${port}`);
             this.sockets.push(socket);
+            this.replaySubscriptions(socket);
             socket.on("message", (data) => this.handleMessage(data.toString(), socket));
             socket.on("close", () => {
                 const index = this.sockets.indexOf(socket);
@@ -141,6 +156,7 @@ export class CgpClient extends EventEmitter {
                 console.log(`Connected to peer ${url}`);
                 ws.send(JSON.stringify(["HELLO", { protocol: "cgp/0.1", mode: "p2p" }]));
                 this.sockets.push(ws);
+                this.replaySubscriptions(ws);
                 console.log(`Peer 1 sockets count: ${this.sockets.length}`);
                 resolve();
             };
@@ -534,13 +550,8 @@ export class CgpClient extends EventEmitter {
     }
 
     async subscribe(guildId: GuildId): Promise<void> {
-        const subId = Math.random().toString(36).slice(2);
-        const frame = JSON.stringify(["SUB", { subId, guildId }]);
-        this.sockets.forEach(s => {
-            if (s.readyState === WebSocket.OPEN) {
-                s.send(frame);
-            }
-        });
+        this.desiredSubscriptions.add(guildId);
+        this.sockets.forEach((s) => this.sendSubscription(s, guildId));
     }
 
     async getMembers(guildId: string): Promise<SerializableMember[]> {

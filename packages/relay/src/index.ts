@@ -2,10 +2,10 @@ import { RelayServer } from "./server";
 
 import { Store, MemoryStore } from "./store";
 import { LevelStore } from "./store_level";
-import type { RelayPlugin, RelayPluginContext } from "./plugins";
+import type { RelayPlugin, RelayPluginContext, RelayPluginHttpArgs } from "./plugins";
 
 export { RelayServer, Store, MemoryStore, LevelStore };
-export type { RelayPlugin, RelayPluginContext };
+export type { RelayPlugin, RelayPluginContext, RelayPluginHttpArgs };
 
 if (require.main === module) {
     void (async () => {
@@ -15,7 +15,6 @@ if (require.main === module) {
         const PORT = parseInt(process.env.CGP_RELAY_PORT || process.env.PORT || "7447", 10);
         const DB_PATH = process.env.CGP_RELAY_DB || "./relay-db";
         const PLUGINS_SPEC = process.env.CGP_RELAY_PLUGINS;
-
         // Clean database if --clean flag is passed
         if (shouldClean) {
             const fs = await import('fs');
@@ -39,8 +38,8 @@ if (require.main === module) {
         }
 
         const plugins: RelayPlugin[] = [];
-        if (PLUGINS_SPEC) {
-            const pluginNames = parsePluginList(PLUGINS_SPEC);
+        const pluginNames = Array.from(new Set(parsePluginList(PLUGINS_SPEC || "")));
+        if (pluginNames.length > 0) {
             for (const name of pluginNames) {
                 try {
                     const plugin = await loadPlugin(name, pluginConfig[name]);

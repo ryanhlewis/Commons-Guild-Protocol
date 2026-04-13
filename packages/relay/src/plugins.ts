@@ -1,3 +1,4 @@
+import type { IncomingMessage, ServerResponse } from "http";
 import type { WebSocket } from "ws";
 import type { GuildEvent, EventBody, GuildId, SerializableMember } from "@cgp/core";
 import type { Store } from "./store";
@@ -10,6 +11,13 @@ export interface RelayPluginContext {
     getLog: (guildId: GuildId) => Promise<GuildEvent[]>;
 }
 
+export interface RelayPluginHttpArgs {
+    req: IncomingMessage;
+    res: ServerResponse;
+    rawUrl: string;
+    pathname: string;
+    pathSegments: string[];
+}
 
 export interface PluginInputSchema {
     name: string;
@@ -27,8 +35,11 @@ export interface PluginMetadata {
     icon?: string; // URL or base64
     version?: string;
     clientExtension?: string;
+    clientExtensionPluginId?: string;
+    clientExtensionAutoEnableInTauri?: boolean;
     clientExtensionDescription?: string;
     clientExtensionUrl?: string;
+    clientExtensionManifestUrl?: string;
     clientExtensionRequiresBrowserExtension?: boolean;
     clientExtensionBrowserInstallUrl?: string;
     clientExtensionBrowserInstallLabel?: string;
@@ -45,6 +56,7 @@ export interface RelayPlugin {
     onConfig?: (args: { socket: WebSocket; config: any }, ctx: RelayPluginContext) => void | Promise<void>;
     onGetMembers?: (args: { guildId: string; socket?: WebSocket }, ctx: RelayPluginContext) => Promise<SerializableMember[] | undefined>;
     onFrame?: (args: { socket: WebSocket; kind: string; payload: unknown }, ctx: RelayPluginContext) => boolean | Promise<boolean>;
+    onHttp?: (args: RelayPluginHttpArgs, ctx: RelayPluginContext) => boolean | Promise<boolean>;
     onEventAppended?: (args: { event: GuildEvent; socket?: WebSocket }, ctx: RelayPluginContext) => void | Promise<void>;
     onClose?: (ctx: RelayPluginContext) => void | Promise<void>;
 }

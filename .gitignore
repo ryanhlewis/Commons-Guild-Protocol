@@ -135,6 +135,10 @@ dist
 .yarn/install-state.gz
 .pnp.*
 /relay-db
+/directory-db
+/packages/directory/directory-db
+/scripts/logs
+/packages/relay/*plugin-identity.json
 *.txt
 /packages/relay/relay-db
 /packages/tests/relay-db

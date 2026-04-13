@@ -3,6 +3,8 @@ import { MerkleTree } from "merkletreejs";
 import { sha256 } from "@noble/hashes/sha256";
 import { GuildId, PublicKeyHex, HashHex, hashObject, verify } from "@cgp/core";
 import { Level } from "level";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 interface DirectoryValue {
     guildId: GuildId;
@@ -90,11 +92,25 @@ export class DirectoryService {
 }
 
 export const app = express();
-const port = 3000;
+const port = (() => {
+    const raw = process.env.PORT ?? process.env.CGP_DIRECTORY_PORT ?? '3000';
+    const parsed = Number.parseInt(raw, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 3000;
+})();
+const isMainModule = (() => {
+    const thisFile = path.resolve(fileURLToPath(import.meta.url));
+    return process.argv.slice(1).some((arg) => {
+        try {
+            return path.resolve(arg) === thisFile;
+        } catch {
+            return false;
+        }
+    });
+})();
 
 let service: DirectoryService;
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isMainModule) {
     service = new DirectoryService();
 
     app.use(express.json());

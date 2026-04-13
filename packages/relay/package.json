@@ -4,6 +4,7 @@
     "main": "src/index.ts",
     "scripts": {
         "dev": "tsx watch src/index.ts",
+        "dev:clean": "node scripts/dev-clean.mjs",
         "build": "tsc"
     },
     "dependencies": {
