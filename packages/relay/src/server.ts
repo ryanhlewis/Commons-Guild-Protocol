@@ -32,6 +32,140 @@ interface Subscription {
     channels?: ChannelId[];
 }
 
+const DIRECT_MESSAGE_SNAPSHOT_MESSAGE_LIMIT = Math.max(
+    1,
+    Number(process.env.CGP_RELAY_DM_SNAPSHOT_MESSAGE_LIMIT ?? "96") || 96
+);
+
+const DIRECT_MESSAGE_SNAPSHOT_TRANSIENT_TYPES = new Set(["CALL_EVENT", "AGENT_INTENT", "CHECKPOINT"]);
+const DIRECT_MESSAGE_SNAPSHOT_DEPENDENT_TYPES = new Set([
+    "EDIT_MESSAGE",
+    "DELETE_MESSAGE",
+    "REACTION_ADD",
+    "REACTION_REMOVE"
+]);
+
+function stringValue(...values: unknown[]) {
+    for (const value of values) {
+        if (typeof value === "string") {
+            const trimmed = value.trim();
+            if (trimmed) return trimmed;
+        }
+    }
+    return "";
+}
+
+function eventType(event: GuildEvent) {
+    return stringValue((event.body as any)?.type).toUpperCase();
+}
+
+function compareEventsByHistoryOrder(left: GuildEvent, right: GuildEvent) {
+    if (left.seq !== right.seq) {
+        return left.seq - right.seq;
+    }
+    if (left.createdAt !== right.createdAt) {
+        return left.createdAt - right.createdAt;
+    }
+    return stringValue(left.id).localeCompare(stringValue(right.id));
+}
+
+function isDirectMessageSnapshotGuild(guildId: GuildId, events: GuildEvent[]) {
+    for (const event of events) {
+        const body = event.body as unknown as Record<string, unknown>;
+        const type = eventType(event);
+        const channelId = stringValue(body.channelId);
+        const name = stringValue(body.name);
+        if (type === "CHANNEL_CREATE" && (channelId === guildId || channelId.startsWith("dm:"))) {
+            return true;
+        }
+        if (type === "GUILD_CREATE" && /^(DM|GROUP DM):/i.test(name)) {
+            return true;
+        }
+        if (channelId && channelId === stringValue(body.guildId) && channelId === guildId) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function compactDirectMessageSnapshot(events: GuildEvent[]) {
+    const latestGuildCreateByGuild = new Map<string, GuildEvent>();
+    const latestChannelCreateByChannel = new Map<string, GuildEvent>();
+    const latestPresenceByUser = new Map<string, GuildEvent>();
+    const passthroughFrames: GuildEvent[] = [];
+    const messageFrames: GuildEvent[] = [];
+    const dependentFrames: GuildEvent[] = [];
+
+    for (const event of events) {
+        const body = event.body as unknown as Record<string, unknown>;
+        const type = eventType(event);
+        if (DIRECT_MESSAGE_SNAPSHOT_TRANSIENT_TYPES.has(type)) {
+            continue;
+        }
+
+        switch (type) {
+            case "GUILD_CREATE": {
+                const guildId = stringValue(body.guildId) || `guild:${latestGuildCreateByGuild.size}`;
+                latestGuildCreateByGuild.set(guildId, event);
+                break;
+            }
+            case "CHANNEL_CREATE": {
+                const channelId = stringValue(body.channelId, body.guildId) || `channel:${latestChannelCreateByChannel.size}`;
+                latestChannelCreateByChannel.set(channelId, event);
+                break;
+            }
+            case "MEMBER_UPDATE":
+            case "GUILD_MEMBER_ADD": {
+                const userId = stringValue(body.userId, body.authorId, event.author);
+                if (userId) {
+                    latestPresenceByUser.set(userId.toLowerCase(), event);
+                }
+                break;
+            }
+            case "MESSAGE":
+                messageFrames.push(event);
+                break;
+            case "EDIT_MESSAGE":
+            case "DELETE_MESSAGE":
+            case "REACTION_ADD":
+            case "REACTION_REMOVE":
+                dependentFrames.push(event);
+                break;
+            default:
+                passthroughFrames.push(event);
+                break;
+        }
+    }
+
+    const tailMessages = messageFrames.slice(-DIRECT_MESSAGE_SNAPSHOT_MESSAGE_LIMIT);
+    const keptMessageIds = new Set(
+        tailMessages.map((event) => stringValue((event.body as any)?.messageId, event.id)).filter(Boolean)
+    );
+    const keptDependentFrames = dependentFrames.filter((event) =>
+        keptMessageIds.has(stringValue((event.body as any)?.messageId))
+    );
+
+    const structuralFrames = [
+        ...latestGuildCreateByGuild.values(),
+        ...latestChannelCreateByChannel.values(),
+        ...latestPresenceByUser.values()
+    ].sort(compareEventsByHistoryOrder);
+    const timelineFrames = [
+        ...passthroughFrames,
+        ...tailMessages,
+        ...keptDependentFrames
+    ].sort(compareEventsByHistoryOrder);
+
+    return [...structuralFrames, ...timelineFrames];
+}
+
+function buildSnapshotEvents(guildId: GuildId, events: GuildEvent[]) {
+    if (!isDirectMessageSnapshotGuild(guildId, events)) {
+        return events;
+    }
+    return compactDirectMessageSnapshot(events);
+}
+
 export class RelayServer {
     private wss: WebSocketServer;
     private httpServer: ReturnType<typeof createServer>;
@@ -489,14 +623,27 @@ export class RelayServer {
         } else if (kind === "SUB") {
             const p = payload as { subId: string; guildId: GuildId; channels?: ChannelId[] };
             const { subId, guildId, channels } = p;
-            const subs = this.subscriptions.get(socket);
-            if (subs) {
-                subs.set(subId, { guildId, channels });
-            }
-
-            // Send snapshot
-            const events = await this.store.getLog(guildId);
-            socket.send(JSON.stringify(["SNAPSHOT", { subId, guildId, events, endSeq: events.length - 1 }]));
+            await this.withGuildMutex(guildId, async () => {
+                const events = await this.store.getLog(guildId);
+                const snapshotEvents = buildSnapshotEvents(guildId, events);
+                const subs = this.subscriptions.get(socket);
+                if (subs) {
+                    subs.set(subId, { guildId, channels });
+                }
+                const tailEvent = events.length > 0 ? events[events.length - 1] : null;
+                socket.send(
+                    JSON.stringify([
+                        "SNAPSHOT",
+                        {
+                            subId,
+                            guildId,
+                            events: snapshotEvents,
+                            endSeq: tailEvent?.seq ?? -1,
+                            endHash: tailEvent?.id ?? null
+                        }
+                    ])
+                );
+            });
 
         } else if (kind === "PUBLISH") {
             const p = payload as { body: EventBody; author: string; signature: string; createdAt: number };
@@ -535,8 +682,7 @@ export class RelayServer {
         const { body, author, signature, createdAt } = p;
         const targetGuildId = body.guildId;
 
-        // Mutex: Serialize processing per guild to prevent race conditions on seq/prevHash
-        const processEvent = async () => {
+        return await this.withGuildMutex(targetGuildId, async () => {
             const lastEvent = await this.store.getLastEvent(targetGuildId);
 
             const seq = lastEvent ? lastEvent.seq + 1 : 0;
@@ -608,13 +754,7 @@ export class RelayServer {
 
             this.broadcast(targetGuildId, fullEvent);
             return fullEvent;
-        };
-
-        // Execute with lock
-        const prev = this.mutexes.get(targetGuildId) || Promise.resolve();
-        const next = prev.catch(() => { }).then(processEvent);
-        this.mutexes.set(targetGuildId, next.then(() => { }));
-        return await next;
+        });
     }
 
     private async runOnEventAppended(event: GuildEvent, socket?: WebSocket) {
@@ -639,6 +779,13 @@ export class RelayServer {
             }
         }
         // console.log(`Broadcasted event ${event.seq} to ${count} clients`);
+    }
+
+    private async withGuildMutex<T>(guildId: GuildId, task: () => Promise<T>): Promise<T> {
+        const prev = this.mutexes.get(guildId) || Promise.resolve();
+        const next = prev.catch(() => undefined).then(task);
+        this.mutexes.set(guildId, next.then(() => undefined, () => undefined));
+        return await next;
     }
 
     public async close() {

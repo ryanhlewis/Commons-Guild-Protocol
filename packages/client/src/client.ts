@@ -39,6 +39,7 @@ export class CgpClient extends EventEmitter {
     private seenEvents = new Set<string>();
     private pendingEvents = new Map<GuildId, Map<number, GuildEvent>>();
     private groupKeys = new Map<GuildId, string>(); // Hex encoded symmetric keys
+    private recoveringGuilds = new Set<GuildId>();
     private server: any;
     public availablePlugins: any[] = [];
     private pluginsBySocket = new Map<WebSocket, any[]>();
@@ -82,6 +83,24 @@ export class CgpClient extends EventEmitter {
         for (const guildId of this.desiredSubscriptions) {
             this.sendSubscription(socket, guildId);
         }
+    }
+
+    private recoverGuild(guildId: GuildId) {
+        if (!guildId || this.recoveringGuilds.has(guildId)) {
+            return;
+        }
+
+        this.recoveringGuilds.add(guildId);
+        this.state.delete(guildId);
+        this.pendingEvents.delete(guildId);
+
+        queueMicrotask(() => {
+            try {
+                this.sockets.forEach((socket) => this.sendSubscription(socket, guildId));
+            } finally {
+                this.recoveringGuilds.delete(guildId);
+            }
+        });
     }
 
     private async connectToRelay(url: string, retryCount = 0) {
@@ -233,19 +252,27 @@ export class CgpClient extends EventEmitter {
                     // console.log(`Gossiped event ${event.seq} to ${gossipCount} peers`);
 
                 } else if (kind === "SNAPSHOT") {
-                    const p = payload as { events: GuildEvent[]; guildId: GuildId };
-                    const { events, guildId } = p;
+                    const p = payload as { events: GuildEvent[]; guildId: GuildId; endSeq?: number; endHash?: string | null };
+                    const { events, guildId, endSeq, endHash } = p;
                     // console.log(`Client received SNAPSHOT for ${guildId} with ${events.length} events`);
                     if (events.length > 0) {
-                        let state = createInitialState(events[0]);
-                        // Extract key from initial event if present
-                        await this.extractKey(events[0]);
+                        const genesisIndex = events.findIndex((event) => event?.body?.type === "GUILD_CREATE");
+                        if (genesisIndex >= 0) {
+                            let state = createInitialState(events[genesisIndex]);
+                            await this.extractKey(events[genesisIndex]);
 
-                        for (let i = 1; i < events.length; i++) {
-                            state = applyEvent(state, events[i]);
-                            await this.extractKey(events[i]);
+                            for (let i = genesisIndex + 1; i < events.length; i++) {
+                                state = applyEvent(state, events[i]);
+                                await this.extractKey(events[i]);
+                            }
+                            if (typeof endSeq === "number" && endSeq >= state.headSeq && typeof endHash === "string" && endHash) {
+                                state.headSeq = endSeq;
+                                state.headHash = endHash;
+                            }
+                            this.state.set(guildId, state);
+                        } else {
+                            this.state.delete(guildId);
                         }
-                        this.state.set(guildId, state);
                     }
                     events.forEach((e: GuildEvent) => this.emit("event", e));
 
@@ -362,6 +389,7 @@ export class CgpClient extends EventEmitter {
                 }
             } else {
                 console.log(`Gap or Fork detected: Expected ${state.headSeq + 1}/${state.headHash}, got ${event.seq}/${event.prevHash}`);
+                this.recoverGuild(guildId);
             }
         }
     }
