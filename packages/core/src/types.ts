@@ -176,6 +176,7 @@ export interface Member {
 export interface Ban {
     userId: UserId;
     reason?: string;
+    expiresAt?: string;
     bannedAt: number;
 }
 

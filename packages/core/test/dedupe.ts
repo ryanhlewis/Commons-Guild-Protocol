@@ -3,7 +3,7 @@ import { strict as assert } from 'assert';
 
 console.log("Running Deduplication Logic Verification...");
 
-// --- Mock Types & Updater Logic (Ported from HollowContext) ---
+// --- Mock Types & Updater Logic ---
 
 interface Message {
     id: string;

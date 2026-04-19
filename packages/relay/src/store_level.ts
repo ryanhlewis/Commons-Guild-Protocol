@@ -1,6 +1,6 @@
 import { Level } from "level";
 import { GuildEvent, GuildId } from "@cgp/core";
-import { Store } from "./store";
+import { HistoryQuery, selectHistoryEvents, Store } from "./store";
 
 export class LevelStore implements Store {
     private db: Level<string, string>;
@@ -32,6 +32,10 @@ export class LevelStore implements Store {
         }
 
         return events;
+    }
+
+    async getHistory(query: HistoryQuery): Promise<GuildEvent[]> {
+        return selectHistoryEvents(await this.getLog(query.guildId), query);
     }
 
     async getLastEvent(guildId: GuildId): Promise<GuildEvent | undefined> {

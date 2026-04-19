@@ -1,6 +1,36 @@
 import { AppObjectDelete, AppObjectUpsert, ChannelCreate, DeleteMessage, EditMessage, GuildEvent, Message } from "./types";
 import { GuildState } from "./state";
 
+export type PermissionScope = "guild" | "channels" | "roles" | "messages" | "members" | "events" | "invites";
+
+const ADMIN_EVENT_TYPES = new Map<string, PermissionScope>([
+    ["GUILD_UPDATE", "guild"],
+    ["CATEGORY_UPSERT", "channels"],
+    ["CATEGORY_DELETE", "channels"],
+    ["CHANNEL_UPSERT", "channels"],
+    ["CHANNEL_DELETE", "channels"],
+    ["EVENT_UPSERT", "events"],
+    ["EVENT_DELETE", "events"],
+    ["TEMPLATE_UPSERT", "guild"],
+    ["TEMPLATE_DELETE", "guild"],
+    ["ROLE_UPSERT", "roles"],
+    ["ROLE_DELETE", "roles"],
+    ["INVITE_CREATE", "invites"],
+    ["INVITE_REVOKE", "invites"],
+    ["BAN_ADD", "members"],
+    ["BAN_REMOVE", "members"],
+    ["MEMBER_KICK", "members"]
+]);
+
+const CHANNEL_PARTICIPATION_EVENT_TYPES = new Set([
+    "REACTION_ADD",
+    "REACTION_REMOVE",
+    "DM_OPEN",
+    "CALL_EVENT",
+    "THREAD_UPSERT",
+    "THREAD_DELETE"
+]);
+
 function assertCanParticipateInGuild(state: GuildState, author: string) {
     if (state.bans.has(author)) {
         throw new Error(`User ${author} is banned`);
@@ -25,21 +55,75 @@ function assertChannelExists(state: GuildState, channelId: string) {
     }
 }
 
+function normalizePermission(value: string) {
+    return value.replace(/[\s_-]+/g, "").toLowerCase();
+}
+
+function permissionSetForMember(state: GuildState, author: string) {
+    const permissions = new Set<string>();
+    const member = state.members.get(author);
+    if (!member) {
+        return permissions;
+    }
+
+    for (const roleId of member.roles) {
+        permissions.add(normalizePermission(roleId));
+        const role = state.roles.get(roleId);
+        for (const permission of role?.permissions ?? []) {
+            permissions.add(normalizePermission(permission));
+        }
+    }
+
+    return permissions;
+}
+
+function hasAnyPermission(permissions: Set<string>, names: string[]) {
+    return names.some((name) => permissions.has(normalizePermission(name)));
+}
+
+export function canModerateScope(state: GuildState, author: string, scope: PermissionScope) {
+    if (state.ownerId === author) {
+        return true;
+    }
+
+    const permissions = permissionSetForMember(state, author);
+    if (hasAnyPermission(permissions, ["owner", "admin", "administrator", "manage_guild", "manage_server"])) {
+        return true;
+    }
+
+    switch (scope) {
+        case "channels":
+            return hasAnyPermission(permissions, ["manage_channels", "manageChannels"]);
+        case "roles":
+            return hasAnyPermission(permissions, ["manage_roles", "manageRoles"]);
+        case "messages":
+            return hasAnyPermission(permissions, ["manage_messages", "manageMessages"]);
+        case "members":
+            return hasAnyPermission(permissions, ["moderate_members", "moderateMembers", "kick_members", "ban_members"]);
+        case "events":
+            return hasAnyPermission(permissions, ["manage_events", "manageEvents"]);
+        case "invites":
+            return hasAnyPermission(permissions, ["create_instant_invite", "createInvites", "manage_invites", "manageInvites"]);
+        case "guild":
+            return false;
+    }
+}
+
+function assertCanModerateScope(state: GuildState, author: string, type: string, scope: PermissionScope) {
+    if (!canModerateScope(state, author, scope)) {
+        throw new Error(`User ${author} does not have permission for ${type}`);
+    }
+}
+
 export function validateEvent(state: GuildState, event: GuildEvent) {
     const { body, author } = event;
+    const bodyRecord = body as any;
 
-    const isOwner = state.ownerId === author;
-    const member = state.members.get(author);
-    const isAdmin = member?.roles.has("admin") || member?.roles.has("owner");
-    const hasPermission = isOwner || isAdmin;
-
-    switch (body.type) {
+    switch (bodyRecord.type) {
         case "GUILD_CREATE":
             throw new Error("GUILD_CREATE can only appear at seq 0");
         case "CHANNEL_CREATE": {
-            if (!hasPermission) {
-                throw new Error(`User ${author} does not have permission for ${body.type}`);
-            }
+            assertCanModerateScope(state, author, bodyRecord.type, "channels");
             const channelBody = body as ChannelCreate;
             if (!channelBody.channelId?.trim()) {
                 throw new Error("CHANNEL_CREATE requires a channelId");
@@ -54,10 +138,21 @@ export function validateEvent(state: GuildState, event: GuildEvent) {
         case "BAN_USER":
         case "UNBAN_USER":
         case "EPHEMERAL_POLICY_UPDATE":
-            if (!hasPermission) {
-                throw new Error(`User ${author} does not have permission for ${body.type}`);
+            assertCanModerateScope(state, author, bodyRecord.type, bodyRecord.type === "EPHEMERAL_POLICY_UPDATE" ? "channels" : "members");
+            break;
+        case "REACTION_ADD":
+        case "REACTION_REMOVE": {
+            assertChannelExists(state, bodyRecord.channelId);
+            assertCanParticipateInGuild(state, author);
+            const message = state.messages.get(bodyRecord.messageId);
+            if (!message || message.deleted) {
+                throw new Error(`Message ${bodyRecord.messageId} does not exist`);
+            }
+            if (message.channelId !== bodyRecord.channelId) {
+                throw new Error(`Message ${bodyRecord.messageId} does not belong to channel ${bodyRecord.channelId}`);
             }
             break;
+        }
         case "MESSAGE":
             const msgBody = body as Message;
             assertChannelExists(state, msgBody.channelId);
@@ -93,7 +188,7 @@ export function validateEvent(state: GuildState, event: GuildEvent) {
             if (message.channelId !== deleteBody.channelId) {
                 throw new Error(`Message ${deleteBody.messageId} does not belong to channel ${deleteBody.channelId}`);
             }
-            if (message.authorId !== author && !hasPermission) {
+            if (message.authorId !== author && !canModerateScope(state, author, "messages")) {
                 throw new Error(`User ${author} cannot delete message ${deleteBody.messageId}`);
             }
             break;
@@ -122,7 +217,26 @@ export function validateEvent(state: GuildState, event: GuildEvent) {
             break;
         }
         case "MEMBER_UPDATE":
+            if (bodyRecord.userId && bodyRecord.userId !== author) {
+                assertCanModerateScope(state, author, bodyRecord.type, "members");
+                break;
+            }
             assertIsMember(state, author);
             break;
+        default: {
+            const adminScope = ADMIN_EVENT_TYPES.get(bodyRecord.type);
+            if (adminScope) {
+                assertCanModerateScope(state, author, bodyRecord.type, adminScope);
+                break;
+            }
+
+            if (CHANNEL_PARTICIPATION_EVENT_TYPES.has(bodyRecord.type)) {
+                if (typeof bodyRecord.channelId === "string" && bodyRecord.channelId) {
+                    assertChannelExists(state, bodyRecord.channelId);
+                }
+                assertCanParticipateInGuild(state, author);
+            }
+            break;
+        }
     }
 }

@@ -1,7 +1,10 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { RelayServer } from "@cgp/relay/src/server"; // Import directly from src to avoid build step in dev
+import { MemoryStore } from "@cgp/relay/src/store";
 import { CgpClient } from "@cgp/client/src/client";
+import { hashObject, sign } from "@cgp/core";
 import * as secp from "@noble/secp256k1";
+import WebSocket from "ws";
 
 describe("CGP relay basic messaging", () => {
     let relay: RelayServer;
@@ -100,6 +103,161 @@ describe("CGP relay basic messaging", () => {
 
         // Wait for propagation (local relay is fast but async)
         await new Promise((res) => setTimeout(res, 200));
+    });
+
+    it("serves paginated channel history snapshots", async () => {
+        const privKey = secp.utils.randomPrivateKey();
+        const pubKey = Buffer.from(secp.getPublicKey(privKey, true)).toString("hex");
+        const alice = new CgpClient({ relays: [relayUrl], keyPair: { pub: pubKey, priv: privKey } });
+        await alice.connect();
+
+        const guildId = await alice.createGuild("History Guild");
+        const channelId = await alice.createChannel(guildId, "history", "text");
+        await new Promise((res) => setTimeout(res, 200));
+
+        for (let i = 0; i < 5; i++) {
+            await alice.sendMessage(guildId, channelId, `history-${i}`);
+        }
+        await new Promise((res) => setTimeout(res, 300));
+
+        const ws = new WebSocket(relayUrl);
+        await new Promise<void>((resolve) => ws.onopen = () => resolve());
+
+        const waitForSnapshot = (subId: string) => new Promise<any>((resolve) => {
+            const handler = (raw: WebSocket.RawData) => {
+                const data = JSON.parse(raw.toString());
+                if (data[0] === "SNAPSHOT" && data[1]?.subId === subId) {
+                    ws.off("message", handler);
+                    resolve(data[1]);
+                }
+            };
+            ws.on("message", handler);
+        });
+
+        const firstPage = waitForSnapshot("history-page-1");
+        ws.send(JSON.stringify(["GET_HISTORY", { subId: "history-page-1", guildId, channelId, limit: 2 }]));
+        const first = await firstPage;
+        expect(first.events.map((event: any) => event.body.content)).toEqual(["history-3", "history-4"]);
+        expect(first.hasMore).toBe(true);
+
+        const secondPage = waitForSnapshot("history-page-2");
+        ws.send(JSON.stringify(["GET_HISTORY", { subId: "history-page-2", guildId, channelId, beforeSeq: first.oldestSeq, limit: 2 }]));
+        const second = await secondPage;
+        expect(second.events.map((event: any) => event.body.content)).toEqual(["history-1", "history-2"]);
+        expect(second.hasMore).toBe(true);
+
+        ws.close();
+        alice.close();
+    });
+
+    it("returns correlated publish acknowledgements and validation errors", async () => {
+        const ownerPrivKey = secp.utils.randomPrivateKey();
+        const ownerPubKey = Buffer.from(secp.getPublicKey(ownerPrivKey, true)).toString("hex");
+        const attackerPrivKey = secp.utils.randomPrivateKey();
+        const attackerPubKey = Buffer.from(secp.getPublicKey(attackerPrivKey, true)).toString("hex");
+        const owner = new CgpClient({ relays: [relayUrl], keyPair: { pub: ownerPubKey, priv: ownerPrivKey } });
+        await owner.connect();
+
+        const guildId = await owner.createGuild("Ack Guild");
+        const channelId = await owner.createChannel(guildId, "ack", "text");
+        await new Promise((res) => setTimeout(res, 200));
+
+        const ws = new WebSocket(relayUrl);
+        await new Promise<void>((resolve) => ws.onopen = () => resolve());
+
+        const waitForFrame = (kind: string, clientEventId: string) => new Promise<any>((resolve) => {
+            const handler = (raw: WebSocket.RawData) => {
+                const data = JSON.parse(raw.toString());
+                if (data[0] === kind && data[1]?.clientEventId === clientEventId) {
+                    ws.off("message", handler);
+                    resolve(data[1]);
+                }
+            };
+            ws.on("message", handler);
+        });
+
+        const ackBody = {
+            type: "MESSAGE",
+            guildId,
+            channelId,
+            messageId: `ack-message-${Date.now()}`,
+            content: "ack me"
+        };
+        const ackCreatedAt = Date.now();
+        const ackClientEventId = "publish-ack-test";
+        const ackSignature = await sign(ownerPrivKey, hashObject({ body: ackBody, author: ownerPubKey, createdAt: ackCreatedAt }));
+        const ackPromise = waitForFrame("PUB_ACK", ackClientEventId);
+        ws.send(JSON.stringify([
+            "PUBLISH",
+            {
+                body: ackBody,
+                author: ownerPubKey,
+                createdAt: ackCreatedAt,
+                signature: ackSignature,
+                clientEventId: ackClientEventId
+            }
+        ]));
+        const ack = await ackPromise;
+        expect(ack.guildId).toBe(guildId);
+        expect(ack.eventId).toBeDefined();
+        expect(typeof ack.seq).toBe("number");
+
+        const errorBody = {
+            type: "CHANNEL_CREATE",
+            guildId,
+            channelId: `attacker-channel-${Date.now()}`,
+            name: "attacker",
+            kind: "text"
+        };
+        const errorCreatedAt = Date.now();
+        const errorClientEventId = "publish-error-test";
+        const errorSignature = await sign(
+            attackerPrivKey,
+            hashObject({ body: errorBody, author: attackerPubKey, createdAt: errorCreatedAt })
+        );
+        const errorPromise = waitForFrame("ERROR", errorClientEventId);
+        ws.send(JSON.stringify([
+            "PUBLISH",
+            {
+                body: errorBody,
+                author: attackerPubKey,
+                createdAt: errorCreatedAt,
+                signature: errorSignature,
+                clientEventId: errorClientEventId
+            }
+        ]));
+        const error = await errorPromise;
+        expect(error.code).toBe("VALIDATION_FAILED");
+        expect(error.message).toContain("permission");
+
+        ws.close();
+        owner.close();
+    });
+
+    it("keeps rate limiting as a configurable relay plugin, not mandatory core protocol", async () => {
+        const pluginlessPort = PORT + 1;
+        const pluginlessRelay = new RelayServer(pluginlessPort, new MemoryStore(), [], {
+            enableDefaultPlugins: false
+        });
+        const ws = new WebSocket(`ws://localhost:${pluginlessPort}`);
+
+        try {
+            await new Promise<void>((resolve) => ws.onopen = () => resolve());
+            const helloPromise = new Promise<any>((resolve) => {
+                ws.onmessage = (msg) => {
+                    const data = JSON.parse(msg.data.toString());
+                    if (data[0] === "HELLO_OK") {
+                        resolve(data[1]);
+                    }
+                };
+            });
+            ws.send(JSON.stringify(["HELLO", { protocol: "cgp/0.1" }]));
+            const hello = await helloPromise;
+            expect(hello.plugins).toEqual([]);
+        } finally {
+            ws.close();
+            await pluginlessRelay.close();
+        }
     });
 
     it("enforces validation rules", async () => {

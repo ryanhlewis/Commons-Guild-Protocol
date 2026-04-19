@@ -1,6 +1,16 @@
 import type { IncomingMessage, ServerResponse } from "http";
 import type { WebSocket } from "ws";
-import type { ChannelId, GuildEvent, EventBody, GuildId, SerializableMember } from "@cgp/core";
+import {
+    applyEvent,
+    canModerateScope,
+    createInitialState,
+    type ChannelId,
+    type EventBody,
+    type GuildEvent,
+    type GuildId,
+    type PermissionScope,
+    type SerializableMember
+} from "@cgp/core";
 import type { Store } from "./store";
 
 interface RateBucket {
@@ -33,6 +43,16 @@ export interface EncryptionPolicy {
      * Empty or omitted means the policy applies to all channels in matching guilds.
      */
     channelIds?: ChannelId[];
+}
+
+export interface AppObjectPermissionRule {
+    namespace: string;
+    objectType?: string;
+    permissionScope: PermissionScope;
+}
+
+export interface AppObjectPermissionPolicy {
+    rules: AppObjectPermissionRule[];
 }
 
 export interface RelayPluginContext {
@@ -133,8 +153,14 @@ function pruneRateBuckets(buckets: Map<string, RateBucket>, windowMs: number, no
     }
 }
 
-function sendRateLimitError(socket: WebSocket, message: string) {
-    socket.send(JSON.stringify(["ERROR", { code: "RATE_LIMITED", message }]));
+function publishClientEventId(payload: unknown) {
+    return typeof (payload as { clientEventId?: unknown })?.clientEventId === "string"
+        ? (payload as { clientEventId: string }).clientEventId
+        : undefined;
+}
+
+function sendRateLimitError(socket: WebSocket, message: string, payload?: unknown) {
+    socket.send(JSON.stringify(["ERROR", { code: "RATE_LIMITED", message, clientEventId: publishClientEventId(payload) }]));
 }
 
 export function createRateLimitPolicyPlugin(policy: Partial<RateLimitPolicy> = {}): RelayPlugin {
@@ -168,7 +194,7 @@ export function createRateLimitPolicyPlugin(policy: Partial<RateLimitPolicy> = {
             }
 
             if (!takeRateToken(buckets, `socket:${socketId}`, resolved.socketPublishesPerWindow, resolved.rateWindowMs)) {
-                sendRateLimitError(socket, "Socket publish rate limit exceeded");
+                sendRateLimitError(socket, "Socket publish rate limit exceeded", payload);
                 return true;
             }
 
@@ -177,12 +203,12 @@ export function createRateLimitPolicyPlugin(policy: Partial<RateLimitPolicy> = {
             const guildId = typeof publish?.body?.guildId === "string" ? publish.body.guildId : "";
 
             if (author && !takeRateToken(buckets, `author:${author}`, resolved.authorPublishesPerWindow, resolved.rateWindowMs)) {
-                sendRateLimitError(socket, "Author publish rate limit exceeded");
+                sendRateLimitError(socket, "Author publish rate limit exceeded", payload);
                 return true;
             }
 
             if (guildId && !takeRateToken(buckets, `guild:${guildId}`, resolved.guildPublishesPerWindow, resolved.rateWindowMs)) {
-                sendRateLimitError(socket, "Guild publish rate limit exceeded");
+                sendRateLimitError(socket, "Guild publish rate limit exceeded", payload);
                 return true;
             }
 
@@ -191,8 +217,8 @@ export function createRateLimitPolicyPlugin(policy: Partial<RateLimitPolicy> = {
     };
 }
 
-function sendPolicyError(socket: WebSocket, code: string, message: string) {
-    socket.send(JSON.stringify(["ERROR", { code, message }]));
+function sendPolicyError(socket: WebSocket, code: string, message: string, payload?: unknown) {
+    socket.send(JSON.stringify(["ERROR", { code, message, clientEventId: publishClientEventId(payload) }]));
 }
 
 function listApplies<T extends string>(allowed: T[] | undefined, value: T | undefined) {
@@ -235,16 +261,73 @@ export function createEncryptionPolicyPlugin(policy: EncryptionPolicy = {}): Rel
 
             const isEncrypted = body.encrypted === true;
             if (isEncrypted && !resolved.allowEncryptedMessages) {
-                sendPolicyError(socket, "ENCRYPTED_PAYLOAD_REJECTED", "This relay does not accept encrypted message payloads for this guild/channel.");
+                sendPolicyError(socket, "ENCRYPTED_PAYLOAD_REJECTED", "This relay does not accept encrypted message payloads for this guild/channel.", payload);
                 return true;
             }
 
             if (resolved.requireEncryptedMessages) {
                 const hasEnvelope = isEncrypted && typeof body.iv === "string" && body.iv.length > 0 && typeof body.content === "string" && body.content.length > 0;
                 if (!hasEnvelope) {
-                    sendPolicyError(socket, "ENCRYPTION_REQUIRED", "This relay requires encrypted message payloads for this guild/channel.");
+                    sendPolicyError(socket, "ENCRYPTION_REQUIRED", "This relay requires encrypted message payloads for this guild/channel.", payload);
                     return true;
                 }
+            }
+
+            return false;
+        }
+    };
+}
+
+function appObjectRuleMatches(rule: AppObjectPermissionRule, body: { namespace?: unknown; objectType?: unknown }) {
+    return (
+        typeof body.namespace === "string" &&
+        body.namespace === rule.namespace &&
+        (!rule.objectType || (typeof body.objectType === "string" && body.objectType === rule.objectType))
+    );
+}
+
+export function createAppObjectPermissionPlugin(policy: AppObjectPermissionPolicy): RelayPlugin {
+    const rules = policy.rules.filter((rule) => rule.namespace.trim().length > 0);
+
+    return {
+        name: "cgp.relay.app-object-permissions",
+        metadata: {
+            name: "Application object permissions",
+            description: "Relay-local permission rules for application-defined APP_OBJECT events.",
+            version: "1",
+            policy: { rules }
+        },
+        onFrame: async ({ socket, kind, payload }, ctx) => {
+            if (kind !== "PUBLISH" || rules.length === 0) {
+                return false;
+            }
+
+            const publish = payload as { author?: unknown; body?: { type?: unknown; guildId?: unknown; namespace?: unknown; objectType?: unknown } };
+            const body = publish?.body;
+            if (body?.type !== "APP_OBJECT_UPSERT" && body?.type !== "APP_OBJECT_DELETE") {
+                return false;
+            }
+
+            const rule = rules.find((candidate) => appObjectRuleMatches(candidate, body));
+            if (!rule) {
+                return false;
+            }
+
+            const guildId = typeof body.guildId === "string" ? body.guildId : "";
+            const author = typeof publish.author === "string" ? publish.author : "";
+            const history = guildId ? await ctx.getLog(guildId) : [];
+            if (!guildId || !author || history.length === 0) {
+                return false;
+            }
+
+            let state = createInitialState(history[0]);
+            for (let index = 1; index < history.length; index++) {
+                state = applyEvent(state, history[index]);
+            }
+
+            if (!canModerateScope(state, author, rule.permissionScope)) {
+                sendPolicyError(socket, "VALIDATION_FAILED", `User ${author} does not have permission for ${body.type}`, payload);
+                return true;
             }
 
             return false;

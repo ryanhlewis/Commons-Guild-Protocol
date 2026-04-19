@@ -24,12 +24,32 @@ import {
     validateEvent
 } from "@cgp/core";
 import { LevelStore } from "./store_level";
-import { Store } from "./store";
-import { RelayPlugin, RelayPluginContext, createRateLimitPolicyPlugin } from "./plugins";
+import { HistoryQuery, Store } from "./store";
+import { RelayPlugin, RelayPluginContext, RateLimitPolicy, createRateLimitPolicyPlugin } from "./plugins";
 
 interface Subscription {
     guildId: GuildId;
     channels?: ChannelId[];
+}
+
+interface HistoryRequest {
+    subId?: string;
+    guildId?: GuildId;
+    channelId?: ChannelId;
+    beforeSeq?: number;
+    afterSeq?: number;
+    limit?: number;
+    includeStructural?: boolean;
+}
+
+export interface RelayServerOptions {
+    /**
+     * Default plugins are recommended reference relay policy, not mandatory CGP protocol state.
+     * Set false when embedding a relay with a custom plugin stack.
+     */
+    enableDefaultPlugins?: boolean;
+    rateLimitPolicy?: Partial<RateLimitPolicy>;
+    maxFrameBytes?: number;
 }
 
 function positiveIntegerFromEnv(name: string, fallback: number) {
@@ -196,6 +216,20 @@ function buildSnapshotEvents(guildId: GuildId, events: GuildEvent[]) {
     return compactDirectMessageSnapshot(events);
 }
 
+function normalizeHistoryLimit(limit: unknown) {
+    const parsed = Number(limit);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+        return 100;
+    }
+
+    return Math.min(500, Math.floor(parsed));
+}
+
+function normalizeOptionalSeq(value: unknown) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : undefined;
+}
+
 export class RelayServer {
     private wss: WebSocketServer;
     private httpServer: ReturnType<typeof createServer>;
@@ -213,14 +247,20 @@ export class RelayServer {
     private checkpointTimer: NodeJS.Timeout;
     private keyPair: { publicKey: string; privateKey: Uint8Array };
 
-    constructor(port: number, dbPathOrStore: string | Store = "./relay-db", plugins: RelayPlugin[] = []) {
+    constructor(
+        port: number,
+        dbPathOrStore: string | Store = "./relay-db",
+        plugins: RelayPlugin[] = [],
+        options: RelayServerOptions = {}
+    ) {
         if (typeof dbPathOrStore === "string") {
             this.store = new LevelStore(dbPathOrStore);
         } else {
             this.store = dbPathOrStore;
         }
-        this.maxFrameBytes = positiveIntegerFromEnv("CGP_RELAY_MAX_FRAME_BYTES", 1024 * 1024);
-        this.plugins = [createRateLimitPolicyPlugin(), ...plugins];
+        this.maxFrameBytes = options.maxFrameBytes ?? positiveIntegerFromEnv("CGP_RELAY_MAX_FRAME_BYTES", 1024 * 1024);
+        const defaultPluginsEnabled = options.enableDefaultPlugins ?? process.env.CGP_RELAY_DEFAULT_PLUGINS !== "0";
+        this.plugins = defaultPluginsEnabled ? [createRateLimitPolicyPlugin(options.rateLimitPolicy), ...plugins] : [...plugins];
         this.httpServer = createServer((req, res) => {
             void this.handleHttp(req, res).catch((err) => {
                 console.error("Relay HTTP handler failed:", err);
@@ -685,11 +725,13 @@ export class RelayServer {
                 );
             });
 
+        } else if (kind === "GET_HISTORY") {
+            await this.handleHistoryRequest(socket, payload);
         } else if (kind === "PUBLISH") {
-            const p = payload as { body: EventBody; author: string; signature: string; createdAt: number };
-            const { body, author, signature, createdAt } = p;
+            const p = payload as { body: EventBody; author: string; signature: string; createdAt: number; clientEventId?: string };
+            const { body, author, signature, createdAt, clientEventId } = p;
 
-            const fullEvent = await this.appendSequencedEvent({ body, author, signature, createdAt }, socket);
+            const fullEvent = await this.appendSequencedEvent({ body, author, signature, createdAt, clientEventId }, socket);
             if (fullEvent) {
                 await this.runOnEventAppended(fullEvent, socket);
             }
@@ -715,15 +757,71 @@ export class RelayServer {
         }
     }
 
+    private async handleHistoryRequest(socket: WebSocket, payload: unknown) {
+        const p = payload as HistoryRequest;
+        const guildId = typeof p?.guildId === "string" ? p.guildId : "";
+        const subId = typeof p?.subId === "string" && p.subId.trim()
+            ? p.subId
+            : `history-${Date.now()}`;
+
+        if (!guildId.trim()) {
+            socket.send(JSON.stringify(["ERROR", { code: "VALIDATION_FAILED", message: "GET_HISTORY requires a guildId" }]));
+            return;
+        }
+
+        const limit = normalizeHistoryLimit(p.limit);
+        const query: HistoryQuery = {
+            guildId,
+            channelId: typeof p.channelId === "string" && p.channelId.trim() ? p.channelId : undefined,
+            beforeSeq: normalizeOptionalSeq(p.beforeSeq),
+            afterSeq: normalizeOptionalSeq(p.afterSeq),
+            limit: limit + 1,
+            includeStructural: p.includeStructural === true
+        };
+
+        await this.withGuildMutex(guildId, async () => {
+            const events = this.store.getHistory
+                ? await this.store.getHistory(query)
+                : (await this.store.getLog(guildId));
+            const hasMore = events.length > limit;
+            const pageEvents = query.afterSeq !== undefined
+                ? events.slice(0, limit)
+                : events.slice(Math.max(0, events.length - limit));
+            const oldestSeq = pageEvents.length > 0 ? pageEvents[0].seq : null;
+            const newestSeq = pageEvents.length > 0 ? pageEvents[pageEvents.length - 1].seq : null;
+            const tailEvent = pageEvents.length > 0 ? pageEvents[pageEvents.length - 1] : await this.store.getLastEvent(guildId);
+
+            socket.send(
+                JSON.stringify([
+                    "SNAPSHOT",
+                    {
+                        subId,
+                        guildId,
+                        channelId: query.channelId,
+                        events: pageEvents,
+                        endSeq: tailEvent?.seq ?? -1,
+                        endHash: tailEvent?.id ?? null,
+                        oldestSeq,
+                        newestSeq,
+                        hasMore
+                    }
+                ])
+            );
+        });
+    }
+
     private async appendSequencedEvent(
-        p: { body: EventBody; author: string; signature: string; createdAt: number },
+        p: { body: EventBody; author: string; signature: string; createdAt: number; clientEventId?: string },
         socket?: WebSocket
     ): Promise<GuildEvent | undefined> {
-        const { body, author, signature, createdAt } = p;
+        const { body, author, signature, createdAt, clientEventId } = p;
         const targetGuildId = body.guildId;
+        const sendError = (code: string, message: string) => {
+            socket?.send(JSON.stringify(["ERROR", { code, message, clientEventId }]));
+        };
 
         if (!targetGuildId?.trim()) {
-            socket?.send(JSON.stringify(["ERROR", { code: "VALIDATION_FAILED", message: "Event body requires a guildId" }]));
+            sendError("VALIDATION_FAILED", "Event body requires a guildId");
             return undefined;
         }
 
@@ -750,7 +848,7 @@ export class RelayServer {
 
             if (!verify(author, msgHash, signature)) {
                 console.error(`Invalid signature for event ${fullEvent.id}`);
-                socket?.send(JSON.stringify(["ERROR", { code: "INVALID_SIGNATURE", message: "Signature verification failed" }]));
+                sendError("INVALID_SIGNATURE", "Signature verification failed");
                 return undefined;
             }
 
@@ -780,13 +878,13 @@ export class RelayServer {
                 } catch (e: any) {
                     console.error(`Validation failed for guild ${targetGuildId}: ${e.message}`);
                     console.error(`Event body:`, JSON.stringify(body));
-                    socket?.send(JSON.stringify(["ERROR", { code: "VALIDATION_FAILED", message: e.message }]));
+                    sendError("VALIDATION_FAILED", e.message);
                     return undefined;
                 }
             } else {
                 if (body.type !== "GUILD_CREATE") {
                     console.error("Validation failed: First event must be GUILD_CREATE");
-                    socket?.send(JSON.stringify(["ERROR", { code: "VALIDATION_FAILED", message: "First event must be GUILD_CREATE" }]));
+                    sendError("VALIDATION_FAILED", "First event must be GUILD_CREATE");
                     return undefined;
                 }
                 // Initialize cache for new guild
@@ -798,6 +896,12 @@ export class RelayServer {
             // console.log(`Relay appended event ${fullEvent.id} type ${body.type} seq ${fullEvent.seq}`);
 
             this.broadcast(targetGuildId, fullEvent);
+            socket?.send(JSON.stringify(["PUB_ACK", {
+                clientEventId,
+                guildId: targetGuildId,
+                eventId: fullEvent.id,
+                seq: fullEvent.seq
+            }]));
             return fullEvent;
         });
     }

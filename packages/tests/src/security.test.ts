@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { RelayServer } from "@cgp/relay";
 import { CgpClient } from "@cgp/client";
-import { MemoryStore } from "@cgp/relay";
+import { MemoryStore, createAppObjectPermissionPlugin } from "@cgp/relay";
 import { generatePrivateKey, getPublicKey, hashObject, sign, GuildEvent, computeEventId } from "@cgp/core";
 import WebSocket from "ws";
 
@@ -15,7 +15,17 @@ describe("Security & Robustness", () => {
     let attackerKeys: { pub: string; priv: Uint8Array };
 
     beforeAll(async () => {
-        relay = new RelayServer(PORT, new MemoryStore());
+        relay = new RelayServer(PORT, new MemoryStore(), [
+            createAppObjectPermissionPlugin({
+                rules: [
+                    {
+                        namespace: "org.example.chat",
+                        objectType: "message-pin",
+                        permissionScope: "messages"
+                    }
+                ]
+            })
+        ]);
 
         const ownerPriv = generatePrivateKey();
         ownerKeys = { pub: getPublicKey(ownerPriv), priv: ownerPriv };
@@ -37,6 +47,34 @@ describe("Security & Robustness", () => {
         attackerClient.close();
         await relay.close();
     });
+
+    async function publishRaw(
+        body: Record<string, any>,
+        keys: { pub: string; priv: Uint8Array } = ownerKeys,
+        waitMs = 350
+    ) {
+        const ws = new WebSocket(`ws://localhost:${PORT}`);
+        await new Promise<void>(resolve => ws.onopen = () => resolve());
+        const createdAt = Date.now();
+        const signature = await sign(keys.priv, hashObject({ body, author: keys.pub, createdAt }));
+        const errorPromise = new Promise<any | null>(resolve => {
+            const timer = setTimeout(() => resolve(null), waitMs);
+            ws.onmessage = (msg) => {
+                const data = JSON.parse(msg.data.toString());
+                if (data[0] === "ERROR") {
+                    clearTimeout(timer);
+                    resolve(data[1]);
+                }
+            };
+        });
+        ws.send(JSON.stringify(["PUBLISH", { body, author: keys.pub, createdAt, signature }]));
+        const error = await errorPromise;
+        ws.close();
+        if (!error) {
+            await new Promise(resolve => setTimeout(resolve, 150));
+        }
+        return error;
+    }
 
     it("rejects events with invalid signatures", async () => {
         // Attacker tries to forge a message from Owner
@@ -112,6 +150,165 @@ describe("Security & Robustness", () => {
         expect(error.code).toBe("VALIDATION_FAILED");
         expect(error.message).toContain("permission");
         ws.close();
+    });
+
+    it("prevents unauthorized users from publishing application admin events", async () => {
+        const ws = new WebSocket(`ws://localhost:${PORT}`);
+        await new Promise<void>(resolve => ws.onopen = () => resolve());
+
+        const errorPromise = new Promise<any>(resolve => {
+            ws.onmessage = (msg) => {
+                const data = JSON.parse(msg.data.toString());
+                if (data[0] === "ERROR") resolve(data[1]);
+            };
+        });
+
+        const body = {
+            type: "GUILD_UPDATE",
+            guildId,
+            name: "Hijacked Guild"
+        };
+        const createdAt = Date.now();
+        const author = attackerKeys.pub;
+        const signature = await sign(attackerKeys.priv, hashObject({ body, author, createdAt }));
+        ws.send(JSON.stringify(["PUBLISH", { body, author, createdAt, signature }]));
+
+        const error = await errorPromise;
+        expect(error.code).toBe("VALIDATION_FAILED");
+        expect(error.message).toContain("permission");
+        ws.close();
+    });
+
+    it("applies BAN_ADD events to relay-authoritative ban state", async () => {
+        const victimPriv = generatePrivateKey();
+        const victimPub = getPublicKey(victimPriv);
+        const channelId = await ownerClient.createChannel(guildId, "custom-ban-channel", "text");
+        await new Promise(r => setTimeout(r, 200));
+
+        const banBody = {
+            type: "BAN_ADD",
+            guildId,
+            userId: victimPub,
+            reason: "custom moderation event"
+        };
+        const banCreatedAt = Date.now();
+        const banSignature = await sign(ownerKeys.priv, hashObject({ body: banBody, author: ownerKeys.pub, createdAt: banCreatedAt }));
+        const ownerWs = new WebSocket(`ws://localhost:${PORT}`);
+        await new Promise<void>(resolve => ownerWs.onopen = () => resolve());
+        ownerWs.send(JSON.stringify(["PUBLISH", { body: banBody, author: ownerKeys.pub, createdAt: banCreatedAt, signature: banSignature }]));
+        await new Promise(r => setTimeout(r, 300));
+        ownerWs.close();
+
+        const victimWs = new WebSocket(`ws://localhost:${PORT}`);
+        await new Promise<void>(resolve => victimWs.onopen = () => resolve());
+        const errorPromise = new Promise<any>(resolve => {
+            victimWs.onmessage = (msg) => {
+                const data = JSON.parse(msg.data.toString());
+                if (data[0] === "ERROR") resolve(data[1]);
+            };
+        });
+        const messageBody = {
+            type: "MESSAGE",
+            guildId,
+            channelId,
+            messageId: hashObject(`blocked-custom-ban-${Date.now()}`),
+            content: "custom ban should block this"
+        };
+        const messageCreatedAt = Date.now();
+        const messageSignature = await sign(victimPriv, hashObject({ body: messageBody, author: victimPub, createdAt: messageCreatedAt }));
+        victimWs.send(JSON.stringify(["PUBLISH", { body: messageBody, author: victimPub, createdAt: messageCreatedAt, signature: messageSignature }]));
+
+        const error = await errorPromise;
+        expect(error.code).toBe("VALIDATION_FAILED");
+        expect(error.message).toContain("banned");
+        victimWs.close();
+    });
+
+    it("enforces app-object pin permissions at the relay", async () => {
+        const channelId = await ownerClient.createChannel(guildId, "pin-policy-channel", "text");
+        const messageId = hashObject(`pin-policy-message-${Date.now()}`);
+        await publishRaw({
+            type: "MESSAGE",
+            guildId,
+            channelId,
+            messageId,
+            content: "Only moderators should be able to pin this."
+        });
+
+        const attackerError = await publishRaw({
+            type: "APP_OBJECT_UPSERT",
+            guildId,
+            channelId,
+            namespace: "org.example.chat",
+            objectType: "message-pin",
+            objectId: `message-pin:${channelId}:${messageId}`,
+            target: { channelId, messageId },
+            value: { pinned: true }
+        }, attackerKeys);
+        expect(attackerError?.code).toBe("VALIDATION_FAILED");
+        expect(attackerError?.message).toContain("permission");
+
+        const ownerError = await publishRaw({
+            type: "APP_OBJECT_UPSERT",
+            guildId,
+            channelId,
+            namespace: "org.example.chat",
+            objectType: "message-pin",
+            objectId: `message-pin:${channelId}:${messageId}`,
+            target: { channelId, messageId },
+            value: { pinned: true }
+        });
+        expect(ownerError).toBeNull();
+
+        const log = await (relay as any).store.getLog(guildId);
+        expect(log.some((e: GuildEvent) => (e.body as any).objectId === `message-pin:${channelId}:${messageId}`)).toBe(true);
+    });
+
+    it("uses custom role permissions when validating application admin events", async () => {
+        const channelId = hashObject(`custom-role-channel-${Date.now()}`);
+        const rejected = await publishRaw({
+            type: "CHANNEL_UPSERT",
+            guildId,
+            channelId,
+            name: "should-not-exist-yet",
+            kind: "text"
+        }, attackerKeys);
+        expect(rejected?.code).toBe("VALIDATION_FAILED");
+        expect(rejected?.message).toContain("permission");
+
+        const roleId = `relay-channel-manager-${Date.now()}`;
+        expect(await publishRaw({
+            type: "ROLE_UPSERT",
+            guildId,
+            roleId,
+            name: "Relay Channel Manager",
+            permissions: ["MANAGE_CHANNELS"]
+        })).toBeNull();
+        expect(await publishRaw({
+            type: "MEMBER_UPDATE",
+            guildId,
+            userId: attackerKeys.pub,
+            roleIds: [roleId]
+        })).toBeNull();
+
+        const accepted = await publishRaw({
+            type: "CHANNEL_UPSERT",
+            guildId,
+            channelId,
+            name: "role-managed",
+            kind: "text"
+        }, attackerKeys);
+        expect(accepted).toBeNull();
+
+        const messageId = hashObject(`custom-role-message-${Date.now()}`);
+        const messageError = await publishRaw({
+            type: "MESSAGE",
+            guildId,
+            channelId,
+            messageId,
+            content: "Channel created through relay-authoritative role permissions."
+        }, attackerKeys);
+        expect(messageError).toBeNull();
     });
 
     it("rejects duplicate channel ids in a guild", async () => {
