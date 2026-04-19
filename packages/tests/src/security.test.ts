@@ -243,7 +243,7 @@ describe("Security & Robustness", () => {
             expect(ghost).toBeUndefined();
         });
 
-        it("allows replay of PUBLISH frames (Spam Vector)", async () => {
+        it("deduplicates replayed PUBLISH frames", async () => {
             // Attack: Capture a valid PUBLISH frame and replay it 10 times.
             // Since Relay assigns Seq, these become 10 valid events with identical bodies.
             // This is a spam vector. Ideally, Relay should deduplicate based on hash(body, author, createdAt).
@@ -281,9 +281,8 @@ describe("Security & Robustness", () => {
             const log = await (relay as any).store.getLog(guildId);
             const spam = log.filter((e: GuildEvent) => (e.body as any).content === "Spam");
 
-            // Current implementation DOES NOT deduplicate, so we expect 5.
-            // This confirms the "vulnerability" (or feature).
-            expect(spam.length).toBe(5);
+            // Replays reuse the same messageId, so relay validation must reject duplicates.
+            expect(spam.length).toBe(1);
         });
     });
 });

@@ -84,6 +84,34 @@ export interface DeleteMessage {
     reason?: string;
 }
 
+export interface AppObjectTarget {
+    channelId?: ChannelId;
+    messageId?: HashHex;
+    userId?: UserId;
+    [key: string]: any;
+}
+
+export interface AppObjectUpsert {
+    type: "APP_OBJECT_UPSERT";
+    guildId: GuildId;
+    namespace: string;
+    objectType: string;
+    objectId: string;
+    channelId?: ChannelId;
+    target?: AppObjectTarget;
+    value?: any;
+}
+
+export interface AppObjectDelete {
+    type: "APP_OBJECT_DELETE";
+    guildId: GuildId;
+    namespace: string;
+    objectType: string;
+    objectId: string;
+    channelId?: ChannelId;
+    target?: AppObjectTarget;
+}
+
 export interface RoleAssign {
     type: "ROLE_ASSIGN";
     guildId: GuildId;
@@ -160,7 +188,14 @@ export interface SerializableGuildState {
     members: Array<[UserId, SerializableMember]>; // Map as array of entries
     roles: Array<[string, Role]>;           // Map as array of entries
     bans: Array<[UserId, Ban]>;             // Map as array of entries
+    messages?: Array<[HashHex, SerializableMessageRef]>;
     access: "public" | "private";
+}
+
+export interface SerializableMessageRef {
+    channelId: ChannelId;
+    authorId: UserId;
+    deleted?: boolean;
 }
 
 export interface Checkpoint {
@@ -193,6 +228,8 @@ export type EventBody =
     | Message
     | EditMessage
     | DeleteMessage
+    | AppObjectUpsert
+    | AppObjectDelete
     | ForkFrom
     | RoleAssign
     | RoleRevoke

@@ -387,6 +387,10 @@ export class CgpClient extends EventEmitter {
                 } catch (e) {
                     console.error("Failed to apply event", e);
                 }
+            } else if (event.seq <= state.headSeq) {
+                // Duplicate or stale gossip should not force recovery. In dense P2P meshes,
+                // the same genesis or earlier fork can arrive after a peer already advanced.
+                return;
             } else {
                 console.log(`Gap or Fork detected: Expected ${state.headSeq + 1}/${state.headHash}, got ${event.seq}/${event.prevHash}`);
                 this.recoverGuild(guildId);

@@ -2,6 +2,7 @@ import {
     GuildEvent,
     GuildId,
     ChannelId,
+    HashHex,
     UserId,
     EventBody,
     GuildCreate,
@@ -10,6 +11,8 @@ import {
     RoleRevoke,
     BanUser,
     UnbanUser,
+    Message,
+    DeleteMessage,
     EphemeralPolicy,
     EphemeralPolicyUpdate,
     MemberUpdate,
@@ -17,6 +20,7 @@ import {
     Role,
     Member,
     Ban,
+    SerializableMessageRef,
     SerializableGuildState,
     Checkpoint
 } from "./types";
@@ -30,6 +34,7 @@ export interface GuildState {
     roles: Map<string, Role>; // roleId -> Role
     members: Map<UserId, Member>;
     bans: Map<UserId, Ban>;
+    messages: Map<HashHex, SerializableMessageRef>;
     createdAt: number;
     headSeq: number;
     headHash: string;
@@ -50,6 +55,7 @@ export function createInitialState(event: GuildEvent): GuildState {
         roles: new Map(),
         members: new Map([[event.author, { userId: event.author, roles: new Set(["owner"]), joinedAt: event.createdAt }]]),
         bans: new Map(),
+        messages: new Map(),
         createdAt: event.createdAt,
         headSeq: event.seq,
         headHash: event.id,
@@ -73,6 +79,7 @@ export function serializeState(state: GuildState): SerializableGuildState {
         ]),
         roles: Array.from(state.roles.entries()),
         bans: Array.from(state.bans.entries()),
+        messages: Array.from(state.messages.entries()),
         access: state.access
     };
 }
@@ -95,6 +102,7 @@ export function deserializeState(serialized: SerializableGuildState, headSeq: nu
         members,
         roles: new Map(serialized.roles),
         bans: new Map(serialized.bans),
+        messages: new Map(serialized.messages ?? []),
         headSeq,
         headHash,
         createdAt,
@@ -114,6 +122,7 @@ export function applyEvent(state: GuildState, event: GuildEvent): GuildState {
     newState.roles = new Map(state.roles);
     newState.members = new Map(state.members);
     newState.bans = new Map(state.bans);
+    newState.messages = new Map(state.messages);
     newState.headSeq = event.seq;
     newState.headHash = event.id;
     newState.access = state.access;
@@ -164,6 +173,25 @@ export function applyEvent(state: GuildState, event: GuildEvent): GuildState {
         case "UNBAN_USER": {
             const b = body as UnbanUser;
             newState.bans.delete(b.userId);
+            break;
+        }
+        case "MESSAGE": {
+            const b = body as Message;
+            newState.messages.set(b.messageId || event.id, {
+                channelId: b.channelId,
+                authorId: event.author
+            });
+            break;
+        }
+        case "DELETE_MESSAGE": {
+            const b = body as DeleteMessage;
+            const message = newState.messages.get(b.messageId);
+            if (message) {
+                newState.messages.set(b.messageId, {
+                    ...message,
+                    deleted: true
+                });
+            }
             break;
         }
         case "EPHEMERAL_POLICY_UPDATE": {

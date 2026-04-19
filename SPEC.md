@@ -127,6 +127,8 @@ type EventBody =
   | Message
   | EditMessage
   | DeleteMessage
+  | AppObjectUpsert
+  | AppObjectDelete
   | ForkFrom
   | Checkpoint
   | EphemeralPolicyUpdate;
@@ -197,6 +199,48 @@ interface ForkFrom {
 
 Other governance events (roles, bans, checkpoints) follow similarly.
 
+### 3.3.1 App-scoped objects
+
+CGP core intentionally keeps channel history small: messages, edits, deletes, membership, roles, bans,
+channels, and retention are first-class. Product features such as pins, read states, bookmarks,
+third-party moderation annotations, and client-specific indexes SHOULD NOT be added as new core event
+types unless they affect portable guild semantics.
+
+Clients and relay plugins MAY instead use app-scoped object events:
+
+```ts
+interface AppObjectTarget {
+  channelId?: ChannelId;
+  messageId?: HashHex;
+  userId?: UserId;
+  // app/plugin-specific target keys
+}
+
+interface AppObjectUpsert {
+  type: "APP_OBJECT_UPSERT";
+  guildId: GuildId;
+  namespace: string;  // reverse-DNS or relay/plugin namespace
+  objectType: string; // app-defined kind, e.g. "message-pin"
+  objectId: string;   // stable app-defined id inside namespace/objectType
+  channelId?: ChannelId;
+  target?: AppObjectTarget;
+  value?: unknown;    // app-defined JSON value
+}
+
+interface AppObjectDelete {
+  type: "APP_OBJECT_DELETE";
+  guildId: GuildId;
+  namespace: string;
+  objectType: string;
+  objectId: string;
+  channelId?: ChannelId;
+  target?: AppObjectTarget;
+}
+```
+
+Relays MUST validate that the author can participate in the guild, that referenced channels exist, and
+that referenced messages are live. Object semantics and finer permissions are owned by the namespace
+and MAY be enforced by relay plugins or clients. Unknown namespaces must not change core guild state.
 ### 3.4 Canonical state (“UTXO of messages”)
 
 For any guild, a **canonical view** of a channel at time `T` is computed by scanning the log up to `seq <= S` where `S` is last known, applying rules:

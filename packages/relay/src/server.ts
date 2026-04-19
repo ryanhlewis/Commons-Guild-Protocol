@@ -42,7 +42,9 @@ const DIRECT_MESSAGE_SNAPSHOT_DEPENDENT_TYPES = new Set([
     "EDIT_MESSAGE",
     "DELETE_MESSAGE",
     "REACTION_ADD",
-    "REACTION_REMOVE"
+    "REACTION_REMOVE",
+    "APP_OBJECT_UPSERT",
+    "APP_OBJECT_DELETE"
 ]);
 
 function stringValue(...values: unknown[]) {
@@ -57,6 +59,14 @@ function stringValue(...values: unknown[]) {
 
 function eventType(event: GuildEvent) {
     return stringValue((event.body as any)?.type).toUpperCase();
+}
+
+function targetMessageId(event: GuildEvent) {
+    const body = event.body as unknown as Record<string, unknown>;
+    const target = body.target && typeof body.target === "object"
+        ? body.target as Record<string, unknown>
+        : {};
+    return stringValue(body.messageId, target.messageId);
 }
 
 function compareEventsByHistoryOrder(left: GuildEvent, right: GuildEvent) {
@@ -129,6 +139,8 @@ function compactDirectMessageSnapshot(events: GuildEvent[]) {
             case "DELETE_MESSAGE":
             case "REACTION_ADD":
             case "REACTION_REMOVE":
+            case "APP_OBJECT_UPSERT":
+            case "APP_OBJECT_DELETE":
                 dependentFrames.push(event);
                 break;
             default:
@@ -141,9 +153,7 @@ function compactDirectMessageSnapshot(events: GuildEvent[]) {
     const keptMessageIds = new Set(
         tailMessages.map((event) => stringValue((event.body as any)?.messageId, event.id)).filter(Boolean)
     );
-    const keptDependentFrames = dependentFrames.filter((event) =>
-        keptMessageIds.has(stringValue((event.body as any)?.messageId))
-    );
+    const keptDependentFrames = dependentFrames.filter((event) => keptMessageIds.has(targetMessageId(event)));
 
     const structuralFrames = [
         ...latestGuildCreateByGuild.values(),
