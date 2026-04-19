@@ -144,12 +144,23 @@ export function validateEvent(state: GuildState, event: GuildEvent) {
         case "REACTION_REMOVE": {
             assertChannelExists(state, bodyRecord.channelId);
             assertCanParticipateInGuild(state, author);
+            if (typeof bodyRecord.reaction !== "string" || !bodyRecord.reaction.trim()) {
+                throw new Error(`${bodyRecord.type} requires a reaction`);
+            }
             const message = state.messages.get(bodyRecord.messageId);
             if (!message || message.deleted) {
                 throw new Error(`Message ${bodyRecord.messageId} does not exist`);
             }
             if (message.channelId !== bodyRecord.channelId) {
                 throw new Error(`Message ${bodyRecord.messageId} does not belong to channel ${bodyRecord.channelId}`);
+            }
+            if (
+                bodyRecord.type === "REACTION_REMOVE" &&
+                typeof bodyRecord.userId === "string" &&
+                bodyRecord.userId !== author &&
+                !canModerateScope(state, author, "messages")
+            ) {
+                throw new Error(`User ${author} cannot remove another user's reaction`);
             }
             break;
         }

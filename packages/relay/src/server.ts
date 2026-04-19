@@ -42,6 +42,11 @@ interface HistoryRequest {
     includeStructural?: boolean;
 }
 
+interface StateRequest {
+    subId?: string;
+    guildId?: GuildId;
+}
+
 export interface RelayServerOptions {
     /**
      * Default plugins are recommended reference relay policy, not mandatory CGP protocol state.
@@ -727,6 +732,8 @@ export class RelayServer {
 
         } else if (kind === "GET_HISTORY") {
             await this.handleHistoryRequest(socket, payload);
+        } else if (kind === "GET_STATE") {
+            await this.handleStateRequest(socket, payload);
         } else if (kind === "PUBLISH") {
             const p = payload as { body: EventBody; author: string; signature: string; createdAt: number; clientEventId?: string };
             const { body, author, signature, createdAt, clientEventId } = p;
@@ -755,6 +762,60 @@ export class RelayServer {
             // If no plugin handled it, return empty or error? For now, empty list or ignore.
             socket.send(JSON.stringify(["MEMBERS", { subId, guildId, members: [] }]));
         }
+    }
+
+    private async rebuildGuildState(guildId: GuildId): Promise<{ state: GuildState; endEvent: GuildEvent } | null> {
+        const events = await this.store.getLog(guildId);
+        if (events.length === 0) {
+            return null;
+        }
+
+        let state = createInitialState(events[0]);
+        for (let i = 1; i < events.length; i++) {
+            state = applyEvent(state, events[i]);
+        }
+        this.stateCache.set(guildId, state);
+
+        return {
+            state,
+            endEvent: events[events.length - 1]
+        };
+    }
+
+    private async handleStateRequest(socket: WebSocket, payload: unknown) {
+        const p = payload as StateRequest;
+        const guildId = typeof p?.guildId === "string" ? p.guildId : "";
+        const subId = typeof p?.subId === "string" && p.subId.trim()
+            ? p.subId
+            : `state-${Date.now()}`;
+
+        if (!guildId.trim()) {
+            socket.send(JSON.stringify(["ERROR", { code: "VALIDATION_FAILED", message: "GET_STATE requires a guildId" }]));
+            return;
+        }
+
+        await this.withGuildMutex(guildId, async () => {
+            const rebuilt = await this.rebuildGuildState(guildId);
+            if (!rebuilt) {
+                socket.send(JSON.stringify(["ERROR", { code: "NOT_FOUND", message: "Guild state not found", subId, guildId }]));
+                return;
+            }
+
+            const serializedState = serializeState(rebuilt.state);
+            socket.send(
+                JSON.stringify([
+                    "STATE",
+                    {
+                        subId,
+                        guildId,
+                        state: serializedState,
+                        rootHash: hashObject(serializedState),
+                        endSeq: rebuilt.endEvent.seq,
+                        endHash: rebuilt.endEvent.id
+                    }
+                ])
+            );
+        });
     }
 
     private async handleHistoryRequest(socket: WebSocket, payload: unknown) {

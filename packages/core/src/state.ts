@@ -22,6 +22,7 @@ import {
     Ban,
     GuildPolicies,
     SerializableMessageRef,
+    AppObjectStateRef,
     SerializableGuildState,
     Checkpoint
 } from "./types";
@@ -36,6 +37,7 @@ export interface GuildState {
     members: Map<UserId, Member>;
     bans: Map<UserId, Ban>;
     messages: Map<HashHex, SerializableMessageRef>;
+    appObjects: Map<string, AppObjectStateRef>;
     createdAt: number;
     headSeq: number;
     headHash: string;
@@ -58,6 +60,7 @@ export function createInitialState(event: GuildEvent): GuildState {
         members: new Map([[event.author, { userId: event.author, roles: new Set(["owner"]), joinedAt: event.createdAt }]]),
         bans: new Map(),
         messages: new Map(),
+        appObjects: new Map(),
         createdAt: event.createdAt,
         headSeq: event.seq,
         headHash: event.id,
@@ -83,6 +86,7 @@ export function serializeState(state: GuildState): SerializableGuildState {
         roles: Array.from(state.roles.entries()),
         bans: Array.from(state.bans.entries()),
         messages: Array.from(state.messages.entries()),
+        appObjects: Array.from(state.appObjects.entries()),
         access: state.access,
         policies: state.policies
     };
@@ -107,6 +111,7 @@ export function deserializeState(serialized: SerializableGuildState, headSeq: nu
         roles: new Map(serialized.roles),
         bans: new Map(serialized.bans),
         messages: new Map(serialized.messages ?? []),
+        appObjects: new Map(serialized.appObjects ?? []),
         headSeq,
         headHash,
         createdAt,
@@ -128,6 +133,7 @@ export function applyEvent(state: GuildState, event: GuildEvent): GuildState {
     newState.members = new Map(state.members);
     newState.bans = new Map(state.bans);
     newState.messages = new Map(state.messages);
+    newState.appObjects = new Map(state.appObjects);
     newState.headSeq = event.seq;
     newState.headHash = event.id;
     newState.access = state.access;
@@ -302,6 +308,42 @@ export function applyEvent(state: GuildState, event: GuildEvent): GuildState {
             });
             break;
         }
+        case "REACTION_ADD": {
+            const reaction = typeof bodyRecord.reaction === "string" ? bodyRecord.reaction.trim() : "";
+            const message = newState.messages.get(bodyRecord.messageId);
+            if (reaction && message) {
+                const reactions = { ...(message.reactions ?? {}) };
+                const users = new Set(reactions[reaction] ?? []);
+                users.add(event.author);
+                reactions[reaction] = Array.from(users).sort();
+                newState.messages.set(bodyRecord.messageId, {
+                    ...message,
+                    reactions
+                });
+            }
+            break;
+        }
+        case "REACTION_REMOVE": {
+            const reaction = typeof bodyRecord.reaction === "string" ? bodyRecord.reaction.trim() : "";
+            const message = newState.messages.get(bodyRecord.messageId);
+            if (reaction && message?.reactions?.[reaction]) {
+                const reactions = { ...message.reactions };
+                const removeUserId = typeof bodyRecord.userId === "string" && bodyRecord.userId.trim()
+                    ? bodyRecord.userId
+                    : event.author;
+                const users = reactions[reaction].filter((userId) => userId !== removeUserId);
+                if (users.length > 0) {
+                    reactions[reaction] = users;
+                } else {
+                    delete reactions[reaction];
+                }
+                newState.messages.set(bodyRecord.messageId, {
+                    ...message,
+                    reactions: Object.keys(reactions).length > 0 ? reactions : undefined
+                });
+            }
+            break;
+        }
         case "DELETE_MESSAGE": {
             const b = body as DeleteMessage;
             const message = newState.messages.get(b.messageId);
@@ -310,6 +352,29 @@ export function applyEvent(state: GuildState, event: GuildEvent): GuildState {
                     ...message,
                     deleted: true
                 });
+            }
+            break;
+        }
+        case "APP_OBJECT_UPSERT": {
+            if (typeof bodyRecord.namespace === "string" && typeof bodyRecord.objectType === "string" && typeof bodyRecord.objectId === "string") {
+                const target = bodyRecord.target && typeof bodyRecord.target === "object" ? bodyRecord.target : undefined;
+                const key = appObjectStateKey(bodyRecord.namespace, bodyRecord.objectType, bodyRecord.objectId);
+                newState.appObjects.set(key, {
+                    namespace: bodyRecord.namespace,
+                    objectType: bodyRecord.objectType,
+                    objectId: bodyRecord.objectId,
+                    channelId: bodyRecord.channelId ?? target?.channelId,
+                    target,
+                    value: bodyRecord.value,
+                    authorId: event.author,
+                    updatedAt: event.createdAt
+                });
+            }
+            break;
+        }
+        case "APP_OBJECT_DELETE": {
+            if (typeof bodyRecord.namespace === "string" && typeof bodyRecord.objectType === "string" && typeof bodyRecord.objectId === "string") {
+                newState.appObjects.delete(appObjectStateKey(bodyRecord.namespace, bodyRecord.objectType, bodyRecord.objectId));
             }
             break;
         }
@@ -358,4 +423,8 @@ export function applyEvent(state: GuildState, event: GuildEvent): GuildState {
     }
 
     return newState;
+}
+
+function appObjectStateKey(namespace: string, objectType: string, objectId: string) {
+    return `${namespace}\u0000${objectType}\u0000${objectId}`;
 }

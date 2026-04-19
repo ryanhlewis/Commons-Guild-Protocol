@@ -150,6 +150,126 @@ describe("CGP relay basic messaging", () => {
         alice.close();
     });
 
+    it("official client wraps history requests and reliable publish acknowledgements", async () => {
+        const ownerPrivKey = secp.utils.randomPrivateKey();
+        const ownerPubKey = Buffer.from(secp.getPublicKey(ownerPrivKey, true)).toString("hex");
+        const attackerPrivKey = secp.utils.randomPrivateKey();
+        const attackerPubKey = Buffer.from(secp.getPublicKey(attackerPrivKey, true)).toString("hex");
+        const owner = new CgpClient({ relays: [relayUrl], keyPair: { pub: ownerPubKey, priv: ownerPrivKey } });
+        const attacker = new CgpClient({ relays: [relayUrl], keyPair: { pub: attackerPubKey, priv: attackerPrivKey } });
+        await Promise.all([owner.connect(), attacker.connect()]);
+
+        const guildId = await owner.createGuild("Client History Guild");
+        const channelId = await owner.createChannel(guildId, "client-history", "text");
+        await new Promise((res) => setTimeout(res, 200));
+
+        const ack = await owner.publishReliable({
+            type: "MESSAGE",
+            guildId,
+            channelId,
+            messageId: `client-ack-${Date.now()}`,
+            content: "reliable publish body"
+        });
+        expect(ack.guildId).toBe(guildId);
+        expect(ack.eventId).toBeDefined();
+        expect(ack.seq).toBeGreaterThanOrEqual(2);
+
+        await owner.sendMessage(guildId, channelId, "history helper tail");
+        const history = await owner.getHistory({ guildId, channelId, limit: 2 });
+        expect(history.guildId).toBe(guildId);
+        expect(history.channelId).toBe(channelId);
+        expect(history.events.map((event) => event.body.type)).toEqual(["MESSAGE", "MESSAGE"]);
+        expect(history.events.some((event: any) => event.body.content === "reliable publish body")).toBe(true);
+        expect(owner.getGuildState(guildId)?.channels.has(channelId)).toBe(true);
+
+        await expect(attacker.publishReliable({
+            type: "CHANNEL_CREATE",
+            guildId,
+            channelId: `unauthorized-${Date.now()}`,
+            name: "unauthorized",
+            kind: "text"
+        }, { timeoutMs: 5000 })).rejects.toThrow(/permission/i);
+
+        owner.close();
+        attacker.close();
+    });
+
+    it("serves canonical replayed guild state snapshots", async () => {
+        const ownerPrivKey = secp.utils.randomPrivateKey();
+        const ownerPubKey = Buffer.from(secp.getPublicKey(ownerPrivKey, true)).toString("hex");
+        const memberPrivKey = secp.utils.randomPrivateKey();
+        const memberPubKey = Buffer.from(secp.getPublicKey(memberPrivKey, true)).toString("hex");
+        const bannedPrivKey = secp.utils.randomPrivateKey();
+        const bannedPubKey = Buffer.from(secp.getPublicKey(bannedPrivKey, true)).toString("hex");
+        const alice = new CgpClient({ relays: [relayUrl], keyPair: { pub: ownerPubKey, priv: ownerPrivKey } });
+        await alice.connect();
+
+        const guildId = await alice.createGuild("State Guild");
+        const channelId = await alice.createChannel(guildId, "state-room", "text");
+        const messageId = await alice.sendMessage(guildId, channelId, "state-backed app object target");
+        await alice.publish({
+            type: "REACTION_ADD",
+            guildId,
+            channelId,
+            messageId,
+            reaction: "+1"
+        });
+        await alice.publish({
+            type: "APP_OBJECT_UPSERT",
+            guildId,
+            channelId,
+            namespace: "org.example.chat",
+            objectType: "message-pin",
+            objectId: `message-pin:${channelId}:${messageId}`,
+            target: { channelId, messageId },
+            value: { pinned: true }
+        });
+        await alice.assignRole(guildId, memberPubKey, "member");
+        await alice.banUser(guildId, bannedPubKey, "spam");
+        await new Promise((res) => setTimeout(res, 300));
+
+        const ws = new WebSocket(relayUrl);
+        await new Promise<void>((resolve) => ws.onopen = () => resolve());
+
+        const statePromise = new Promise<any>((resolve) => {
+            const handler = (raw: WebSocket.RawData) => {
+                const data = JSON.parse(raw.toString());
+                if (data[0] === "STATE" && data[1]?.subId === "state-snapshot") {
+                    ws.off("message", handler);
+                    resolve(data[1]);
+                }
+            };
+            ws.on("message", handler);
+        });
+
+        ws.send(JSON.stringify(["GET_STATE", { subId: "state-snapshot", guildId }]));
+        const state = await statePromise;
+
+        expect(state.guildId).toBe(guildId);
+        expect(typeof state.rootHash).toBe("string");
+        expect(state.endSeq).toBeGreaterThanOrEqual(5);
+        expect(state.state.name).toBe("State Guild");
+        expect(state.state.channels.some(([id]: [string, any]) => id === channelId)).toBe(true);
+        expect(state.state.messages.some(([id]: [string, any]) => id === messageId)).toBe(true);
+        expect(state.state.messages.some(([id, message]: [string, any]) =>
+            id === messageId &&
+            Array.isArray(message.reactions?.["+1"]) &&
+            message.reactions["+1"].includes(ownerPubKey)
+        )).toBe(true);
+        expect(state.state.appObjects.some(([, object]: [string, any]) =>
+            object.namespace === "org.example.chat" &&
+            object.objectType === "message-pin" &&
+            object.target?.messageId === messageId &&
+            object.value?.pinned === true
+        )).toBe(true);
+        expect(state.state.members.some(([id]: [string, any]) => id === ownerPubKey)).toBe(true);
+        expect(state.state.members.some(([id]: [string, any]) => id === memberPubKey)).toBe(true);
+        expect(state.state.bans.some(([id]: [string, any]) => id === bannedPubKey)).toBe(true);
+
+        ws.close();
+        alice.close();
+    });
+
     it("returns correlated publish acknowledgements and validation errors", async () => {
         const ownerPrivKey = secp.utils.randomPrivateKey();
         const ownerPubKey = Buffer.from(secp.getPublicKey(ownerPrivKey, true)).toString("hex");

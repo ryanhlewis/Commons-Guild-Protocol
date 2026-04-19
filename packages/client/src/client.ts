@@ -8,6 +8,7 @@ import {
     createInitialState,
     applyEvent,
     GuildState,
+    deserializeState,
     verify,
     hashObject,
     sign,
@@ -28,8 +29,51 @@ import {
     encrypt,
     decrypt,
     generateSymmetricKey,
-    SerializableMember
+    SerializableMember,
+    SerializableGuildState
 } from "@cgp/core";
+
+export interface StateResponse {
+    subId?: string;
+    guildId: GuildId;
+    state: SerializableGuildState;
+    rootHash: string;
+    endSeq: number;
+    endHash: string;
+}
+
+export interface HistoryRequest {
+    guildId: GuildId;
+    channelId?: ChannelId;
+    beforeSeq?: number;
+    afterSeq?: number;
+    limit?: number;
+    includeStructural?: boolean;
+}
+
+export interface HistoryResponse {
+    subId?: string;
+    guildId: GuildId;
+    channelId?: ChannelId;
+    events: GuildEvent[];
+    endSeq: number;
+    endHash: string | null;
+    oldestSeq: number | null;
+    newestSeq: number | null;
+    hasMore: boolean;
+}
+
+export interface PublishAck {
+    clientEventId?: string;
+    guildId: GuildId;
+    eventId: string;
+    seq: number;
+}
+
+export interface PublishReliableOptions {
+    timeoutMs?: number;
+    clientEventId?: string;
+}
 
 export class CgpClient extends EventEmitter {
     private relays: string[];
@@ -253,7 +297,8 @@ export class CgpClient extends EventEmitter {
                     // console.log(`Gossiped event ${event.seq} to ${gossipCount} peers`);
 
                 } else if (kind === "SNAPSHOT") {
-                    const p = payload as { events: GuildEvent[]; guildId: GuildId; endSeq?: number; endHash?: string | null };
+                    const p = payload as HistoryResponse;
+                    this.emit("snapshot_response", payload);
                     const { events, guildId, endSeq, endHash } = p;
                     // console.log(`Client received SNAPSHOT for ${guildId} with ${events.length} events`);
                     if (events.length > 0) {
@@ -271,8 +316,6 @@ export class CgpClient extends EventEmitter {
                                 state.headHash = endHash;
                             }
                             this.state.set(guildId, state);
-                        } else {
-                            this.state.delete(guildId);
                         }
                     }
                     events.forEach((e: GuildEvent) => this.emit("event", e));
@@ -338,6 +381,8 @@ export class CgpClient extends EventEmitter {
                     }
                 } else if (kind === "PLUGIN_CONFIG_OK") {
                     this.emit("plugin_config_ok", payload);
+                } else if (kind === "PUB_ACK") {
+                    this.emit("publish_ack", payload);
                 } else if (kind === "BATCH") {
                     const events = payload as GuildEvent[];
                     if (Array.isArray(events)) {
@@ -350,6 +395,12 @@ export class CgpClient extends EventEmitter {
                 } else if (kind === "ERROR") {
                     console.error("Client received ERROR:", payload);
                     this.emit("error_frame", payload);
+                } else if (kind === "STATE") {
+                    const p = payload as Partial<StateResponse>;
+                    if (p.state && p.guildId && typeof p.endSeq === "number" && typeof p.endHash === "string") {
+                        this.state.set(p.guildId, deserializeState(p.state, p.endSeq, p.endHash, Date.now()));
+                    }
+                    this.emit("state_response", payload);
                 } else if (kind === "MEMBERS") {
                     this.emit("members_response", payload);
                 }
@@ -625,6 +676,86 @@ export class CgpClient extends EventEmitter {
         });
     }
 
+    async getState(guildId: GuildId): Promise<StateResponse> {
+        const subId = Math.random().toString(36).slice(2);
+        const frame = JSON.stringify(["GET_STATE", { subId, guildId }]);
+
+        return new Promise<StateResponse>((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                cleanup();
+                reject(new Error("Timeout waiting for guild state"));
+            }, 10000);
+
+            const handler = (data: StateResponse) => {
+                if (data.subId === subId) {
+                    cleanup();
+                    resolve(data);
+                }
+            };
+            const errorHandler = (data: any) => {
+                if (data?.subId === subId) {
+                    cleanup();
+                    reject(new Error(data.message || "Guild state request failed"));
+                }
+            };
+
+            const cleanup = () => {
+                clearTimeout(timeout);
+                this.off("state_response", handler);
+                this.off("error_frame", errorHandler);
+            };
+
+            this.on("state_response", handler);
+            this.on("error_frame", errorHandler);
+
+            this.sockets.forEach(s => {
+                if (s.readyState === WebSocket.OPEN) {
+                    s.send(frame);
+                }
+            });
+        });
+    }
+
+    async getHistory(request: HistoryRequest): Promise<HistoryResponse> {
+        const subId = Math.random().toString(36).slice(2);
+        const frame = JSON.stringify(["GET_HISTORY", { subId, ...request }]);
+
+        return new Promise<HistoryResponse>((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                cleanup();
+                reject(new Error("Timeout waiting for guild history"));
+            }, 10000);
+
+            const handler = (data: HistoryResponse) => {
+                if (data.subId === subId) {
+                    cleanup();
+                    resolve(data);
+                }
+            };
+            const errorHandler = (data: any) => {
+                if (data?.subId === subId) {
+                    cleanup();
+                    reject(new Error(data.message || "Guild history request failed"));
+                }
+            };
+
+            const cleanup = () => {
+                clearTimeout(timeout);
+                this.off("snapshot_response", handler);
+                this.off("error_frame", errorHandler);
+            };
+
+            this.on("snapshot_response", handler);
+            this.on("error_frame", errorHandler);
+
+            this.sockets.forEach(s => {
+                if (s.readyState === WebSocket.OPEN) {
+                    s.send(frame);
+                }
+            });
+        });
+    }
+
     async publish(body: EventBody): Promise<string> {
         if (!this.keyPair) throw new Error("No keypair");
         const { pub, priv } = this.keyPair;
@@ -671,6 +802,70 @@ export class CgpClient extends EventEmitter {
         });
 
         return "";
+    }
+
+    async publishReliable(body: EventBody, options: PublishReliableOptions = {}): Promise<PublishAck> {
+        if (!this.keyPair) throw new Error("No keypair");
+        if (this.relays.length === 0) {
+            const eventId = await this.publish(body);
+            const state = this.state.get(body.guildId);
+            return {
+                clientEventId: options.clientEventId,
+                guildId: body.guildId,
+                eventId,
+                seq: state?.headSeq ?? 0
+            };
+        }
+
+        const { pub, priv } = this.keyPair;
+        const createdAt = Date.now();
+        const clientEventId = options.clientEventId || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        const unsigned = { body, author: pub, createdAt };
+        const signature = await sign(priv, hashObject(unsigned));
+        const frame = JSON.stringify(["PUBLISH", { body, author: pub, signature, createdAt, clientEventId }]);
+        const timeoutMs = options.timeoutMs ?? 10000;
+
+        return new Promise<PublishAck>((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                cleanup();
+                reject(new Error("Timeout waiting for publish acknowledgement"));
+            }, timeoutMs);
+
+            const ackHandler = (data: PublishAck) => {
+                if (data?.clientEventId === clientEventId) {
+                    cleanup();
+                    resolve(data);
+                }
+            };
+            const errorHandler = (data: any) => {
+                if (data?.clientEventId === clientEventId) {
+                    cleanup();
+                    reject(new Error(data.message || "Publish rejected by relay"));
+                }
+            };
+
+            const cleanup = () => {
+                clearTimeout(timeout);
+                this.off("publish_ack", ackHandler);
+                this.off("error_frame", errorHandler);
+            };
+
+            this.on("publish_ack", ackHandler);
+            this.on("error_frame", errorHandler);
+
+            let sent = false;
+            this.sockets.forEach(s => {
+                if (s.readyState === WebSocket.OPEN) {
+                    s.send(frame);
+                    sent = true;
+                }
+            });
+
+            if (!sent) {
+                cleanup();
+                reject(new Error("No open relay connection"));
+            }
+        });
     }
 
     getGuildState(guildId: GuildId): GuildState | undefined {

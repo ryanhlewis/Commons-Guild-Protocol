@@ -52,6 +52,15 @@ export interface GuildPolicies {
     posting?: "public" | "members";
 }
 
+export interface GuildUpdate {
+    type: "GUILD_UPDATE";
+    guildId: GuildId;
+    name?: string;
+    description?: string;
+    access?: "public" | "private";
+    policies?: GuildPolicies;
+}
+
 export interface EphemeralPolicy {
     mode: "infinite" | "rolling-window" | "ttl";
     days?: number;
@@ -65,6 +74,26 @@ export interface ChannelCreate {
     name: string;
     kind: "text" | "voice" | "ephemeral-text";
     retention?: EphemeralPolicy;
+}
+
+export interface ChannelUpsert {
+    type: "CHANNEL_UPSERT";
+    guildId: GuildId;
+    channelId: ChannelId;
+    name?: string;
+    kind?: "text" | "voice" | "ephemeral-text" | string;
+    retention?: EphemeralPolicy;
+    categoryId?: string;
+    description?: string;
+    topic?: string;
+    position?: number;
+    permissionOverwrites?: any[];
+}
+
+export interface ChannelDelete {
+    type: "CHANNEL_DELETE";
+    guildId: GuildId;
+    channelId: ChannelId;
 }
 
 export interface Message {
@@ -92,6 +121,23 @@ export interface DeleteMessage {
     channelId: ChannelId;
     messageId: HashHex;
     reason?: string;
+}
+
+export interface ReactionAdd {
+    type: "REACTION_ADD";
+    guildId: GuildId;
+    channelId: ChannelId;
+    messageId: HashHex;
+    reaction: string;
+}
+
+export interface ReactionRemove {
+    type: "REACTION_REMOVE";
+    guildId: GuildId;
+    channelId: ChannelId;
+    messageId: HashHex;
+    reaction: string;
+    userId?: UserId;
 }
 
 export interface AppObjectTarget {
@@ -137,6 +183,26 @@ export interface RoleRevoke {
     roleId: string;
 }
 
+export interface RoleUpsert {
+    type: "ROLE_UPSERT";
+    guildId: GuildId;
+    roleId: string;
+    name?: string;
+    permissions?: string[];
+    color?: string;
+    icon?: string;
+    position?: number;
+    mentionable?: boolean;
+    hoist?: boolean;
+    managed?: boolean;
+}
+
+export interface RoleDelete {
+    type: "ROLE_DELETE";
+    guildId: GuildId;
+    roleId: string;
+}
+
 export interface BanUser {
     type: "BAN_USER";
     guildId: GuildId;
@@ -148,6 +214,27 @@ export interface UnbanUser {
     type: "UNBAN_USER";
     guildId: GuildId;
     userId: UserId;
+}
+
+export interface BanAdd {
+    type: "BAN_ADD";
+    guildId: GuildId;
+    userId: UserId;
+    reason?: string;
+    expiresAt?: string;
+}
+
+export interface BanRemove {
+    type: "BAN_REMOVE";
+    guildId: GuildId;
+    userId: UserId;
+}
+
+export interface MemberKick {
+    type: "MEMBER_KICK";
+    guildId: GuildId;
+    userId: UserId;
+    reason?: string;
 }
 
 export interface Channel {
@@ -200,6 +287,7 @@ export interface SerializableGuildState {
     roles: Array<[string, Role]>;           // Map as array of entries
     bans: Array<[UserId, Ban]>;             // Map as array of entries
     messages?: Array<[HashHex, SerializableMessageRef]>;
+    appObjects?: Array<[string, AppObjectStateRef]>;
     access: "public" | "private";
     policies?: GuildPolicies;
 }
@@ -208,6 +296,18 @@ export interface SerializableMessageRef {
     channelId: ChannelId;
     authorId: UserId;
     deleted?: boolean;
+    reactions?: Record<string, UserId[]>;
+}
+
+export interface AppObjectStateRef {
+    namespace: string;
+    objectType: string;
+    objectId: string;
+    channelId?: ChannelId;
+    target?: AppObjectTarget;
+    value?: any;
+    authorId: UserId;
+    updatedAt: number;
 }
 
 export interface Checkpoint {
@@ -236,17 +336,27 @@ export interface ForkFrom {
 
 export type EventBody =
     | GuildCreate
+    | GuildUpdate
     | ChannelCreate
+    | ChannelUpsert
+    | ChannelDelete
     | Message
     | EditMessage
     | DeleteMessage
+    | ReactionAdd
+    | ReactionRemove
     | AppObjectUpsert
     | AppObjectDelete
     | ForkFrom
+    | RoleUpsert
+    | RoleDelete
     | RoleAssign
     | RoleRevoke
     | BanUser
     | UnbanUser
+    | BanAdd
+    | BanRemove
+    | MemberKick
     | Checkpoint
     | EphemeralPolicyUpdate
     | MemberUpdate;
