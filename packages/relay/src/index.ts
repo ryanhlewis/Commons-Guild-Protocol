@@ -2,10 +2,11 @@ import { RelayServer } from "./server";
 
 import { Store, MemoryStore } from "./store";
 import { LevelStore } from "./store_level";
-import type { RelayPlugin, RelayPluginContext, RelayPluginHttpArgs } from "./plugins";
+import { createEncryptionPolicyPlugin, createRateLimitPolicyPlugin } from "./plugins";
+import type { EncryptionPolicy, RelayPlugin, RelayPluginContext, RelayPluginHttpArgs, RateLimitPolicy } from "./plugins";
 
-export { RelayServer, Store, MemoryStore, LevelStore };
-export type { RelayPlugin, RelayPluginContext, RelayPluginHttpArgs };
+export { RelayServer, Store, MemoryStore, LevelStore, createEncryptionPolicyPlugin, createRateLimitPolicyPlugin };
+export type { EncryptionPolicy, RelayPlugin, RelayPluginContext, RelayPluginHttpArgs, RateLimitPolicy };
 
 if (require.main === module) {
     void (async () => {

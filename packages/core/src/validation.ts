@@ -1,12 +1,21 @@
-import { AppObjectDelete, AppObjectUpsert, DeleteMessage, EditMessage, GuildEvent, Message } from "./types";
+import { AppObjectDelete, AppObjectUpsert, ChannelCreate, DeleteMessage, EditMessage, GuildEvent, Message } from "./types";
 import { GuildState } from "./state";
 
 function assertCanParticipateInGuild(state: GuildState, author: string) {
     if (state.bans.has(author)) {
         throw new Error(`User ${author} is banned`);
     }
-    if (state.access === "private" && !state.members.has(author)) {
-        throw new Error(`Guild is private. User ${author} is not a member.`);
+    if ((state.access === "private" || state.policies.posting === "members") && !state.members.has(author)) {
+        throw new Error(`User ${author} is not allowed to publish without guild membership.`);
+    }
+}
+
+function assertIsMember(state: GuildState, author: string) {
+    if (state.bans.has(author)) {
+        throw new Error(`User ${author} is banned`);
+    }
+    if (!state.members.has(author)) {
+        throw new Error(`User ${author} is not a member.`);
     }
 }
 
@@ -25,7 +34,21 @@ export function validateEvent(state: GuildState, event: GuildEvent) {
     const hasPermission = isOwner || isAdmin;
 
     switch (body.type) {
-        case "CHANNEL_CREATE":
+        case "GUILD_CREATE":
+            throw new Error("GUILD_CREATE can only appear at seq 0");
+        case "CHANNEL_CREATE": {
+            if (!hasPermission) {
+                throw new Error(`User ${author} does not have permission for ${body.type}`);
+            }
+            const channelBody = body as ChannelCreate;
+            if (!channelBody.channelId?.trim()) {
+                throw new Error("CHANNEL_CREATE requires a channelId");
+            }
+            if (state.channels.has(channelBody.channelId)) {
+                throw new Error(`Channel ${channelBody.channelId} already exists`);
+            }
+            break;
+        }
         case "ROLE_ASSIGN":
         case "ROLE_REVOKE":
         case "BAN_USER":
@@ -98,5 +121,8 @@ export function validateEvent(state: GuildState, event: GuildEvent) {
             }
             break;
         }
+        case "MEMBER_UPDATE":
+            assertIsMember(state, author);
+            break;
     }
 }

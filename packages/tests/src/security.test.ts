@@ -114,6 +114,112 @@ describe("Security & Robustness", () => {
         ws.close();
     });
 
+    it("rejects duplicate channel ids in a guild", async () => {
+        const channelId = await ownerClient.createChannel(guildId, "unique-channel", "text");
+        await new Promise(r => setTimeout(r, 200));
+
+        const body = {
+            type: "CHANNEL_CREATE",
+            guildId,
+            channelId,
+            name: "duplicate-channel",
+            kind: "text"
+        };
+        const createdAt = Date.now();
+        const author = ownerKeys.pub;
+        const signature = await sign(ownerKeys.priv, hashObject({ body, author, createdAt }));
+        const payload = { body, author, createdAt, signature };
+
+        const ws = new WebSocket(`ws://localhost:${PORT}`);
+        await new Promise<void>(resolve => ws.onopen = () => resolve());
+
+        const errorPromise = new Promise<any>(resolve => {
+            ws.onmessage = (msg) => {
+                const data = JSON.parse(msg.data.toString());
+                if (data[0] === "ERROR") resolve(data[1]);
+            };
+        });
+
+        ws.send(JSON.stringify(["PUBLISH", payload]));
+
+        const error = await errorPromise;
+        expect(error.code).toBe("VALIDATION_FAILED");
+        expect(error.message).toContain("already exists");
+        ws.close();
+    });
+
+    it("rejects GUILD_CREATE after genesis for an existing guild log", async () => {
+        const body = {
+            type: "GUILD_CREATE",
+            guildId,
+            name: "Shadow Genesis"
+        };
+        const createdAt = Date.now();
+        const author = ownerKeys.pub;
+        const signature = await sign(ownerKeys.priv, hashObject({ body, author, createdAt }));
+        const payload = { body, author, createdAt, signature };
+
+        const ws = new WebSocket(`ws://localhost:${PORT}`);
+        await new Promise<void>(resolve => ws.onopen = () => resolve());
+
+        const errorPromise = new Promise<any>(resolve => {
+            ws.onmessage = (msg) => {
+                const data = JSON.parse(msg.data.toString());
+                if (data[0] === "ERROR") resolve(data[1]);
+            };
+        });
+
+        ws.send(JSON.stringify(["PUBLISH", payload]));
+
+        const error = await errorPromise;
+        expect(error.code).toBe("VALIDATION_FAILED");
+        expect(error.message).toContain("seq 0");
+        ws.close();
+    });
+
+    it("enforces members-only posting policy for public guilds", async () => {
+        const restrictedGuildId = await ownerClient.createGuild("Members Only Public Guild", undefined, "public", { posting: "members" });
+        const channelId = await ownerClient.createChannel(restrictedGuildId, "members", "text");
+        await new Promise(r => setTimeout(r, 200));
+
+        const body = {
+            type: "MESSAGE",
+            guildId: restrictedGuildId,
+            channelId,
+            messageId: hashObject(`blocked-${Date.now()}`),
+            content: "I should not be accepted"
+        };
+        const createdAt = Date.now();
+        const author = attackerKeys.pub;
+        const signature = await sign(attackerKeys.priv, hashObject({ body, author, createdAt }));
+        const payload = { body, author, createdAt, signature };
+
+        const ws = new WebSocket(`ws://localhost:${PORT}`);
+        await new Promise<void>(resolve => ws.onopen = () => resolve());
+
+        const errorPromise = new Promise<any>(resolve => {
+            ws.onmessage = (msg) => {
+                const data = JSON.parse(msg.data.toString());
+                if (data[0] === "ERROR") resolve(data[1]);
+            };
+        });
+
+        ws.send(JSON.stringify(["PUBLISH", payload]));
+        const error = await errorPromise;
+        expect(error.code).toBe("VALIDATION_FAILED");
+        expect(error.message).toContain("membership");
+        ws.close();
+
+        await ownerClient.assignRole(restrictedGuildId, attackerKeys.pub, "member");
+        await new Promise(r => setTimeout(r, 200));
+        await attackerClient.sendMessage(restrictedGuildId, channelId, "member message accepted");
+        await new Promise(r => setTimeout(r, 500));
+
+        const log = await (relay as any).store.getLog(restrictedGuildId);
+        expect(log.some((e: GuildEvent) => (e.body as any).content === "I should not be accepted")).toBe(false);
+        expect(log.some((e: GuildEvent) => (e.body as any).content === "member message accepted")).toBe(true);
+    });
+
     it("rejects malformed payloads", async () => {
         const ws = new WebSocket(`ws://localhost:${PORT}`);
         await new Promise<void>(resolve => ws.onopen = () => resolve());

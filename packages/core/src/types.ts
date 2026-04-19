@@ -1,13 +1,13 @@
 export type PublicKeyHex = string;  // lowercase hex, 66 chars including "02"/"03" prefix
 export type SignatureHex = string;
 export type HashHex = string;       // lowercase hex
-export type GuildId = HashHex;      // SHA256 of guild creation event
-export type ChannelId = HashHex;    // SHA256 of channel creation event
+export type GuildId = HashHex;      // stable collision-resistant guild identifier
+export type ChannelId = HashHex;    // stable collision-resistant channel identifier
 export type UserId = PublicKeyHex;  // identity == pubkey
 
 export interface GuildEventBodyBase {
     type: string;     // e.g. "GUILD_CREATE", "MESSAGE", ...
-    guildId: GuildId; // for all events except GUILD_CREATE itself
+    guildId: GuildId; // target guild log
     [key: string]: any;
 }
 
@@ -27,7 +27,7 @@ export interface GuildEvent {
     createdAt: number;          // milliseconds since epoch (informational)
     author: UserId;             // public key of signer
     body: EventBody;
-    signature: SignatureHex;    // signature over canonical encoding of {seq, prevHash, createdAt, author, body}
+    signature: SignatureHex;    // signature over canonical encoding of {body, author, createdAt}
 }
 
 export interface GuildCreate {
@@ -39,7 +39,17 @@ export interface GuildCreate {
         allowForksBy?: "any" | "mods" | "owner-only";
     };
     access?: "public" | "private"; // Default public
+    policies?: GuildPolicies;
     encryptedGroupKey?: string;
+}
+
+export interface GuildPolicies {
+    /**
+     * Who may publish user-authored channel/application objects into the guild.
+     * "public" keeps open community behavior; "members" requires explicit membership
+     * even when the guild profile itself is public.
+     */
+    posting?: "public" | "members";
 }
 
 export interface EphemeralPolicy {
@@ -61,7 +71,7 @@ export interface Message {
     type: "MESSAGE";
     guildId: GuildId;
     channelId: ChannelId;
-    messageId: HashHex; // SHA256 of (guildId, channelId, seq, author, content)
+    messageId: HashHex; // stable client-chosen id; SHOULD hash a collision-resistant message preimage
     content: string;
     replyTo?: HashHex;
     iv?: string;
@@ -190,6 +200,7 @@ export interface SerializableGuildState {
     bans: Array<[UserId, Ban]>;             // Map as array of entries
     messages?: Array<[HashHex, SerializableMessageRef]>;
     access: "public" | "private";
+    policies?: GuildPolicies;
 }
 
 export interface SerializableMessageRef {

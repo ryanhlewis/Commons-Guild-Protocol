@@ -20,6 +20,7 @@ import {
     Role,
     Member,
     Ban,
+    GuildPolicies,
     SerializableMessageRef,
     SerializableGuildState,
     Checkpoint
@@ -39,6 +40,7 @@ export interface GuildState {
     headSeq: number;
     headHash: string;
     access: "public" | "private";
+    policies: GuildPolicies;
 }
 
 export function createInitialState(event: GuildEvent): GuildState {
@@ -59,7 +61,8 @@ export function createInitialState(event: GuildEvent): GuildState {
         createdAt: event.createdAt,
         headSeq: event.seq,
         headHash: event.id,
-        access: body.access || "public"
+        access: body.access || "public",
+        policies: body.policies || {}
     };
 }
 
@@ -80,7 +83,8 @@ export function serializeState(state: GuildState): SerializableGuildState {
         roles: Array.from(state.roles.entries()),
         bans: Array.from(state.bans.entries()),
         messages: Array.from(state.messages.entries()),
-        access: state.access
+        access: state.access,
+        policies: state.policies
     };
 }
 
@@ -106,7 +110,8 @@ export function deserializeState(serialized: SerializableGuildState, headSeq: nu
         headSeq,
         headHash,
         createdAt,
-        access: serialized.access
+        access: serialized.access,
+        policies: serialized.policies || {}
     };
 }
 
@@ -126,6 +131,7 @@ export function applyEvent(state: GuildState, event: GuildEvent): GuildState {
     newState.headSeq = event.seq;
     newState.headHash = event.id;
     newState.access = state.access;
+    newState.policies = state.policies;
 
     const body = event.body;
 

@@ -1,4 +1,4 @@
-import { WebSocketServer, WebSocket } from "ws";
+import { WebSocketServer, WebSocket, RawData } from "ws";
 import { createServer, IncomingMessage, ServerResponse } from "http";
 import { createReadStream } from "fs";
 import { stat } from "fs/promises";
@@ -25,11 +25,31 @@ import {
 } from "@cgp/core";
 import { LevelStore } from "./store_level";
 import { Store } from "./store";
-import { RelayPlugin, RelayPluginContext } from "./plugins";
+import { RelayPlugin, RelayPluginContext, createRateLimitPolicyPlugin } from "./plugins";
 
 interface Subscription {
     guildId: GuildId;
     channels?: ChannelId[];
+}
+
+function positiveIntegerFromEnv(name: string, fallback: number) {
+    const raw = process.env[name];
+    if (!raw) return fallback;
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+function rawDataByteLength(data: RawData) {
+    if (typeof data === "string") return Buffer.byteLength(data);
+    if (Array.isArray(data)) return data.reduce((total, chunk) => total + chunk.byteLength, 0);
+    return data.byteLength;
+}
+
+function rawDataToString(data: RawData) {
+    if (typeof data === "string") return data;
+    if (Array.isArray(data)) return Buffer.concat(data).toString("utf8");
+    if (data instanceof ArrayBuffer) return Buffer.from(new Uint8Array(data)).toString("utf8");
+    return data.toString("utf8");
 }
 
 const DIRECT_MESSAGE_SNAPSHOT_MESSAGE_LIMIT = Math.max(
@@ -187,6 +207,7 @@ export class RelayServer {
     private messageQueues = new Map<WebSocket, Promise<void>>();
     private stateCache = new Map<GuildId, GuildState>();
     private mutexes = new Map<GuildId, Promise<void>>();
+    private maxFrameBytes: number;
 
     private pruneTimer: NodeJS.Timeout;
     private checkpointTimer: NodeJS.Timeout;
@@ -198,7 +219,8 @@ export class RelayServer {
         } else {
             this.store = dbPathOrStore;
         }
-        this.plugins = plugins;
+        this.maxFrameBytes = positiveIntegerFromEnv("CGP_RELAY_MAX_FRAME_BYTES", 1024 * 1024);
+        this.plugins = [createRateLimitPolicyPlugin(), ...plugins];
         this.httpServer = createServer((req, res) => {
             void this.handleHttp(req, res).catch((err) => {
                 console.error("Relay HTTP handler failed:", err);
@@ -243,7 +265,15 @@ export class RelayServer {
                 const currentQueue = this.messageQueues.get(socket) || Promise.resolve();
                 const nextTask = currentQueue.then(async () => {
                     try {
-                        const raw = data.toString();
+                        if (rawDataByteLength(data) > this.maxFrameBytes) {
+                            socket.send(JSON.stringify(["ERROR", {
+                                code: "PAYLOAD_TOO_LARGE",
+                                message: `Frame exceeds ${this.maxFrameBytes} byte relay limit`
+                            }]));
+                            return;
+                        }
+
+                        const raw = rawDataToString(data);
                         const [kind, payload] = JSON.parse(raw);
                         await this.handleMessage(socket, kind, payload);
                     } catch (e: any) {
@@ -691,6 +721,11 @@ export class RelayServer {
     ): Promise<GuildEvent | undefined> {
         const { body, author, signature, createdAt } = p;
         const targetGuildId = body.guildId;
+
+        if (!targetGuildId?.trim()) {
+            socket?.send(JSON.stringify(["ERROR", { code: "VALIDATION_FAILED", message: "Event body requires a guildId" }]));
+            return undefined;
+        }
 
         return await this.withGuildMutex(targetGuildId, async () => {
             const lastEvent = await this.store.getLastEvent(targetGuildId);

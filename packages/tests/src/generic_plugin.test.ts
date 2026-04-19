@@ -1,7 +1,8 @@
 
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { RelayServer } from "@cgp/relay/src/server";
-import { RelayPlugin, PluginInputSchema } from "@cgp/relay/src/plugins";
+import { createEncryptionPolicyPlugin, createRateLimitPolicyPlugin } from "@cgp/relay/src/plugins";
+import type { RelayPlugin } from "@cgp/relay/src/plugins";
 import WebSocket from "ws";
 
 describe("Generic Plugin System", () => {
@@ -56,11 +57,15 @@ describe("Generic Plugin System", () => {
 
         const payload = await helloPromise;
         expect(payload.plugins).toBeDefined();
-        expect(payload.plugins).toHaveLength(1);
-        expect(payload.plugins[0].name).toBe("mock-plugin");
-        expect(payload.plugins[0].metadata.name).toBe("Mock Plugin");
-        expect(payload.plugins[0].inputs).toHaveLength(1);
-        expect(payload.plugins[0].inputs[0].name).toBe("token");
+        const rateLimitPlugin = payload.plugins.find((plugin: any) => plugin.name === "cgp.relay.rate-limit");
+        const announcedMock = payload.plugins.find((plugin: any) => plugin.name === "mock-plugin");
+        expect(rateLimitPlugin).toBeDefined();
+        expect(rateLimitPlugin.metadata.policy.rateWindowMs).toBeGreaterThan(0);
+        expect(rateLimitPlugin.metadata.policy.socketPublishesPerWindow).toBeGreaterThan(0);
+        expect(announcedMock).toBeDefined();
+        expect(announcedMock.metadata.name).toBe("Mock Plugin");
+        expect(announcedMock.inputs).toHaveLength(1);
+        expect(announcedMock.inputs[0].name).toBe("token");
 
         ws.close();
     });
@@ -112,5 +117,49 @@ describe("Generic Plugin System", () => {
         expect(err.code).toBe("PLUGIN_NOT_FOUND");
 
         ws.close();
+    });
+
+    it("enforces rate limits through the rate-limit plugin hook", async () => {
+        const plugin = createRateLimitPolicyPlugin({
+            rateWindowMs: 60_000,
+            socketPublishesPerWindow: 1,
+            authorPublishesPerWindow: 100,
+            guildPublishesPerWindow: 100
+        });
+        const sent: any[] = [];
+        const socket = { send: (message: string) => sent.push(JSON.parse(message)) } as unknown as WebSocket;
+        const payload = { author: "user-a", body: { guildId: "guild-a" } };
+
+        expect(await plugin.onFrame?.({ socket, kind: "PUBLISH", payload }, {} as any)).toBe(false);
+        expect(await plugin.onFrame?.({ socket, kind: "PUBLISH", payload }, {} as any)).toBe(true);
+        expect(sent[0][0]).toBe("ERROR");
+        expect(sent[0][1].code).toBe("RATE_LIMITED");
+    });
+
+    it("can require encrypted message envelopes as an optional policy plugin", async () => {
+        const plugin = createEncryptionPolicyPlugin({ requireEncryptedMessages: true });
+        const sent: any[] = [];
+        const socket = { send: (message: string) => sent.push(JSON.parse(message)) } as unknown as WebSocket;
+
+        expect(await plugin.onFrame?.({
+            socket,
+            kind: "PUBLISH",
+            payload: {
+                author: "user-a",
+                body: { type: "MESSAGE", guildId: "guild-a", channelId: "general", content: "plaintext" }
+            }
+        }, {} as any)).toBe(true);
+
+        expect(sent[0][0]).toBe("ERROR");
+        expect(sent[0][1].code).toBe("ENCRYPTION_REQUIRED");
+
+        expect(await plugin.onFrame?.({
+            socket,
+            kind: "PUBLISH",
+            payload: {
+                author: "user-a",
+                body: { type: "MESSAGE", guildId: "guild-a", channelId: "general", content: "ciphertext", encrypted: true, iv: "iv" }
+            }
+        }, {} as any)).toBe(false);
     });
 });

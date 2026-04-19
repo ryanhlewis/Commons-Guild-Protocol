@@ -22,6 +22,7 @@ import {
     ForkFrom,
     EphemeralPolicyUpdate,
     EphemeralPolicy,
+    GuildPolicies,
     validateEvent,
     getSharedSecret,
     encrypt,
@@ -424,7 +425,12 @@ export class CgpClient extends EventEmitter {
         }
     }
 
-    async createGuild(name: string, description?: string, access: "public" | "private" = "public"): Promise<GuildId> {
+    async createGuild(
+        name: string,
+        description?: string,
+        access: "public" | "private" = "public",
+        policies?: GuildPolicies
+    ): Promise<GuildId> {
         const { pub, priv } = this.keyPair!;
         const createdAt = Date.now();
 
@@ -445,6 +451,7 @@ export class CgpClient extends EventEmitter {
             name,
             description,
             access,
+            policies,
             encryptedGroupKey
         };
         const tempId = hashObject({ author: pub, name, createdAt });

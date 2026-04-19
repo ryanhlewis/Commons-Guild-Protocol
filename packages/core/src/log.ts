@@ -22,16 +22,7 @@ export function validateChain(events: GuildEvent[]): boolean {
 
         if (expectedId !== ev.id) return false;
 
-        // Extended validation
-        if (ev.body.type === "CHANNEL_CREATE") {
-            // Check uniqueness if we had the full state, but here we just validate the chain structure.
-            // We can enforce that channelId is the hash of the event?
-            // The spec says "channel_id is its hash".
-            // But channelId is inside the body.
-            // So we can't easily validate it without re-hashing the body excluding channelId?
-            // Or maybe channelId is NOT in the body for the hash?
-            // For now, let's just ensure basic structure.
-        }
+        // Stateful checks such as duplicate channel IDs require replay state and live in validateEvent().
         // Note: Signature verification is separate, usually done before chain validation or as part of it if we pass in verify fn
     }
     return true;

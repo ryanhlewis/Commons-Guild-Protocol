@@ -16,9 +16,11 @@
 
 **Non-goals**
 
-- Strong global consensus (no “single canonical world state”).
+- Strong global consensus (no "single canonical world state").
 - Strong delivery guarantees (no exactly-once; we aim for **eventual consistency** given honest relays).
 - On-chain message storage. Only optional anchoring of small hashes to external L1s.
+- Mandatory end-to-end encryption, key escrow, or relay-visible decryption.
+- Strong metadata privacy without additional transports/plugins.
 
 ---
 
@@ -34,12 +36,12 @@
 
 ### 2.2 Signatures
 
-- Signature scheme: ECDSA or Schnorr over secp256k1 (reference impl uses noble’s ECDSA first; Schnorr may be added later).
+- Signature scheme: ECDSA or Schnorr over secp256k1 (reference impl uses noble's ECDSA first; Schnorr may be added later).
 - Sign/verify functions live in `@cgp/core/crypto`.
 
 ### 2.3 Hashing
 
-- Hash function: **SHA‑256**.
+- Hash function: **SHA-256**.
 - Library: `@noble/hashes/sha256`.   
 - Used for:
   - event IDs: `event_id = SHA256(canonical_encode(event_without_id_sign))`
@@ -69,14 +71,17 @@ Implementations **must** use a deterministic encoding when computing hashes. The
 type PublicKeyHex = string;  // lowercase hex, 66 chars including "02"/"03" prefix
 type SignatureHex = string;
 type HashHex = string;       // lowercase hex
-type GuildId = HashHex;      // SHA256 of guild creation event
-type ChannelId = HashHex;    // SHA256 of channel creation event
+type GuildId = HashHex;      // stable collision-resistant guild identifier
+type ChannelId = HashHex;    // stable collision-resistant channel identifier
 type UserId = PublicKeyHex;  // identity == pubkey
 ```
 
 * A **user** is any entity that controls a secp256k1 private key.
-* A **guild** is defined by its first event (`GUILD_CREATE`); its `guild_id` is the hash of that event.
-* A **channel** is defined by its `CHANNEL_CREATE` event; `channel_id` is its hash.
+* A **guild** is defined by its first event (`GUILD_CREATE`); its `guildId` is the target log ID chosen
+  by the creator. Implementations SHOULD derive it from a collision-resistant genesis preimage such as
+  `(author, createdAt, random nonce, metadata)`, not from the final event that embeds `guildId` itself.
+* A **channel** is defined by its `CHANNEL_CREATE` event; its `channelId` is stable within the guild and
+  relays MUST reject duplicate channel IDs in the same guild.
 
 ### 3.2 Guild log
 
@@ -85,7 +90,7 @@ A guild log is a sequence of **events**:
 ```ts
 interface GuildEventBodyBase {
   type: string;     // e.g. "GUILD_CREATE", "MESSAGE", ...
-  guildId: GuildId; // for all events except GUILD_CREATE itself (see below)
+  guildId: GuildId; // target guild log
   // plus event-type-specific fields
 }
 
@@ -96,7 +101,7 @@ interface GuildEvent {
   createdAt: number;          // milliseconds since epoch (informational)
   author: UserId;             // public key of signer
   body: GuildEventBodyBase & Record<string, any>;
-  signature: SignatureHex;    // signature over canonical encoding of {seq, prevHash, createdAt, author, body}
+  signature: SignatureHex;    // signature over canonical encoding of {body, author, createdAt}
 }
 ```
 
@@ -139,10 +144,16 @@ Some key ones:
 ```ts
 interface GuildCreate {
   type: "GUILD_CREATE";
-  // guildId is special: for this event, body.guildId MUST equal SHA256(canonicalEncode(unsignedEvent))
+  // guildId is the target log ID and MUST remain stable for every event in this guild.
   guildId: GuildId;
   name: string;
   description?: string;
+  access?: "public" | "private";
+  policies?: {
+    // "public" allows any non-banned key to publish user-authored channel/app events.
+    // "members" requires explicit membership even when the guild profile is public.
+    posting?: "public" | "members";
+  };
   flags?: {
     allowForksBy?: "any" | "mods" | "owner-only"; // advisory, not enforced by protocol
   };
@@ -166,7 +177,7 @@ interface Message {
   type: "MESSAGE";
   guildId: GuildId;
   channelId: ChannelId;
-  messageId: HashHex; // SHA256 of (guildId, channelId, seq, author, content)
+  messageId: HashHex; // stable client-chosen id; SHOULD hash a collision-resistant message preimage
   content: string;    // UTF-8 text; later: support attachments
   replyTo?: HashHex;  // messageId of parent message
 }
@@ -241,7 +252,30 @@ interface AppObjectDelete {
 Relays MUST validate that the author can participate in the guild, that referenced channels exist, and
 that referenced messages are live. Object semantics and finer permissions are owned by the namespace
 and MAY be enforced by relay plugins or clients. Unknown namespaces must not change core guild state.
-### 3.4 Canonical state (“UTXO of messages”)
+
+### 3.3.2 Admission, posting policy, and baseline anti-abuse
+
+CGP identities are self-generated public keys. The base protocol is therefore not Sybil-resistant by
+identity alone. Sybil resistance comes from guild and relay policy:
+
+* `access: "private"` requires membership for reads and writes.
+* `policies.posting: "members"` requires membership for user-authored publish events while still allowing
+  a public guild profile or directory listing.
+* `policies.posting: "public"` preserves open community behavior but must be paired with relay-side
+  moderation, proof challenges, reputation, invite gates, or plugin policy for large public guilds.
+
+Reference relays MUST reject writes from banned users and MUST enforce membership when `access` is private
+or `policies.posting` is `members`. Sybil resistance, rate limiting, proof challenges, reputation,
+captcha/WebAuthn gates, invite gates, and spam scoring are relay or guild policy, not canonical CGP state.
+Relays MAY advertise those policies as plugins in `HELLO_OK.plugins`; these plugins do not change the core
+event format and MUST NOT be represented as top-level core protocol fields.
+
+The reference relay ships with a default plugin named `cgp.relay.rate-limit` that enforces per-socket,
+per-author, and per-guild publish buckets. That plugin is a recommended operational default, not a
+mandatory part of CGP-0.1. Compatible relays may disable it, replace it, or combine it with other policy
+plugins as long as they still enforce the core authorization rules above.
+
+### 3.4 Canonical state ("UTXO of messages")
 
 For any guild, a **canonical view** of a channel at time `T` is computed by scanning the log up to `seq <= S` where `S` is last known, applying rules:
 
@@ -254,8 +288,8 @@ For any guild, a **canonical view** of a channel at time `T` is computed by scan
 
 This is analogous to a UTXO set:
 
-* `MESSAGE` “mints” a message,
-* `DELETE_MESSAGE` “spends” it,
+* `MESSAGE` "mints" a message,
+* `DELETE_MESSAGE` "spends" it,
 * `EDIT_MESSAGE` updates its **view**, not its existence.
 
 State derivation is local and deterministic given the log; clients are free to index/cache it.
@@ -345,10 +379,19 @@ type Frame =
   | ["HELLO_OK", HelloOkFrame]
   | ["ERROR", ErrorFrame]
   | ["EVENT", GuildEvent]             // server → client: new event
-  | ["PUBLISH", GuildEvent]           // client → server: submit event
+  | ["PUBLISH", PublishFrame]         // client -> server: submit pre-sequenced event
   | ["SUB", SubFrame]                 // client → server: subscribe
   | ["UNSUB", UnsubFrame]             // client → server: unsubscribe
   | ["SNAPSHOT", SnapshotFrame];      // server → client: initial events
+```
+
+```ts
+interface PublishFrame {
+  body: EventBody;
+  author: UserId;
+  createdAt: number;
+  signature: SignatureHex; // sign(SHA256(canonicalEncode({ body, author, createdAt })))
+}
 ```
 
 ### 5.2 HELLO handshake
@@ -379,6 +422,7 @@ interface HelloOkFrame {
   relayName?: string;
   relayVersion?: string;
   features?: string[]; // e.g. ["ephemeral", "checkpoints", "directory-cache"]
+  plugins?: RelayPluginDescriptor[];
 }
 ```
 
@@ -487,6 +531,7 @@ interface PluginMetadata {
   description?: string;
   icon?: string;
   version?: string;
+  policy?: Record<string, unknown>; // plugin-defined policy/status metadata
   clientExtension?: string;
   clientExtensionDescription?: string;
   clientExtensionUrl?: string;
@@ -524,6 +569,14 @@ or an `["ERROR", { code: "PLUGIN_NOT_FOUND" | "PLUGIN_CONFIG_ERROR", message: st
 If `clientExtensionUrl` is relative, clients resolve it against the relay HTTP origin (if the relay serves extension bundles).
 If `clientExtensionUrl` is absolute, clients fetch directly. HTTP hosting of extension bundles is optional and not part of the WebSocket protocol.
 Relay implementations may also expose plugin-provided static assets under `/extensions/{clientExtension}/...` as a convenience.
+
+Reserved reference plugin names:
+
+* `cgp.relay.rate-limit`: relay-local publish buckets or equivalent anti-spam policy. This is a
+  recommended reference plugin, not core CGP state.
+* `cgp.security.encryption-policy`: relay-local policy that can require or reject encrypted MESSAGE
+  envelopes for selected guilds/channels. This plugin must not receive plaintext keys and must not act
+  as a key server.
 
 ---
 
@@ -592,7 +645,7 @@ Peers (clients):
 * Are **not required** to relay for others.
 * May optionally:
 
-  * act as P2P “soft-relays” for small guilds where all members agree,
+  * act as P2P "soft-relays" for small guilds where all members agree,
   * cache logs for offline use and share them with other clients during connection.
 
 ---
@@ -616,7 +669,23 @@ Peers (clients):
 
 **Privacy**
 
-* CGP-0.1 does not guarantee metadata privacy:
+CGP-0.1 guarantees log integrity, not metadata privacy. By default, relays can observe:
 
-  * relays see who connects and which guilds they subscribe to.
-* Payloads *can* be E2E encrypted at application level (like Matrix & Nostr do), but that is outside core spec.
+* the network endpoint that connects to them,
+* which guilds and channels a client subscribes to,
+* event authors, event types, event sizes, timing, sequence numbers, and public guild/channel IDs,
+* directory lookups made directly against a directory operator.
+
+Payload confidentiality is an optional end-to-end client capability, not a relay requirement. Clients may
+publish opaque ciphertext in message payloads or app-defined envelopes; relays MUST NOT need plaintext or
+decryption keys to sequence or replicate those events. Relays MAY advertise an optional policy plugin such
+as `cgp.security.encryption-policy` to require encrypted MESSAGE envelopes for selected guilds/channels,
+or to reject encrypted payloads on relays that require plaintext moderation. Such a plugin verifies only
+envelope shape and local relay policy; it is not a key server and does not make E2EE part of core relay
+state.
+
+Metadata privacy requires additional client/relay extensions. Recommended mitigations include TLS,
+Tor/I2P/proxy transports, subscribing to broader guild snapshots and filtering locally, batching
+subscriptions, padding event sizes, delaying publishes, pseudonymous per-guild keys, and private directory
+lookup mechanisms. Strong metadata privacy via PIR, mixnets, or oblivious relays is intentionally out of
+scope for CGP-0.1 because it changes latency, cost, and operational assumptions.

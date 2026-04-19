@@ -48,9 +48,9 @@ describe("Client Plugin Discovery", () => {
         const plugins = await pluginsPromise;
 
         expect(Array.isArray(plugins)).toBe(true);
-        expect(plugins).toHaveLength(1);
-        expect(plugins[0].name).toBe("mock-plugin");
-        expect(client.availablePlugins).toHaveLength(1);
+        expect(plugins.some((plugin) => plugin.name === "cgp.relay.rate-limit")).toBe(true);
+        expect(plugins.some((plugin) => plugin.name === "mock-plugin")).toBe(true);
+        expect(client.availablePlugins.some((plugin) => plugin.name === "mock-plugin")).toBe(true);
 
         client.close();
     });
