@@ -781,6 +781,36 @@ describe("CGP relay basic messaging", () => {
         stranger.close();
     });
 
+    it("serves members and guild state as bounded pages", async () => {
+        const ownerPrivKey = secp.utils.randomPrivateKey();
+        const ownerPubKey = Buffer.from(secp.getPublicKey(ownerPrivKey, true)).toString("hex");
+        const owner = new CgpClient({ relays: [relayUrl], keyPair: { pub: ownerPubKey, priv: ownerPrivKey } });
+        await owner.connect();
+
+        const guildId = await owner.createGuild("Paged Members Guild");
+        for (let index = 0; index < 12; index += 1) {
+            await owner.assignRole(guildId, `member-${String(index).padStart(3, "0")}`, "member");
+        }
+        await new Promise((res) => setTimeout(res, 300));
+
+        const firstPage = await owner.getMembersPage(guildId, { limit: 5 });
+        expect(firstPage.members).toHaveLength(5);
+        expect(firstPage.hasMore).toBe(true);
+        expect(firstPage.nextCursor).toBe(firstPage.members.at(-1)?.userId);
+
+        const secondPage = await owner.getMembersPage(guildId, { limit: 5, afterUserId: firstPage.nextCursor ?? undefined });
+        expect(secondPage.members.length).toBeGreaterThan(0);
+        expect(secondPage.members[0].userId.localeCompare(firstPage.nextCursor ?? "")).toBeGreaterThan(0);
+
+        const partialState = await owner.getState(guildId, { memberLimit: 4, includeMessages: false });
+        expect(partialState.stateIncludes).toMatchObject({ members: "partial", messages: "omitted" });
+        expect(partialState.membersPage).toMatchObject({ hasMore: true });
+        expect(partialState.state.members).toHaveLength(4);
+        expect(partialState.state.messages ?? []).toHaveLength(0);
+
+        owner.close();
+    });
+
     it("filters hidden channel history for unauthenticated readers", async () => {
         const ownerPrivKey = secp.utils.randomPrivateKey();
         const ownerPubKey = Buffer.from(secp.getPublicKey(ownerPrivKey, true)).toString("hex");

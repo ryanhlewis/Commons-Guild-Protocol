@@ -37,6 +37,20 @@ import {
     SerializableGuildState
 } from "@cgp/core";
 
+export type StateIncludeMode = "full" | "partial" | "omitted";
+
+export interface StateIncludes {
+    members?: StateIncludeMode;
+    messages?: Exclude<StateIncludeMode, "partial">;
+    appObjects?: Exclude<StateIncludeMode, "partial">;
+}
+
+export interface MemberPageMeta {
+    nextCursor: string | null;
+    hasMore: boolean;
+    totalApprox?: number;
+}
+
 export interface StateResponse {
     subId?: string;
     guildId: GuildId;
@@ -46,6 +60,30 @@ export interface StateResponse {
     endHash: string;
     checkpointSeq?: number | null;
     checkpointHash?: string | null;
+    membersPage?: MemberPageMeta;
+    stateIncludes?: StateIncludes;
+}
+
+export interface StateRequestOptions {
+    includeMembers?: boolean;
+    includeMessages?: boolean;
+    includeAppObjects?: boolean;
+    memberAfter?: string;
+    memberLimit?: number;
+}
+
+export interface MembersRequestOptions {
+    afterUserId?: string;
+    limit?: number;
+}
+
+export interface MembersResponse {
+    subId?: string;
+    guildId: GuildId;
+    members: SerializableMember[];
+    nextCursor?: string | null;
+    hasMore?: boolean;
+    totalApprox?: number;
 }
 
 export interface HistoryRequest {
@@ -136,6 +174,23 @@ export interface AppObjectWriteOptions {
     channelId?: ChannelId;
     target?: AppObjectTarget;
     value?: any;
+}
+
+function mergePartialState(current: GuildState | undefined, incoming: GuildState, includes?: StateIncludes): GuildState {
+    if (!current || !includes) {
+        return incoming;
+    }
+
+    return {
+        ...incoming,
+        members: includes.members === "omitted"
+            ? current.members
+            : includes.members === "partial"
+                ? new Map([...current.members, ...incoming.members])
+                : incoming.members,
+        messages: includes.messages === "omitted" ? current.messages : incoming.messages,
+        appObjects: includes.appObjects === "omitted" ? current.appObjects : incoming.appObjects
+    };
 }
 
 export class CgpClient extends EventEmitter {
@@ -473,7 +528,8 @@ export class CgpClient extends EventEmitter {
                 } else if (kind === "STATE") {
                     const p = payload as Partial<StateResponse>;
                     if (p.state && p.guildId && typeof p.endSeq === "number" && typeof p.endHash === "string") {
-                        this.state.set(p.guildId, deserializeState(p.state, p.endSeq, p.endHash, Date.now()));
+                        const incoming = deserializeState(p.state, p.endSeq, p.endHash, Date.now());
+                        this.state.set(p.guildId, mergePartialState(this.state.get(p.guildId), incoming, p.stateIncludes));
                     }
                     this.emit("state_response", payload);
                 } else if (kind === "SEARCH_RESULTS") {
@@ -671,7 +727,7 @@ export class CgpClient extends EventEmitter {
             target: options.target,
             value: options.value
         };
-        await this.publish(body);
+        await this.publishReliable(body);
     }
 
     async deleteAppObject(
@@ -690,7 +746,7 @@ export class CgpClient extends EventEmitter {
             channelId: options.channelId,
             target: options.target
         };
-        await this.publish(body);
+        await this.publishReliable(body);
     }
 
     async assignRole(guildId: GuildId, userId: string, role: string): Promise<void> {
@@ -760,20 +816,25 @@ export class CgpClient extends EventEmitter {
     }
 
     async getMembers(guildId: string): Promise<SerializableMember[]> {
+        const response = await this.getMembersPage(guildId);
+        return response.members;
+    }
+
+    async getMembersPage(guildId: string, options: MembersRequestOptions = {}): Promise<MembersResponse> {
         const subId = Math.random().toString(36).slice(2);
-        const payload = await this.signedReadPayload("GET_MEMBERS", { subId, guildId });
+        const payload = await this.signedReadPayload("GET_MEMBERS", { subId, guildId, ...options });
         const frame = JSON.stringify(["GET_MEMBERS", payload]);
 
-        return new Promise<SerializableMember[]>((resolve, reject) => {
+        return new Promise<MembersResponse>((resolve, reject) => {
             const timeout = setTimeout(() => {
                 cleanup();
                 reject(new Error("Timeout waiting for members"));
             }, 10000);
 
-            const handler = (data: { subId: string, members: SerializableMember[] }) => {
+            const handler = (data: MembersResponse) => {
                 if (data.subId === subId) {
                     cleanup();
-                    resolve(data.members);
+                    resolve(data);
                 }
             };
             const errorHandler = (data: any) => {
@@ -800,9 +861,9 @@ export class CgpClient extends EventEmitter {
         });
     }
 
-    async getState(guildId: GuildId): Promise<StateResponse> {
+    async getState(guildId: GuildId, options: StateRequestOptions = {}): Promise<StateResponse> {
         const subId = Math.random().toString(36).slice(2);
-        const payload = await this.signedReadPayload("GET_STATE", { subId, guildId });
+        const payload = await this.signedReadPayload("GET_STATE", { subId, guildId, ...options });
         const frame = JSON.stringify(["GET_STATE", payload]);
 
         return new Promise<StateResponse>((resolve, reject) => {

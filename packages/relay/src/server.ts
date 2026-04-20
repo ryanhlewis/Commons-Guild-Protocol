@@ -23,12 +23,15 @@ import {
     Message,
     Checkpoint,
     EphemeralPolicyUpdate,
+    Member,
+    SerializableMember,
+    SerializableMessageRef,
     validateEvent,
     canReadGuild,
     canViewChannel
 } from "@cgp/core";
 import { LevelStore } from "./store_level";
-import { HistoryQuery, Store } from "./store";
+import { HistoryQuery, MemberPageQuery, normalizeMemberPageLimit, Store } from "./store";
 import {
     RelayPlugin,
     RelayPluginContext,
@@ -102,11 +105,18 @@ interface SearchResult {
 interface StateRequest extends SignedReadRequest {
     subId?: string;
     guildId?: GuildId;
+    includeMembers?: boolean;
+    includeMessages?: boolean;
+    includeAppObjects?: boolean;
+    memberAfter?: string;
+    memberLimit?: number;
 }
 
 interface MembersRequest extends SignedReadRequest {
     subId?: string;
     guildId?: GuildId;
+    afterUserId?: string;
+    limit?: number;
 }
 
 export interface RelayServerOptions {
@@ -117,6 +127,9 @@ export interface RelayServerOptions {
     enableDefaultPlugins?: boolean;
     rateLimitPolicy?: Partial<RateLimitPolicy>;
     maxFrameBytes?: number;
+    searchScanLimit?: number;
+    snapshotEventLimit?: number;
+    checkpointMessageRefLimit?: number;
 }
 
 function positiveIntegerFromEnv(name: string, fallback: number) {
@@ -439,15 +452,79 @@ function eventMatchesRequestedChannels(state: GuildState, event: GuildEvent, cha
     return !channelId || channels.includes(channelId);
 }
 
-function filterSerializedStateForReader(state: GuildState, author?: string) {
+function filterSerializedStateForReader(
+    state: GuildState,
+    author?: string,
+    options: {
+        includeMembers?: boolean;
+        includeMessages?: boolean;
+        includeAppObjects?: boolean;
+    } = {}
+) {
+    const channels: ReturnType<typeof serializeState>["channels"] = [];
+    for (const entry of state.channels) {
+        if (canViewChannel(state, author, entry[0])) {
+            channels.push(entry);
+        }
+    }
+
+    const needsChannelVisibility = options.includeMessages !== false || options.includeAppObjects !== false;
+    const visibleChannelIds = needsChannelVisibility ? new Set(channels.map(([channelId]) => channelId)) : null;
+
+    const members: ReturnType<typeof serializeState>["members"] = [];
+    if (options.includeMembers !== false) {
+        for (const [id, member] of state.members) {
+            members.push([
+                id,
+                {
+                    ...member,
+                    roles: Array.from(member.roles)
+                }
+            ]);
+        }
+    }
+
+    const messages: ReturnType<typeof serializeState>["messages"] = [];
+    if (options.includeMessages !== false && visibleChannelIds) {
+        for (const entry of state.messages) {
+            if (visibleChannelIds.has(entry[1].channelId)) {
+                messages.push(entry);
+            }
+        }
+    }
+
+    const appObjects: ReturnType<typeof serializeState>["appObjects"] = [];
+    if (options.includeAppObjects !== false && visibleChannelIds) {
+        for (const entry of state.appObjects) {
+            const object = entry[1];
+            const channelId = object.channelId || object.target?.channelId;
+            if (!channelId || visibleChannelIds.has(channelId)) {
+                appObjects.push(entry);
+            }
+        }
+    }
+
+    return {
+        guildId: state.guildId,
+        name: state.name,
+        description: state.description || "",
+        ownerId: state.ownerId,
+        channels,
+        members,
+        roles: Array.from(state.roles.entries()),
+        bans: Array.from(state.bans.entries()),
+        messages,
+        appObjects,
+        access: state.access,
+        policies: state.policies
+    };
+}
+
+function serializeBoundedCheckpointState(state: GuildState, messageRefLimit: number) {
     const serialized = serializeState(state);
-    serialized.channels = serialized.channels.filter(([channelId]) => canViewChannel(state, author, channelId));
-    const visibleChannelIds = new Set(serialized.channels.map(([channelId]) => channelId));
-    serialized.messages = (serialized.messages ?? []).filter(([, message]) => visibleChannelIds.has(message.channelId));
-    serialized.appObjects = (serialized.appObjects ?? []).filter(([, object]) => {
-        const channelId = object.channelId || object.target?.channelId;
-        return !channelId || visibleChannelIds.has(channelId);
-    });
+    if (Number.isFinite(messageRefLimit) && messageRefLimit >= 0 && serialized.messages && serialized.messages.length > messageRefLimit) {
+        serialized.messages = serialized.messages.slice(serialized.messages.length - messageRefLimit);
+    }
     return serialized;
 }
 
@@ -526,6 +603,7 @@ function buildSearchResults(
 ) {
     const results: SearchResult[] = [];
     const visibleEvents = filterEventsForReader(state, events, author);
+    const hasEnoughResults = () => results.length > request.limit;
 
     if (request.scopes.has("messages")) {
         for (const record of collectSearchMessageRecords(visibleEvents)) {
@@ -559,7 +637,7 @@ function buildSearchResults(
         }
     }
 
-    if (request.scopes.has("channels")) {
+    if (!hasEnoughResults() && request.scopes.has("channels")) {
         for (const [channelId, channel] of state.channels) {
             if (request.channelId && channelId !== request.channelId) continue;
             if (!canViewChannel(state, author, channelId)) continue;
@@ -573,10 +651,11 @@ function buildSearchResults(
                 channelId,
                 preview: previewText([channel.name, channel.topic || channel.description].filter(Boolean).join(" - "))
             });
+            if (hasEnoughResults()) break;
         }
     }
 
-    if (request.scopes.has("members")) {
+    if (!hasEnoughResults() && request.scopes.has("members")) {
         for (const [userId, member] of state.members) {
             if (!passesSeqWindow(undefined, request.beforeSeq, request.afterSeq)) continue;
             if (!matchesSearchQuery(request.query, userId, member.nickname, member.bio, Array.from(member.roles))) {
@@ -588,10 +667,11 @@ function buildSearchResults(
                 userId,
                 preview: previewText(member.nickname || member.bio || userId)
             });
+            if (hasEnoughResults()) break;
         }
     }
 
-    if (request.scopes.has("appObjects")) {
+    if (!hasEnoughResults() && request.scopes.has("appObjects")) {
         for (const [, object] of state.appObjects) {
             if (!passesSeqWindow(undefined, request.beforeSeq, request.afterSeq)) continue;
             const channelId = object.channelId || object.target?.channelId;
@@ -611,6 +691,7 @@ function buildSearchResults(
                 createdAt: object.updatedAt,
                 preview: previewText(`${object.namespace}/${object.objectType}/${object.objectId}`)
             });
+            if (hasEnoughResults()) break;
         }
     }
 
@@ -636,10 +717,15 @@ export class RelayServer {
     private pluginCtx: RelayPluginContext;
     private pluginsReady: Promise<void>;
     private subscriptions = new Map<WebSocket, Map<string, Subscription>>();
+    private guildSubscriptions = new Map<GuildId, Map<WebSocket, Set<string>>>();
     private messageQueues = new Map<WebSocket, Promise<void>>();
     private stateCache = new Map<GuildId, GuildState>();
+    private checkpointCache = new Map<GuildId, GuildEvent | undefined>();
     private mutexes = new Map<GuildId, Promise<void>>();
     private maxFrameBytes: number;
+    private searchScanLimit: number;
+    private snapshotEventLimit: number;
+    private checkpointMessageRefLimit: number;
 
     private pruneTimer: NodeJS.Timeout;
     private checkpointTimer: NodeJS.Timeout;
@@ -657,6 +743,9 @@ export class RelayServer {
             this.store = dbPathOrStore;
         }
         this.maxFrameBytes = options.maxFrameBytes ?? positiveIntegerFromEnv("CGP_RELAY_MAX_FRAME_BYTES", 1024 * 1024);
+        this.searchScanLimit = options.searchScanLimit ?? positiveIntegerFromEnv("CGP_RELAY_SEARCH_SCAN_EVENTS", 25000);
+        this.snapshotEventLimit = options.snapshotEventLimit ?? positiveIntegerFromEnv("CGP_RELAY_SNAPSHOT_EVENTS", 5000);
+        this.checkpointMessageRefLimit = options.checkpointMessageRefLimit ?? positiveIntegerFromEnv("CGP_RELAY_CHECKPOINT_MESSAGE_REFS", 50000);
         const defaultPluginsEnabled = options.enableDefaultPlugins ?? process.env.CGP_RELAY_DEFAULT_PLUGINS !== "0";
         this.plugins = defaultPluginsEnabled
             ? [
@@ -709,6 +798,9 @@ export class RelayServer {
             },
             getLog: async (guildId: GuildId) => {
                 return await this.store.getLog(guildId);
+            },
+            getState: async (guildId: GuildId) => {
+                return (await this.rebuildGuildState(guildId))?.state ?? null;
             }
         };
         this.pluginsReady = this.initPlugins();
@@ -746,7 +838,7 @@ export class RelayServer {
             });
 
             socket.on("close", () => {
-                this.subscriptions.delete(socket);
+                this.removeSocketSubscriptions(socket);
                 this.messageQueues.delete(socket);
             });
         });
@@ -987,24 +1079,22 @@ export class RelayServer {
         const guilds = await this.store.getGuildIds();
 
         for (const guildId of guilds) {
-            const events = await this.store.getLog(guildId);
-            if (events.length === 0) continue;
-
-            let state: GuildState;
+            let rebuilt: { state: GuildState; endEvent: GuildEvent; checkpointEvent?: GuildEvent } | null;
             try {
-                state = rebuildStateFromEvents(events).state;
+                rebuilt = await this.rebuildGuildState(guildId);
             } catch (e) {
                 console.error(`Failed to rebuild state for guild ${guildId} during checkpoint:`, e);
                 continue;
             }
+            if (!rebuilt) continue;
 
             // Create checkpoint event
-            const lastEvent = events[events.length - 1];
+            const { state, endEvent: lastEvent } = rebuilt;
             if (lastEvent.body.type === "CHECKPOINT") {
                 continue;
             }
 
-            const serializedState = serializeState(state);
+            const serializedState = serializeBoundedCheckpointState(state, this.checkpointMessageRefLimit);
             const stateHash = hashObject(serializedState);
 
             const body: Checkpoint = {
@@ -1030,6 +1120,7 @@ export class RelayServer {
 
             await this.store.append(guildId, fullEvent);
             this.stateCache.set(guildId, applyEvent(state, fullEvent));
+            this.checkpointCache.set(guildId, fullEvent);
             console.log(`Relay created checkpoint for guild ${guildId} at seq ${fullEvent.seq}`);
             this.broadcast(guildId, fullEvent);
         }
@@ -1040,28 +1131,36 @@ export class RelayServer {
         const now = Date.now();
 
         for (const guildId of guilds) {
-            const events = await this.store.getLog(guildId);
-            if (events.length === 0) continue;
-
-            let state: GuildState;
+            let rebuilt: { state: GuildState; endEvent: GuildEvent; checkpointEvent?: GuildEvent } | null;
             try {
-                state = createInitialState(events[0]);
-                for (let i = 1; i < events.length; i++) {
-                    state = applyEvent(state, events[i]);
-                }
+                rebuilt = await this.rebuildGuildState(guildId);
             } catch (e) {
                 console.error(`Failed to rebuild state for guild ${guildId} during prune:`, e);
                 continue;
             }
+            if (!rebuilt) continue;
+
+            const ttlChannels = new Map<ChannelId, number>();
+            for (const [channelId, channel] of rebuilt.state.channels) {
+                if (channel.retention?.mode === "ttl" && channel.retention.seconds) {
+                    ttlChannels.set(channelId, channel.retention.seconds);
+                }
+            }
+            if (ttlChannels.size === 0) {
+                continue;
+            }
+
+            const events = await this.store.getLog(guildId);
+            if (events.length === 0) continue;
 
             const seqsToDelete: number[] = [];
             for (const event of events) {
                 if (event.body.type === "MESSAGE") {
                     const body = event.body as Message;
-                    const channel = state.channels.get(body.channelId);
-                    if (channel && channel.retention && channel.retention.mode === "ttl" && channel.retention.seconds) {
+                    const ttlSeconds = ttlChannels.get(body.channelId);
+                    if (ttlSeconds) {
                         const ageSeconds = (now - event.createdAt) / 1000;
-                        if (ageSeconds > channel.retention.seconds) {
+                        if (ageSeconds > ttlSeconds) {
                             seqsToDelete.push(event.seq);
                         }
                     }
@@ -1070,6 +1169,10 @@ export class RelayServer {
 
             for (const seq of seqsToDelete) {
                 await this.store.deleteEvent(guildId, seq);
+            }
+            if (seqsToDelete.length > 0) {
+                this.stateCache.delete(guildId);
+                this.checkpointCache.delete(guildId);
             }
         }
     }
@@ -1127,23 +1230,19 @@ export class RelayServer {
                 const author = await this.readAuthorOrError(socket, "SUB", payload, subId, guildId);
                 if (author === null) return;
 
-                const events = await this.store.getLog(guildId);
                 const rebuilt = await this.rebuildGuildState(guildId);
                 if (rebuilt && !canReadGuild(rebuilt.state, author)) {
                     this.sendRequestError(socket, "FORBIDDEN", "You do not have permission to subscribe to this guild", { subId, guildId });
                     return;
                 }
 
-                const rawSnapshotEvents = buildReplaySnapshotEvents(guildId, events);
+                const rawSnapshotEvents = await this.readReplaySnapshotEvents(guildId);
                 const snapshotEvents = rebuilt
                     ? filterEventsForReader(rebuilt.state, rawSnapshotEvents, author)
                         .filter((event) => eventMatchesRequestedChannels(rebuilt.state, event, channels))
                     : rawSnapshotEvents;
-                const subs = this.subscriptions.get(socket);
-                if (subs) {
-                    subs.set(subId, { guildId, channels, author });
-                }
-                const tailEvent = events.length > 0 ? events[events.length - 1] : null;
+                this.addSubscription(socket, subId, { guildId, channels, author });
+                const tailEvent = rebuilt?.endEvent ?? (snapshotEvents.length > 0 ? snapshotEvents[snapshotEvents.length - 1] : null);
                 const oldestSeq = snapshotEvents.length > 0 ? snapshotEvents[0].seq : null;
                 const newestSeq = snapshotEvents.length > 0 ? snapshotEvents[snapshotEvents.length - 1].seq : null;
                 const checkpointEvent = snapshotEvents.find((event) => event.body.type === "CHECKPOINT");
@@ -1158,7 +1257,7 @@ export class RelayServer {
                             endHash: tailEvent?.id ?? null,
                             oldestSeq,
                             newestSeq,
-                            hasMore: snapshotEvents.length < events.length,
+                            hasMore: oldestSeq !== null && oldestSeq > 0,
                             checkpointSeq: checkpointEvent?.seq ?? null,
                             checkpointHash: checkpointEvent?.id ?? null
                         }
@@ -1208,7 +1307,7 @@ export class RelayServer {
                     try {
                         const members = await plugin.onGetMembers?.({ guildId, author, socket }, this.pluginCtx);
                         if (members) {
-                            socket.send(JSON.stringify(["MEMBERS", { subId, guildId, members }]));
+                            socket.send(JSON.stringify(["MEMBERS", { subId, guildId, members, nextCursor: null, hasMore: false }]));
                             return;
                         }
                     } catch (e: any) {
@@ -1216,20 +1315,72 @@ export class RelayServer {
                     }
                 }
 
-                const members = serializeState(rebuilt.state).members.map(([, member]) => member);
-                socket.send(JSON.stringify(["MEMBERS", { subId, guildId, members }]));
+                const limit = normalizeMemberPageLimit(p.limit);
+                const afterUserId = typeof p.afterUserId === "string" && p.afterUserId.trim() ? p.afterUserId : undefined;
+                if (this.store.getMembersPage) {
+                    const page = await this.store.getMembersPage({ guildId, afterUserId, limit });
+                    socket.send(JSON.stringify(["MEMBERS", { subId, guildId, ...page }]));
+                    return;
+                }
+
+                const members = serializeState(rebuilt.state).members
+                    .map(([, member]) => member)
+                    .sort((left, right) => left.userId.localeCompare(right.userId));
+                const startIndex = afterUserId ? members.findIndex((member) => member.userId > afterUserId) : 0;
+                const pageStart = startIndex >= 0 ? startIndex : members.length;
+                const page = members.slice(pageStart, pageStart + limit + 1);
+                const hasMore = page.length > limit;
+                const visible = hasMore ? page.slice(0, limit) : page;
+                socket.send(JSON.stringify([
+                    "MEMBERS",
+                    {
+                        subId,
+                        guildId,
+                        members: visible,
+                        nextCursor: hasMore && visible.length > 0 ? visible[visible.length - 1].userId : null,
+                        hasMore,
+                        totalApprox: members.length
+                    }
+                ]));
             });
         }
     }
 
     private async rebuildGuildState(guildId: GuildId): Promise<{ state: GuildState; endEvent: GuildEvent; checkpointEvent?: GuildEvent } | null> {
-        const events = await this.store.getLog(guildId);
+        const endEvent = await this.store.getLastEvent(guildId);
+        if (!endEvent) {
+            this.stateCache.delete(guildId);
+            this.checkpointCache.delete(guildId);
+            return null;
+        }
+
+        const cachedState = this.stateCache.get(guildId);
+        if (cachedState?.headSeq === endEvent.seq) {
+            if (endEvent.body.type === "CHECKPOINT" && isValidCheckpointEvent(endEvent)) {
+                this.checkpointCache.set(guildId, endEvent);
+            }
+            return {
+                state: cachedState,
+                endEvent,
+                checkpointEvent: this.checkpointCache.get(guildId)
+            };
+        }
+
+        let events = this.store.getReplaySnapshotEvents
+            ? buildReplaySnapshotEvents(guildId, await this.store.getReplaySnapshotEvents({ guildId, limit: this.snapshotEventLimit }))
+            : await this.store.getLog(guildId);
+        const canReplayFromFirstEvent = events[0]?.seq === 0 ||
+            (events[0]?.body.type === "CHECKPOINT" && isValidCheckpointEvent(events[0]));
+        if (!canReplayFromFirstEvent) {
+            events = await this.store.getLog(guildId);
+        }
         if (events.length === 0) {
             return null;
         }
 
         const { state, checkpointEvent } = rebuildStateFromEvents(events);
         this.stateCache.set(guildId, state);
+        this.checkpointCache.set(guildId, checkpointEvent);
 
         return {
             state,
@@ -1270,6 +1421,54 @@ export class RelayServer {
         socket.send(JSON.stringify(["ERROR", { code, message, ...(extra ?? {}) }]));
     }
 
+    private addSubscription(socket: WebSocket, subId: string, subscription: Subscription) {
+        const subs = this.subscriptions.get(socket);
+        if (!subs) {
+            return;
+        }
+
+        const existing = subs.get(subId);
+        if (existing) {
+            this.removeSubscriptionIndex(socket, subId, existing.guildId);
+        }
+
+        subs.set(subId, subscription);
+        let guildSockets = this.guildSubscriptions.get(subscription.guildId);
+        if (!guildSockets) {
+            guildSockets = new Map<WebSocket, Set<string>>();
+            this.guildSubscriptions.set(subscription.guildId, guildSockets);
+        }
+        const socketSubs = guildSockets.get(socket) ?? new Set<string>();
+        socketSubs.add(subId);
+        guildSockets.set(socket, socketSubs);
+    }
+
+    private removeSubscriptionIndex(socket: WebSocket, subId: string, guildId: GuildId) {
+        const guildSockets = this.guildSubscriptions.get(guildId);
+        const socketSubs = guildSockets?.get(socket);
+        if (!guildSockets || !socketSubs) {
+            return;
+        }
+
+        socketSubs.delete(subId);
+        if (socketSubs.size === 0) {
+            guildSockets.delete(socket);
+        }
+        if (guildSockets.size === 0) {
+            this.guildSubscriptions.delete(guildId);
+        }
+    }
+
+    private removeSocketSubscriptions(socket: WebSocket) {
+        const subs = this.subscriptions.get(socket);
+        if (subs) {
+            for (const [subId, sub] of subs) {
+                this.removeSubscriptionIndex(socket, subId, sub.guildId);
+            }
+        }
+        this.subscriptions.delete(socket);
+    }
+
     private async readAuthorOrError(socket: WebSocket, kind: string, payload: unknown, subId?: string, guildId?: string) {
         try {
             return this.verifyReadRequest(kind, payload);
@@ -1306,7 +1505,23 @@ export class RelayServer {
                 return;
             }
 
-            const serializedState = filterSerializedStateForReader(rebuilt.state, author);
+            const wantsPagedMembers = p.memberLimit !== undefined || (typeof p.memberAfter === "string" && p.memberAfter.trim());
+            const memberLimit = normalizeMemberPageLimit(p.memberLimit);
+            const memberAfter = typeof p.memberAfter === "string" && p.memberAfter.trim() ? p.memberAfter : undefined;
+            const includeMembers = wantsPagedMembers ? false : p.includeMembers !== false;
+            const includeMessages = p.includeMessages !== false;
+            const includeAppObjects = p.includeAppObjects !== false;
+            const serializedState = filterSerializedStateForReader(rebuilt.state, author, {
+                includeMembers,
+                includeMessages,
+                includeAppObjects
+            });
+            const membersPage = wantsPagedMembers
+                ? await this.readMembersPage(rebuilt.state, { guildId, afterUserId: memberAfter, limit: memberLimit })
+                : null;
+            if (membersPage) {
+                serializedState.members = membersPage.members.map((member) => [member.userId, member]);
+            }
             socket.send(
                 JSON.stringify([
                     "STATE",
@@ -1318,11 +1533,52 @@ export class RelayServer {
                         endSeq: rebuilt.endEvent.seq,
                         endHash: rebuilt.endEvent.id,
                         checkpointSeq: rebuilt.checkpointEvent?.seq ?? null,
-                        checkpointHash: rebuilt.checkpointEvent?.id ?? null
+                        checkpointHash: rebuilt.checkpointEvent?.id ?? null,
+                        membersPage: membersPage
+                            ? {
+                                nextCursor: membersPage.nextCursor,
+                                hasMore: membersPage.hasMore,
+                                totalApprox: membersPage.totalApprox
+                            }
+                            : undefined,
+                        stateIncludes: {
+                            members: membersPage ? "partial" : includeMembers ? "full" : "omitted",
+                            messages: includeMessages ? "full" : "omitted",
+                            appObjects: includeAppObjects ? "full" : "omitted"
+                        }
                     }
                 ])
             );
         });
+    }
+
+    private async readMembersPage(state: GuildState, query: MemberPageQuery) {
+        if (this.store.getMembersPage) {
+            return await this.store.getMembersPage(query);
+        }
+
+        const limit = normalizeMemberPageLimit(query.limit);
+        const members = serializeState(state).members
+            .map(([, member]) => member)
+            .sort((left, right) => left.userId.localeCompare(right.userId));
+        const startIndex = query.afterUserId ? members.findIndex((member) => member.userId > query.afterUserId!) : 0;
+        const pageStart = startIndex >= 0 ? startIndex : members.length;
+        const page = members.slice(pageStart, pageStart + limit + 1);
+        const hasMore = page.length > limit;
+        const visible = hasMore ? page.slice(0, limit) : page;
+        return {
+            members: visible,
+            nextCursor: hasMore && visible.length > 0 ? visible[visible.length - 1].userId : null,
+            hasMore,
+            totalApprox: members.length
+        };
+    }
+
+    private async readReplaySnapshotEvents(guildId: GuildId) {
+        const events = this.store.getReplaySnapshotEvents
+            ? await this.store.getReplaySnapshotEvents({ guildId, limit: this.snapshotEventLimit })
+            : await this.store.getLog(guildId);
+        return buildReplaySnapshotEvents(guildId, events);
     }
 
     private async handleHistoryRequest(socket: WebSocket, payload: unknown) {
@@ -1452,7 +1708,9 @@ export class RelayServer {
                 return;
             }
 
-            const events = await this.store.getLog(guildId);
+            const events = request.scopes.has("messages")
+                ? await this.readSearchCandidateEvents(request)
+                : [];
             const { results, hasMore } = buildSearchResults(rebuilt.state, events, author, request);
             const seqs = results
                 .map((result) => result.seq)
@@ -1477,6 +1735,32 @@ export class RelayServer {
                 ])
             );
         });
+    }
+
+    private async readSearchCandidateEvents(request: {
+        guildId: GuildId;
+        channelId?: ChannelId;
+        beforeSeq?: number;
+        afterSeq?: number;
+    }) {
+        const query = {
+            guildId: request.guildId,
+            channelId: request.channelId,
+            beforeSeq: request.beforeSeq,
+            afterSeq: request.afterSeq,
+            scanLimit: this.searchScanLimit,
+            includeStructural: false
+        };
+
+        if (this.store.getSearchEvents) {
+            return await this.store.getSearchEvents(query);
+        }
+
+        if (this.store.getHistory) {
+            return await this.store.getHistory({ ...query, limit: this.searchScanLimit });
+        }
+
+        return await this.store.getLog(request.guildId);
     }
 
     private async appendSequencedEvent(
@@ -1530,21 +1814,34 @@ export class RelayServer {
                 let state = this.stateCache.get(targetGuildId);
 
                 if (!state || state.headSeq !== seq - 1) {
-                    const history = await this.store.getLog(targetGuildId);
+                    let history = this.store.getReplaySnapshotEvents
+                        ? buildReplaySnapshotEvents(targetGuildId, await this.store.getReplaySnapshotEvents({ guildId: targetGuildId, limit: this.snapshotEventLimit }))
+                        : await this.store.getLog(targetGuildId);
+                    const canReplayFromFirstEvent = history[0]?.seq === 0 ||
+                        (history[0]?.body.type === "CHECKPOINT" && isValidCheckpointEvent(history[0]));
+                    if (!canReplayFromFirstEvent) {
+                        history = await this.store.getLog(targetGuildId);
+                    }
                     if (history.length === 0) {
                         console.error("Validation error: Missing history for non-genesis event");
                         return undefined;
                     }
 
-                    state = rebuildStateFromEvents(history).state;
+                    const rebuilt = rebuildStateFromEvents(history);
+                    state = rebuilt.state;
                     this.stateCache.set(targetGuildId, state);
+                    this.checkpointCache.set(targetGuildId, rebuilt.checkpointEvent);
                 }
 
                 try {
-                    validateEvent(state, fullEvent);
+                    const validationState = await this.hydrateValidationIndexes(state, fullEvent);
+                    validateEvent(validationState, fullEvent);
                     // Optimistically apply to cache
-                    const newState = applyEvent(state, fullEvent);
+                    const newState = applyEvent(validationState, fullEvent);
                     this.stateCache.set(targetGuildId, newState);
+                    if (fullEvent.body.type === "CHECKPOINT" && isValidCheckpointEvent(fullEvent)) {
+                        this.checkpointCache.set(targetGuildId, fullEvent);
+                    }
                 } catch (e: any) {
                     console.error(`Validation failed for guild ${targetGuildId}: ${e.message}`);
                     console.error(`Event body:`, JSON.stringify(body));
@@ -1560,6 +1857,7 @@ export class RelayServer {
                 // Initialize cache for new guild
                 const state = createInitialState(fullEvent);
                 this.stateCache.set(targetGuildId, state);
+                this.checkpointCache.delete(targetGuildId);
             }
 
             await this.store.append(targetGuildId, fullEvent);
@@ -1576,6 +1874,105 @@ export class RelayServer {
         });
     }
 
+    private async hydrateValidationIndexes(state: GuildState, event: GuildEvent): Promise<GuildState> {
+        const memberState = await this.hydrateValidationMembers(state, event);
+        return await this.hydrateValidationMessageRefs(memberState, event);
+    }
+
+    private async hydrateValidationMembers(state: GuildState, event: GuildEvent): Promise<GuildState> {
+        if (!this.store.getMember) {
+            return state;
+        }
+
+        const body = event.body as Record<string, any>;
+        const userIds = new Set<string>([event.author]);
+        for (const key of ["userId", "targetUserId", "memberId", "authorId"]) {
+            if (typeof body[key] === "string" && body[key].trim()) {
+                userIds.add(body[key]);
+            }
+        }
+
+        let nextMembers: Map<string, Member> | null = null;
+        for (const userId of userIds) {
+            if (state.members.has(userId)) {
+                continue;
+            }
+
+            const member = await this.store.getMember({ guildId: state.guildId, userId });
+            if (!member) {
+                continue;
+            }
+
+            if (!nextMembers) {
+                nextMembers = new Map(state.members);
+            }
+            nextMembers.set(userId, this.deserializeMemberForState(member));
+        }
+
+        return nextMembers ? { ...state, members: nextMembers } : state;
+    }
+
+    private deserializeMemberForState(member: SerializableMember): Member {
+        return {
+            ...member,
+            roles: new Set(Array.isArray(member.roles) ? member.roles : Array.from(member.roles ?? []))
+        };
+    }
+
+    private async hydrateValidationMessageRefs(state: GuildState, event: GuildEvent): Promise<GuildState> {
+        if (!this.store.getMessageRef) {
+            return state;
+        }
+
+        const body = event.body as Record<string, any>;
+        const messageIds = new Set<string>();
+        if (body.type === "MESSAGE") {
+            const messageId = typeof body.messageId === "string" && body.messageId.trim() ? body.messageId : event.id;
+            messageIds.add(messageId);
+        } else if (
+            body.type === "EDIT_MESSAGE" ||
+            body.type === "DELETE_MESSAGE" ||
+            body.type === "REACTION_ADD" ||
+            body.type === "REACTION_REMOVE"
+        ) {
+            if (typeof body.messageId === "string" && body.messageId.trim()) {
+                messageIds.add(body.messageId);
+            }
+        }
+
+        const target = body.target && typeof body.target === "object" ? body.target as Record<string, any> : undefined;
+        if ((body.type === "APP_OBJECT_UPSERT" || body.type === "APP_OBJECT_DELETE") && typeof target?.messageId === "string" && target.messageId.trim()) {
+            messageIds.add(target.messageId);
+        }
+
+        if (messageIds.size === 0) {
+            return state;
+        }
+
+        let hydrated: GuildState | null = null;
+        const ensureHydrated = () => {
+            if (!hydrated) {
+                hydrated = {
+                    ...state,
+                    messages: new Map(state.messages)
+                };
+            }
+            return hydrated;
+        };
+
+        for (const messageId of messageIds) {
+            if (state.messages.has(messageId)) {
+                continue;
+            }
+            const ref: SerializableMessageRef | null = await this.store.getMessageRef({ guildId: state.guildId, messageId });
+            if (ref) {
+                ensureHydrated().messages.set(messageId, ref);
+            }
+        }
+
+        return hydrated ?? state;
+    }
+
     private async runOnEventAppended(event: GuildEvent, socket?: WebSocket) {
         for (const plugin of this.plugins) {
             try {
@@ -1590,15 +1987,32 @@ export class RelayServer {
     private broadcast(guildId: GuildId, event: GuildEvent) {
         let count = 0;
         const state = this.stateCache.get(guildId);
-        for (const [socket, subs] of this.subscriptions) {
-            for (const sub of subs.values()) {
-                if (sub.guildId === guildId) {
-                    if (state && (!eventVisibleToReader(state, event, sub.author) || !eventMatchesRequestedChannels(state, event, sub.channels))) {
-                        continue;
-                    }
-                    socket.send(JSON.stringify(["EVENT", event]));
-                    count++;
+        const frame = JSON.stringify(["EVENT", event]);
+        const guildSockets = this.guildSubscriptions.get(guildId);
+        if (!guildSockets) {
+            return;
+        }
+
+        for (const [socket, subIds] of guildSockets) {
+            const subs = this.subscriptions.get(socket);
+            if (!subs) {
+                continue;
+            }
+            let shouldSend = false;
+            for (const subId of subIds) {
+                const sub = subs.get(subId);
+                if (!sub) {
+                    continue;
                 }
+                if (state && (!eventVisibleToReader(state, event, sub.author) || !eventMatchesRequestedChannels(state, event, sub.channels))) {
+                    continue;
+                }
+                shouldSend = true;
+                break;
+            }
+            if (shouldSend) {
+                socket.send(frame);
+                count++;
             }
         }
         // console.log(`Broadcasted event ${event.seq} to ${count} clients`);

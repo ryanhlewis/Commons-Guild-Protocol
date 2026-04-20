@@ -11,6 +11,7 @@ import {
     type EventBody,
     type GuildEvent,
     type GuildId,
+    type GuildState,
     type PermissionScope,
     type SerializableMember
 } from "@cgp/core";
@@ -201,6 +202,7 @@ export interface RelayPluginContext {
     publishAsRelay: (body: EventBody, createdAt?: number) => Promise<GuildEvent | undefined>;
     broadcast: (guildId: string, event: GuildEvent) => void;
     getLog: (guildId: GuildId) => Promise<GuildEvent[]>;
+    getState?: (guildId: GuildId) => Promise<GuildState | null>;
 }
 
 export interface RelayPluginHttpArgs {
@@ -585,6 +587,10 @@ function replayGuildState(history: GuildEvent[]) {
     } catch {
         return null;
     }
+}
+
+async function relayGuildState(ctx: RelayPluginContext, guildId: GuildId) {
+    return (await ctx.getState?.(guildId)) ?? replayGuildState(await ctx.getLog(guildId));
 }
 
 export function createEncryptionPolicyPlugin(policy: EncryptionPolicy = {}): RelayPlugin {
@@ -1146,8 +1152,7 @@ export function createAppSurfacePolicyPlugin(policy: AppSurfacePolicy = {}): Rel
                 return true;
             }
 
-            const history = await ctx.getLog(guildId);
-            const state = replayGuildState(history);
+            const state = await relayGuildState(ctx, guildId);
             if (!state) {
                 return false;
             }
@@ -1381,8 +1386,7 @@ export function createWebhookIngressPlugin(policy: WebhookIngressPolicy = {}): R
                 return true;
             }
 
-            const history = await ctx.getLog(guildId);
-            const state = replayGuildState(history);
+            const state = await relayGuildState(ctx, guildId);
             const webhook = findWebhookRecord(state, webhookObjectType, webhookId);
             const value = isRecord(webhook?.value) ? webhook.value : undefined;
             const target = isRecord(webhook?.target) ? webhook.target : undefined;
@@ -1545,7 +1549,7 @@ export function createSafetyReportPlugin(policy: SafetyReportPolicy = {}): Relay
             }
 
             if (requireParticipantReporter) {
-                const state = replayGuildState(await ctx.getLog(guildId));
+                const state = await relayGuildState(ctx, guildId);
                 if (!state) {
                     return false;
                 }
@@ -1591,12 +1595,11 @@ export function createAppObjectPermissionPlugin(policy: AppObjectPermissionPolic
 
             const guildId = typeof body.guildId === "string" ? body.guildId : "";
             const author = typeof publish.author === "string" ? publish.author : "";
-            const history = guildId ? await ctx.getLog(guildId) : [];
-            if (!guildId || !author || history.length === 0) {
+            if (!guildId || !author) {
                 return false;
             }
 
-            const state = replayGuildState(history);
+            const state = await relayGuildState(ctx, guildId);
             if (!state) {
                 return false;
             }
