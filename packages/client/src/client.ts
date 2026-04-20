@@ -9,6 +9,7 @@ import {
     applyEvent,
     GuildState,
     deserializeState,
+    rebuildStateFromEvents,
     verify,
     hashObject,
     sign,
@@ -16,6 +17,9 @@ import {
     GuildCreate,
     ChannelCreate,
     Message,
+    AppObjectDelete,
+    AppObjectTarget,
+    AppObjectUpsert,
     RoleAssign,
     BanUser,
     EditMessage,
@@ -40,6 +44,8 @@ export interface StateResponse {
     rootHash: string;
     endSeq: number;
     endHash: string;
+    checkpointSeq?: number | null;
+    checkpointHash?: string | null;
 }
 
 export interface HistoryRequest {
@@ -61,6 +67,57 @@ export interface HistoryResponse {
     oldestSeq: number | null;
     newestSeq: number | null;
     hasMore: boolean;
+    checkpointSeq?: number | null;
+    checkpointHash?: string | null;
+}
+
+export type SearchScope = "messages" | "channels" | "members" | "appObjects";
+export type SearchResultKind = "message" | "channel" | "member" | "appObject";
+
+export interface SearchRequest {
+    guildId: GuildId;
+    channelId?: ChannelId;
+    query: string;
+    scopes?: SearchScope[];
+    beforeSeq?: number;
+    afterSeq?: number;
+    limit?: number;
+    includeDeleted?: boolean;
+    includeEncrypted?: boolean;
+    includeEvent?: boolean;
+}
+
+export interface SearchResult {
+    kind: SearchResultKind;
+    guildId: GuildId;
+    channelId?: ChannelId;
+    messageId?: string;
+    userId?: string;
+    objectId?: string;
+    namespace?: string;
+    objectType?: string;
+    eventId?: string;
+    seq?: number;
+    createdAt?: number;
+    author?: string;
+    encrypted?: boolean;
+    preview?: string;
+    content?: string;
+    event?: GuildEvent;
+}
+
+export interface SearchResponse {
+    subId?: string;
+    guildId: GuildId;
+    channelId?: ChannelId;
+    query: string;
+    scopes: SearchScope[];
+    results: SearchResult[];
+    hasMore: boolean;
+    oldestSeq: number | null;
+    newestSeq: number | null;
+    checkpointSeq?: number | null;
+    checkpointHash?: string | null;
 }
 
 export interface PublishAck {
@@ -73,6 +130,12 @@ export interface PublishAck {
 export interface PublishReliableOptions {
     timeoutMs?: number;
     clientEventId?: string;
+}
+
+export interface AppObjectWriteOptions {
+    channelId?: ChannelId;
+    target?: AppObjectTarget;
+    value?: any;
 }
 
 export class CgpClient extends EventEmitter {
@@ -118,15 +181,29 @@ export class CgpClient extends EventEmitter {
         });
     }
 
-    private sendSubscription(socket: WebSocket, guildId: GuildId) {
+    private async signedReadPayload(kind: string, payload: Record<string, unknown>) {
+        if (!this.keyPair) {
+            return payload;
+        }
+
+        const { pub, priv } = this.keyPair;
+        const createdAt = Date.now();
+        const unsignedPayload = { ...payload, author: pub, createdAt };
+        const signature = await sign(priv, hashObject({ kind, payload: unsignedPayload }));
+        return { ...unsignedPayload, signature };
+    }
+
+    private async sendSubscription(socket: WebSocket, guildId: GuildId) {
         if (socket.readyState !== WebSocket.OPEN) return;
         const subId = Math.random().toString(36).slice(2);
-        socket.send(JSON.stringify(["SUB", { subId, guildId }]));
+        const payload = await this.signedReadPayload("SUB", { subId, guildId });
+        if (socket.readyState !== WebSocket.OPEN) return;
+        socket.send(JSON.stringify(["SUB", payload]));
     }
 
     private replaySubscriptions(socket: WebSocket) {
         for (const guildId of this.desiredSubscriptions) {
-            this.sendSubscription(socket, guildId);
+            void this.sendSubscription(socket, guildId);
         }
     }
 
@@ -141,7 +218,7 @@ export class CgpClient extends EventEmitter {
 
         queueMicrotask(() => {
             try {
-                this.sockets.forEach((socket) => this.sendSubscription(socket, guildId));
+                this.sockets.forEach((socket) => void this.sendSubscription(socket, guildId));
             } finally {
                 this.recoveringGuilds.delete(guildId);
             }
@@ -302,20 +379,18 @@ export class CgpClient extends EventEmitter {
                     const { events, guildId, endSeq, endHash } = p;
                     // console.log(`Client received SNAPSHOT for ${guildId} with ${events.length} events`);
                     if (events.length > 0) {
-                        const genesisIndex = events.findIndex((event) => event?.body?.type === "GUILD_CREATE");
-                        if (genesisIndex >= 0) {
-                            let state = createInitialState(events[genesisIndex]);
-                            await this.extractKey(events[genesisIndex]);
-
-                            for (let i = genesisIndex + 1; i < events.length; i++) {
-                                state = applyEvent(state, events[i]);
-                                await this.extractKey(events[i]);
+                        try {
+                            let state = rebuildStateFromEvents(events).state;
+                            for (const event of events) {
+                                await this.extractKey(event);
                             }
                             if (typeof endSeq === "number" && endSeq >= state.headSeq && typeof endHash === "string" && endHash) {
                                 state.headSeq = endSeq;
                                 state.headHash = endHash;
                             }
                             this.state.set(guildId, state);
+                        } catch {
+                            // Channel-history pages may intentionally omit genesis/checkpoint anchors.
                         }
                     }
                     events.forEach((e: GuildEvent) => this.emit("event", e));
@@ -401,6 +476,8 @@ export class CgpClient extends EventEmitter {
                         this.state.set(p.guildId, deserializeState(p.state, p.endSeq, p.endHash, Date.now()));
                     }
                     this.emit("state_response", payload);
+                } else if (kind === "SEARCH_RESULTS") {
+                    this.emit("search_response", payload);
                 } else if (kind === "MEMBERS") {
                     this.emit("members_response", payload);
                 }
@@ -571,11 +648,49 @@ export class CgpClient extends EventEmitter {
             content: finalContent,
             iv,
             encrypted,
-            // @ts-ignore
             external
         };
         await this.publish(body);
         return messageId;
+    }
+
+    async upsertAppObject(
+        guildId: GuildId,
+        namespace: string,
+        objectType: string,
+        objectId: string,
+        options: AppObjectWriteOptions = {}
+    ): Promise<void> {
+        const body: AppObjectUpsert = {
+            type: "APP_OBJECT_UPSERT",
+            guildId,
+            namespace,
+            objectType,
+            objectId,
+            channelId: options.channelId,
+            target: options.target,
+            value: options.value
+        };
+        await this.publish(body);
+    }
+
+    async deleteAppObject(
+        guildId: GuildId,
+        namespace: string,
+        objectType: string,
+        objectId: string,
+        options: Omit<AppObjectWriteOptions, "value"> = {}
+    ): Promise<void> {
+        const body: AppObjectDelete = {
+            type: "APP_OBJECT_DELETE",
+            guildId,
+            namespace,
+            objectType,
+            objectId,
+            channelId: options.channelId,
+            target: options.target
+        };
+        await this.publish(body);
     }
 
     async assignRole(guildId: GuildId, userId: string, role: string): Promise<void> {
@@ -641,12 +756,13 @@ export class CgpClient extends EventEmitter {
 
     async subscribe(guildId: GuildId): Promise<void> {
         this.desiredSubscriptions.add(guildId);
-        this.sockets.forEach((s) => this.sendSubscription(s, guildId));
+        this.sockets.forEach((s) => void this.sendSubscription(s, guildId));
     }
 
     async getMembers(guildId: string): Promise<SerializableMember[]> {
         const subId = Math.random().toString(36).slice(2);
-        const frame = JSON.stringify(["GET_MEMBERS", { subId, guildId }]);
+        const payload = await this.signedReadPayload("GET_MEMBERS", { subId, guildId });
+        const frame = JSON.stringify(["GET_MEMBERS", payload]);
 
         return new Promise<SerializableMember[]>((resolve, reject) => {
             const timeout = setTimeout(() => {
@@ -660,13 +776,21 @@ export class CgpClient extends EventEmitter {
                     resolve(data.members);
                 }
             };
+            const errorHandler = (data: any) => {
+                if (data?.subId === subId) {
+                    cleanup();
+                    reject(new Error(data.message || "Members request failed"));
+                }
+            };
 
             const cleanup = () => {
                 clearTimeout(timeout);
                 this.off("members_response", handler);
+                this.off("error_frame", errorHandler);
             };
 
             this.on("members_response", handler);
+            this.on("error_frame", errorHandler);
 
             this.sockets.forEach(s => {
                 if (s.readyState === WebSocket.OPEN) {
@@ -678,7 +802,8 @@ export class CgpClient extends EventEmitter {
 
     async getState(guildId: GuildId): Promise<StateResponse> {
         const subId = Math.random().toString(36).slice(2);
-        const frame = JSON.stringify(["GET_STATE", { subId, guildId }]);
+        const payload = await this.signedReadPayload("GET_STATE", { subId, guildId });
+        const frame = JSON.stringify(["GET_STATE", payload]);
 
         return new Promise<StateResponse>((resolve, reject) => {
             const timeout = setTimeout(() => {
@@ -718,7 +843,8 @@ export class CgpClient extends EventEmitter {
 
     async getHistory(request: HistoryRequest): Promise<HistoryResponse> {
         const subId = Math.random().toString(36).slice(2);
-        const frame = JSON.stringify(["GET_HISTORY", { subId, ...request }]);
+        const payload = await this.signedReadPayload("GET_HISTORY", { subId, ...request });
+        const frame = JSON.stringify(["GET_HISTORY", payload]);
 
         return new Promise<HistoryResponse>((resolve, reject) => {
             const timeout = setTimeout(() => {
@@ -746,6 +872,47 @@ export class CgpClient extends EventEmitter {
             };
 
             this.on("snapshot_response", handler);
+            this.on("error_frame", errorHandler);
+
+            this.sockets.forEach(s => {
+                if (s.readyState === WebSocket.OPEN) {
+                    s.send(frame);
+                }
+            });
+        });
+    }
+
+    async search(request: SearchRequest): Promise<SearchResponse> {
+        const subId = Math.random().toString(36).slice(2);
+        const payload = await this.signedReadPayload("SEARCH", { subId, ...request });
+        const frame = JSON.stringify(["SEARCH", payload]);
+
+        return new Promise<SearchResponse>((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                cleanup();
+                reject(new Error("Timeout waiting for guild search results"));
+            }, 10000);
+
+            const handler = (data: SearchResponse) => {
+                if (data.subId === subId) {
+                    cleanup();
+                    resolve(data);
+                }
+            };
+            const errorHandler = (data: any) => {
+                if (data?.subId === subId) {
+                    cleanup();
+                    reject(new Error(data.message || "Guild search request failed"));
+                }
+            };
+
+            const cleanup = () => {
+                clearTimeout(timeout);
+                this.off("search_response", handler);
+                this.off("error_frame", errorHandler);
+            };
+
+            this.on("search_response", handler);
             this.on("error_frame", errorHandler);
 
             this.sockets.forEach(s => {

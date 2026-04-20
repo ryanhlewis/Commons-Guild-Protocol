@@ -3,15 +3,29 @@ import type { RelayServerOptions } from "./server";
 
 import { Store, MemoryStore } from "./store";
 import { LevelStore } from "./store_level";
-import { createAppObjectPermissionPlugin, createEncryptionPolicyPlugin, createRateLimitPolicyPlugin } from "./plugins";
+import {
+    createAbuseControlPolicyPlugin,
+    createAppSurfacePolicyPlugin,
+    createAppObjectPermissionPlugin,
+    createEncryptionPolicyPlugin,
+    createProofOfWorkPolicyPlugin,
+    createRateLimitPolicyPlugin,
+    createSafetyReportPlugin,
+    createWebhookIngressPlugin
+} from "./plugins";
 import type {
+    AbuseControlPolicy,
     AppObjectPermissionPolicy,
     AppObjectPermissionRule,
+    AppSurfacePolicy,
     EncryptionPolicy,
+    ProofOfWorkPolicy,
     RelayPlugin,
     RelayPluginContext,
     RelayPluginHttpArgs,
-    RateLimitPolicy
+    RateLimitPolicy,
+    SafetyReportPolicy,
+    WebhookIngressPolicy
 } from "./plugins";
 
 export {
@@ -19,18 +33,28 @@ export {
     Store,
     MemoryStore,
     LevelStore,
+    createAbuseControlPolicyPlugin,
+    createAppSurfacePolicyPlugin,
     createAppObjectPermissionPlugin,
     createEncryptionPolicyPlugin,
-    createRateLimitPolicyPlugin
+    createProofOfWorkPolicyPlugin,
+    createRateLimitPolicyPlugin,
+    createSafetyReportPlugin,
+    createWebhookIngressPlugin
 };
 export type {
+    AbuseControlPolicy,
     AppObjectPermissionPolicy,
     AppObjectPermissionRule,
+    AppSurfacePolicy,
     EncryptionPolicy,
+    ProofOfWorkPolicy,
     RelayPlugin,
     RelayPluginContext,
     RelayPluginHttpArgs,
     RateLimitPolicy,
+    SafetyReportPolicy,
+    WebhookIngressPolicy,
     RelayServerOptions
 };
 

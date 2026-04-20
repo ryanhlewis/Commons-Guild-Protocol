@@ -194,6 +194,92 @@ describe("CGP relay basic messaging", () => {
         attacker.close();
     });
 
+    it("serves permission-filtered durable search results", async () => {
+        const ownerPrivKey = secp.utils.randomPrivateKey();
+        const ownerPubKey = Buffer.from(secp.getPublicKey(ownerPrivKey, true)).toString("hex");
+        const owner = new CgpClient({ relays: [relayUrl], keyPair: { pub: ownerPubKey, priv: ownerPrivKey } });
+        await owner.connect();
+
+        const guildId = await owner.createGuild("Search Guild");
+        const channelId = await owner.createChannel(guildId, "knowledge-base", "text");
+        await new Promise((res) => setTimeout(res, 200));
+
+        const liveMessageId = `search-live-${Date.now()}`;
+        await owner.publishReliable({
+            type: "MESSAGE",
+            guildId,
+            channelId,
+            messageId: liveMessageId,
+            content: "alpha moderation workflow"
+        });
+        await owner.publishReliable({
+            type: "EDIT_MESSAGE",
+            guildId,
+            channelId,
+            messageId: liveMessageId,
+            newContent: "alpha operator audit workflow"
+        });
+
+        const deletedMessageId = `search-deleted-${Date.now()}`;
+        await owner.publishReliable({
+            type: "MESSAGE",
+            guildId,
+            channelId,
+            messageId: deletedMessageId,
+            content: "delete-visible-token"
+        });
+        await owner.publishReliable({
+            type: "DELETE_MESSAGE",
+            guildId,
+            channelId,
+            messageId: deletedMessageId,
+            reason: "search test"
+        });
+
+        const encryptedMessageId = `search-encrypted-${Date.now()}`;
+        await owner.publishReliable({
+            type: "MESSAGE",
+            guildId,
+            channelId,
+            messageId: encryptedMessageId,
+            content: "super-secret-token",
+            encrypted: true
+        });
+
+        await owner.upsertAppObject(guildId, "org.cgp.chat", "message-pin", `pin-${liveMessageId}`, {
+            channelId,
+            target: { channelId, messageId: liveMessageId },
+            value: { label: "Launch checklist pin" }
+        });
+
+        const editedSearch = await owner.search({ guildId, query: "operator audit", scopes: ["messages"], limit: 10 });
+        expect(editedSearch.results.map((result) => result.messageId)).toContain(liveMessageId);
+        expect(editedSearch.results[0].preview).toContain("operator audit");
+
+        const staleContentSearch = await owner.search({ guildId, query: "moderation workflow", scopes: ["messages"], limit: 10 });
+        expect(staleContentSearch.results.map((result) => result.messageId)).not.toContain(liveMessageId);
+
+        const deletedHidden = await owner.search({ guildId, query: "delete-visible-token", scopes: ["messages"], limit: 10 });
+        expect(deletedHidden.results).toHaveLength(0);
+
+        const deletedIncluded = await owner.search({ guildId, query: "delete-visible-token", scopes: ["messages"], includeDeleted: true, limit: 10 });
+        expect(deletedIncluded.results.map((result) => result.messageId)).toContain(deletedMessageId);
+
+        const encryptedSearch = await owner.search({ guildId, query: "super-secret-token", scopes: ["messages"], limit: 10 });
+        expect(encryptedSearch.results).toHaveLength(0);
+
+        const channelSearch = await owner.search({ guildId, query: "knowledge", scopes: ["channels"], limit: 10 });
+        expect(channelSearch.results.map((result) => result.channelId)).toContain(channelId);
+
+        const appObjectSearch = await owner.search({ guildId, query: "Launch checklist", scopes: ["appObjects"], limit: 10 });
+        expect(appObjectSearch.results.map((result) => result.objectId)).toContain(`pin-${liveMessageId}`);
+
+        const memberSearch = await owner.search({ guildId, query: ownerPubKey.slice(0, 16), scopes: ["members"], limit: 10 });
+        expect(memberSearch.results.map((result) => result.userId)).toContain(ownerPubKey);
+
+        owner.close();
+    });
+
     it("serves canonical replayed guild state snapshots", async () => {
         const ownerPrivKey = secp.utils.randomPrivateKey();
         const ownerPubKey = Buffer.from(secp.getPublicKey(ownerPrivKey, true)).toString("hex");
@@ -268,6 +354,74 @@ describe("CGP relay basic messaging", () => {
 
         ws.close();
         alice.close();
+    });
+
+    it("uses relay checkpoints as compact subscription replay anchors", async () => {
+        const ownerPrivKey = secp.utils.randomPrivateKey();
+        const ownerPubKey = Buffer.from(secp.getPublicKey(ownerPrivKey, true)).toString("hex");
+        const owner = new CgpClient({ relays: [relayUrl], keyPair: { pub: ownerPubKey, priv: ownerPrivKey } });
+        await owner.connect();
+
+        const guildId = await owner.createGuild("Checkpoint Replay Guild");
+        const oldChannelId = await owner.createChannel(guildId, "old-room", "text");
+        await owner.sendMessage(guildId, oldChannelId, "before checkpoint");
+        await new Promise((res) => setTimeout(res, 200));
+
+        await relay.createCheckpoints();
+        const newChannelId = await owner.createChannel(guildId, "new-room", "text");
+        await new Promise((res) => setTimeout(res, 200));
+
+        const ws = new WebSocket(relayUrl);
+        await new Promise<void>((resolve) => ws.onopen = () => resolve());
+
+        const snapshotPromise = new Promise<any>((resolve) => {
+            const handler = (raw: WebSocket.RawData) => {
+                const data = JSON.parse(raw.toString());
+                if (data[0] === "SNAPSHOT" && data[1]?.subId === "checkpoint-sub") {
+                    ws.off("message", handler);
+                    resolve(data[1]);
+                }
+            };
+            ws.on("message", handler);
+        });
+
+        ws.send(JSON.stringify(["SUB", { subId: "checkpoint-sub", guildId }]));
+        const snapshot = await snapshotPromise;
+        expect(snapshot.events[0].body.type).toBe("CHECKPOINT");
+        expect(snapshot.events.some((event: any) => event.body.type === "GUILD_CREATE")).toBe(false);
+        expect(snapshot.events.some((event: any) => event.body.channelId === newChannelId)).toBe(true);
+        expect(snapshot.checkpointSeq).toBe(snapshot.events[0].seq);
+        expect(snapshot.hasMore).toBe(true);
+
+        const joiningClient = new CgpClient({ relays: [relayUrl] });
+        await joiningClient.connect();
+        await joiningClient.subscribe(guildId);
+        await new Promise((res) => setTimeout(res, 300));
+        const joinedState = joiningClient.getGuildState(guildId);
+        expect(joinedState?.channels.has(oldChannelId)).toBe(true);
+        expect(joinedState?.channels.has(newChannelId)).toBe(true);
+
+        ws.close();
+        owner.close();
+        joiningClient.close();
+    });
+
+    it("rejects client-published checkpoints", async () => {
+        const ownerPrivKey = secp.utils.randomPrivateKey();
+        const ownerPubKey = Buffer.from(secp.getPublicKey(ownerPrivKey, true)).toString("hex");
+        const owner = new CgpClient({ relays: [relayUrl], keyPair: { pub: ownerPubKey, priv: ownerPrivKey } });
+        await owner.connect();
+
+        const guildId = await owner.createGuild("Client Checkpoint Rejection Guild");
+        await expect(owner.publishReliable({
+            type: "CHECKPOINT",
+            guildId,
+            rootHash: "bad",
+            seq: 999,
+            state: {}
+        } as any, { timeoutMs: 5000 })).rejects.toThrow(/relay-maintained/i);
+
+        owner.close();
     });
 
     it("returns correlated publish acknowledgements and validation errors", async () => {
@@ -378,6 +532,299 @@ describe("CGP relay basic messaging", () => {
             ws.close();
             await pluginlessRelay.close();
         }
+    });
+
+    it("enforces default generic chat app-object permissions for message pins", async () => {
+        const ownerPrivKey = secp.utils.randomPrivateKey();
+        const ownerPubKey = Buffer.from(secp.getPublicKey(ownerPrivKey, true)).toString("hex");
+        const attackerPrivKey = secp.utils.randomPrivateKey();
+        const attackerPubKey = Buffer.from(secp.getPublicKey(attackerPrivKey, true)).toString("hex");
+        const owner = new CgpClient({ relays: [relayUrl], keyPair: { pub: ownerPubKey, priv: ownerPrivKey } });
+        const attacker = new CgpClient({ relays: [relayUrl], keyPair: { pub: attackerPubKey, priv: attackerPrivKey } });
+        await Promise.all([owner.connect(), attacker.connect()]);
+
+        const guildId = await owner.createGuild("Default App Object Policy Guild");
+        const channelId = await owner.createChannel(guildId, "pins", "text");
+        await new Promise((res) => setTimeout(res, 200));
+        const messageId = `pin-target-${Date.now()}`;
+        await owner.publishReliable({
+            type: "MESSAGE",
+            guildId,
+            channelId,
+            messageId,
+            content: "pin permission target"
+        });
+
+        const pinBody = {
+            type: "APP_OBJECT_UPSERT" as const,
+            guildId,
+            channelId,
+            namespace: "org.cgp.chat",
+            objectType: "message-pin",
+            objectId: `message-pin:${channelId}:${messageId}`,
+            target: { channelId, messageId },
+            value: { pinned: true }
+        };
+
+        await expect(attacker.publishReliable(pinBody, { timeoutMs: 5000 })).rejects.toThrow(/permission/i);
+        await expect(owner.publishReliable(pinBody, { timeoutMs: 5000 })).resolves.toMatchObject({
+            guildId
+        });
+
+        owner.close();
+        attacker.close();
+    });
+
+    it("enforces default portable app surface permissions", async () => {
+        const ownerPrivKey = secp.utils.randomPrivateKey();
+        const ownerPubKey = Buffer.from(secp.getPublicKey(ownerPrivKey, true)).toString("hex");
+        const attackerPrivKey = secp.utils.randomPrivateKey();
+        const attackerPubKey = Buffer.from(secp.getPublicKey(attackerPrivKey, true)).toString("hex");
+        const owner = new CgpClient({ relays: [relayUrl], keyPair: { pub: ownerPubKey, priv: ownerPrivKey } });
+        const attacker = new CgpClient({ relays: [relayUrl], keyPair: { pub: attackerPubKey, priv: attackerPrivKey } });
+        await Promise.all([owner.connect(), attacker.connect()]);
+
+        const guildId = await owner.createGuild("Default App Surface Guild");
+        const channelId = await owner.createChannel(guildId, "bot-lab", "text");
+        await new Promise((res) => setTimeout(res, 200));
+
+        const manifestBody = {
+            type: "APP_OBJECT_UPSERT" as const,
+            guildId,
+            namespace: "org.cgp.apps",
+            objectType: "app-manifest",
+            objectId: "assistant",
+            value: {
+                name: "Assistant",
+                bot: true,
+                agent: true,
+                commands: [{ name: "ask", description: "Ask the assistant" }]
+            }
+        };
+
+        await expect(attacker.publishReliable(manifestBody, { timeoutMs: 5000 })).rejects.toThrow(/permission/i);
+        await expect(owner.publishReliable(manifestBody, { timeoutMs: 5000 })).resolves.toMatchObject({ guildId });
+
+        await expect(owner.publishReliable({
+            type: "APP_OBJECT_UPSERT" as const,
+            guildId,
+            channelId,
+            namespace: "org.cgp.apps",
+            objectType: "webhook",
+            objectId: "deploy",
+            target: { channelId },
+            value: { name: "Deploy Hook", token: "do-not-log-secrets" }
+        }, { timeoutMs: 5000 })).rejects.toThrow(/plaintext token/i);
+
+        await expect(owner.publishReliable({
+            type: "APP_OBJECT_UPSERT" as const,
+            guildId,
+            channelId,
+            namespace: "org.cgp.apps",
+            objectType: "webhook",
+            objectId: "deploy",
+            target: { channelId },
+            value: { name: "Deploy Hook", credentialRef: "relay-local:deploy" }
+        }, { timeoutMs: 5000 })).resolves.toMatchObject({ guildId });
+
+        owner.close();
+        attacker.close();
+    });
+
+    it("enforces channel permission overwrites on the relay", async () => {
+        const ownerPrivKey = secp.utils.randomPrivateKey();
+        const ownerPubKey = Buffer.from(secp.getPublicKey(ownerPrivKey, true)).toString("hex");
+        const memberPrivKey = secp.utils.randomPrivateKey();
+        const memberPubKey = Buffer.from(secp.getPublicKey(memberPrivKey, true)).toString("hex");
+        const attackerPrivKey = secp.utils.randomPrivateKey();
+        const attackerPubKey = Buffer.from(secp.getPublicKey(attackerPrivKey, true)).toString("hex");
+        const owner = new CgpClient({ relays: [relayUrl], keyPair: { pub: ownerPubKey, priv: ownerPrivKey } });
+        const member = new CgpClient({ relays: [relayUrl], keyPair: { pub: memberPubKey, priv: memberPrivKey } });
+        const attacker = new CgpClient({ relays: [relayUrl], keyPair: { pub: attackerPubKey, priv: attackerPrivKey } });
+        await Promise.all([owner.connect(), member.connect(), attacker.connect()]);
+
+        const guildId = await owner.createGuild("Overwrite Enforcement Guild");
+        const channelId = await owner.createChannel(guildId, "staff", "text");
+        await owner.publishReliable({
+            type: "ROLE_UPSERT",
+            guildId,
+            roleId: "speaker",
+            name: "Speaker",
+            permissions: []
+        });
+        await owner.publishReliable({
+            type: "ROLE_ASSIGN",
+            guildId,
+            userId: memberPubKey,
+            roleId: "speaker"
+        });
+        await owner.publishReliable({
+            type: "CHANNEL_UPSERT",
+            guildId,
+            channelId,
+            permissionOverwrites: [
+                {
+                    id: "@everyone",
+                    kind: "role",
+                    allow: ["viewChannels"],
+                    deny: ["sendMessages"]
+                },
+                {
+                    id: "speaker",
+                    kind: "role",
+                    allow: ["sendMessages"],
+                    deny: []
+                }
+            ]
+        });
+        await new Promise((res) => setTimeout(res, 200));
+
+        await expect(attacker.publishReliable({
+            type: "MESSAGE",
+            guildId,
+            channelId,
+            messageId: `blocked-overwrite-${Date.now()}`,
+            content: "should not pass"
+        }, { timeoutMs: 5000 })).rejects.toThrow(/sendMessages/i);
+
+        await expect(member.publishReliable({
+            type: "MESSAGE",
+            guildId,
+            channelId,
+            messageId: `allowed-overwrite-${Date.now()}`,
+            content: "role overwrite allowed"
+        }, { timeoutMs: 5000 })).resolves.toMatchObject({ guildId });
+
+        owner.close();
+        member.close();
+        attacker.close();
+    });
+
+    it("requires signed membership for private guild reads", async () => {
+        const ownerPrivKey = secp.utils.randomPrivateKey();
+        const ownerPubKey = Buffer.from(secp.getPublicKey(ownerPrivKey, true)).toString("hex");
+        const strangerPrivKey = secp.utils.randomPrivateKey();
+        const strangerPubKey = Buffer.from(secp.getPublicKey(strangerPrivKey, true)).toString("hex");
+        const owner = new CgpClient({ relays: [relayUrl], keyPair: { pub: ownerPubKey, priv: ownerPrivKey } });
+        const stranger = new CgpClient({ relays: [relayUrl], keyPair: { pub: strangerPubKey, priv: strangerPrivKey } });
+        await Promise.all([owner.connect(), stranger.connect()]);
+
+        const guildId = await owner.createGuild("Private Read Guild", undefined, "private");
+        const channelId = await owner.createChannel(guildId, "vault", "text");
+        const messageId = await owner.sendMessage(guildId, channelId, "private relay history");
+        await new Promise((res) => setTimeout(res, 300));
+
+        const ws = new WebSocket(relayUrl);
+        await new Promise<void>((resolve) => ws.onopen = () => resolve());
+        const errorPromise = new Promise<any>((resolve) => {
+            const handler = (raw: WebSocket.RawData) => {
+                const data = JSON.parse(raw.toString());
+                if (data[0] === "ERROR" && data[1]?.subId === "private-state") {
+                    ws.off("message", handler);
+                    resolve(data[1]);
+                }
+            };
+            ws.on("message", handler);
+        });
+        ws.send(JSON.stringify(["GET_STATE", { subId: "private-state", guildId }]));
+        await expect(errorPromise).resolves.toMatchObject({ code: "FORBIDDEN" });
+
+        await expect(stranger.getState(guildId)).rejects.toThrow(/permission/i);
+        await expect(owner.getState(guildId)).resolves.toMatchObject({ guildId });
+        const history = await owner.getHistory({ guildId, channelId, limit: 10 });
+        expect(history.events.some((event: any) => event.body.type === "MESSAGE" && event.body.messageId === messageId)).toBe(true);
+
+        ws.close();
+        owner.close();
+        stranger.close();
+    });
+
+    it("serves canonical member lists only to authorized readers", async () => {
+        const ownerPrivKey = secp.utils.randomPrivateKey();
+        const ownerPubKey = Buffer.from(secp.getPublicKey(ownerPrivKey, true)).toString("hex");
+        const strangerPrivKey = secp.utils.randomPrivateKey();
+        const strangerPubKey = Buffer.from(secp.getPublicKey(strangerPrivKey, true)).toString("hex");
+        const owner = new CgpClient({ relays: [relayUrl], keyPair: { pub: ownerPubKey, priv: ownerPrivKey } });
+        const stranger = new CgpClient({ relays: [relayUrl], keyPair: { pub: strangerPubKey, priv: strangerPrivKey } });
+        await Promise.all([owner.connect(), stranger.connect()]);
+
+        const guildId = await owner.createGuild("Private Members Guild", undefined, "private");
+        await new Promise((res) => setTimeout(res, 200));
+
+        await expect(stranger.getMembers(guildId)).rejects.toThrow(/permission/i);
+        await expect(owner.getMembers(guildId)).resolves.toEqual(
+            expect.arrayContaining([
+                expect.objectContaining({
+                    userId: ownerPubKey,
+                    roles: expect.arrayContaining(["owner"])
+                })
+            ])
+        );
+
+        const ws = new WebSocket(relayUrl);
+        await new Promise<void>((resolve) => ws.onopen = () => resolve());
+        const errorPromise = new Promise<any>((resolve) => {
+            const handler = (raw: WebSocket.RawData) => {
+                const data = JSON.parse(raw.toString());
+                if (data[0] === "ERROR" && data[1]?.subId === "private-members") {
+                    ws.off("message", handler);
+                    resolve(data[1]);
+                }
+            };
+            ws.on("message", handler);
+        });
+        ws.send(JSON.stringify(["GET_MEMBERS", { subId: "private-members", guildId }]));
+        await expect(errorPromise).resolves.toMatchObject({ code: "FORBIDDEN" });
+
+        ws.close();
+        owner.close();
+        stranger.close();
+    });
+
+    it("filters hidden channel history for unauthenticated readers", async () => {
+        const ownerPrivKey = secp.utils.randomPrivateKey();
+        const ownerPubKey = Buffer.from(secp.getPublicKey(ownerPrivKey, true)).toString("hex");
+        const owner = new CgpClient({ relays: [relayUrl], keyPair: { pub: ownerPubKey, priv: ownerPrivKey } });
+        await owner.connect();
+
+        const guildId = await owner.createGuild("Hidden Channel Guild");
+        const channelId = await owner.createChannel(guildId, "ops", "text");
+        await owner.publishReliable({
+            type: "CHANNEL_UPSERT",
+            guildId,
+            channelId,
+            permissionOverwrites: [
+                {
+                    id: "@everyone",
+                    kind: "role",
+                    deny: ["viewChannels"],
+                    allow: []
+                }
+            ]
+        });
+        await owner.sendMessage(guildId, channelId, "hidden relay history");
+        await new Promise((res) => setTimeout(res, 300));
+
+        const ws = new WebSocket(relayUrl);
+        await new Promise<void>((resolve) => ws.onopen = () => resolve());
+        const errorPromise = new Promise<any>((resolve) => {
+            const handler = (raw: WebSocket.RawData) => {
+                const data = JSON.parse(raw.toString());
+                if (data[0] === "ERROR" && data[1]?.subId === "hidden-history") {
+                    ws.off("message", handler);
+                    resolve(data[1]);
+                }
+            };
+            ws.on("message", handler);
+        });
+        ws.send(JSON.stringify(["GET_HISTORY", { subId: "hidden-history", guildId, channelId, limit: 10 }]));
+        await expect(errorPromise).resolves.toMatchObject({ code: "FORBIDDEN" });
+
+        const history = await owner.getHistory({ guildId, channelId, limit: 10 });
+        expect(history.events.some((event: any) => event.body.content === "hidden relay history")).toBe(true);
+
+        ws.close();
+        owner.close();
     });
 
     it("enforces validation rules", async () => {

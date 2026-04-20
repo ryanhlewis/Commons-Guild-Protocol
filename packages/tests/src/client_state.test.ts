@@ -90,4 +90,46 @@ describe("Client State Tracking", () => {
         expect(state?.name).toBe("Snapshot Guild");
         expect(state?.channels.has(channelId)).toBe(true);
     });
+
+    it("publishes generic app objects through client helpers", async () => {
+        const privKey = secp.utils.randomPrivateKey();
+        const pubKey = Buffer.from(secp.getPublicKey(privKey, true)).toString("hex");
+        const client = new CgpClient({ relays: [relayUrl], keyPair: { pub: pubKey, priv: privKey } });
+        await client.connect();
+
+        const guildId = await client.createGuild("App Object Helper Guild");
+        await new Promise(r => setTimeout(r, 100));
+
+        await client.upsertAppObject(guildId, "org.cgp.apps", "agent-profile", pubKey, {
+            target: { userId: pubKey },
+            value: {
+                displayName: "Helper Agent [bot]",
+                bot: true,
+                agent: true
+            }
+        });
+        await new Promise(r => setTimeout(r, 100));
+
+        let state = client.getGuildState(guildId);
+        expect(Array.from(state?.appObjects.values() ?? []).some((object) =>
+            object.namespace === "org.cgp.apps" &&
+            object.objectType === "agent-profile" &&
+            object.objectId === pubKey &&
+            object.value?.bot === true
+        )).toBe(true);
+
+        await client.deleteAppObject(guildId, "org.cgp.apps", "agent-profile", pubKey, {
+            target: { userId: pubKey }
+        });
+        await new Promise(r => setTimeout(r, 100));
+
+        state = client.getGuildState(guildId);
+        expect(Array.from(state?.appObjects.values() ?? []).some((object) =>
+            object.namespace === "org.cgp.apps" &&
+            object.objectType === "agent-profile" &&
+            object.objectId === pubKey
+        )).toBe(false);
+
+        client.close();
+    });
 });

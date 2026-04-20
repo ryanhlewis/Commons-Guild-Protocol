@@ -14,10 +14,12 @@ export interface GuildEventBodyBase {
 export interface MemberUpdate {
     type: "MEMBER_UPDATE";
     guildId: GuildId;
+    userId?: UserId;
     nickname?: string;
     avatar?: string;
     banner?: string;
     bio?: string;
+    external?: any;
 }
 
 export interface GuildEvent {
@@ -74,6 +76,11 @@ export interface ChannelCreate {
     name: string;
     kind: "text" | "voice" | "ephemeral-text";
     retention?: EphemeralPolicy;
+    categoryId?: string;
+    description?: string;
+    topic?: string;
+    position?: number;
+    permissionOverwrites?: PermissionOverwrite[];
 }
 
 export interface ChannelUpsert {
@@ -103,8 +110,27 @@ export interface Message {
     messageId: HashHex; // stable client-chosen id; SHOULD hash a collision-resistant message preimage
     content: string;
     replyTo?: HashHex;
+    attachments?: AttachmentRef[];
     iv?: string;
     encrypted?: boolean;
+    external?: any;
+}
+
+export interface AttachmentRef {
+    id?: string;
+    url?: string;
+    type?: "image" | "video" | "audio" | "file" | string;
+    name?: string;
+    mimeType?: string;
+    size?: number;
+    width?: number;
+    height?: number;
+    hash?: HashHex;
+    encrypted?: boolean;
+    scheme?: string;
+    iv?: string;
+    content?: string;
+    external?: any;
 }
 
 export interface EditMessage {
@@ -240,8 +266,20 @@ export interface MemberKick {
 export interface Channel {
     id: ChannelId;
     name: string;
-    kind: "text" | "voice" | "ephemeral-text";
+    kind: "text" | "voice" | "ephemeral-text" | string;
     retention?: EphemeralPolicy;
+    categoryId?: string;
+    description?: string;
+    topic?: string;
+    position?: number;
+    permissionOverwrites?: PermissionOverwrite[];
+}
+
+export interface PermissionOverwrite {
+    id: string;
+    kind: "role" | "member";
+    allow?: string[];
+    deny?: string[];
 }
 
 export interface Role {

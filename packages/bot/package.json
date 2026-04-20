@@ -1,0 +1,16 @@
+{
+  "name": "@cgp/bot",
+  "version": "0.1.0",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@cgp/client": "*",
+    "@cgp/core": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0"
+  }
+}

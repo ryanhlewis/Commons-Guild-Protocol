@@ -1,4 +1,4 @@
-# Commons Guild Protocol (CGP) Specification (Draft 0.1)
+﻿# Commons Guild Protocol (CGP) Specification (Draft 0.1)
 
 ## 1. Goals and non-goals
 
@@ -17,7 +17,11 @@
 **Non-goals**
 
 - Strong global consensus (no "single canonical world state").
-- Strong delivery guarantees (no exactly-once; we aim for **eventual consistency** given honest relays).
+  | ["SNAPSHOT", SnapshotFrame]       // server -> client: initial events/history page
+  | ["GET_STATE", StateRequestFrame]  // client -> server: canonical state read
+  | ["GET_HISTORY", HistoryRequestFrame] // client -> server: paginated history read
+  | ["SEARCH", SearchRequestFrame]    // client -> server: permission-filtered search
+  | ["SEARCH_RESULTS", SearchResultsFrame]; // server -> client: search response
 - On-chain message storage. Only optional anchoring of small hashes to external L1s.
 - Mandatory end-to-end encryption, key escrow, or relay-visible decryption.
 - Strong metadata privacy without additional transports/plugins.
@@ -164,7 +168,12 @@ interface ChannelCreate {
   guildId: GuildId;
   channelId: ChannelId;
   name: string;
-  kind: "text" | "voice" | "ephemeral-text";
+  kind: "text" | "voice" | "ephemeral-text" | string;
+  categoryId?: string;
+  description?: string;
+  topic?: string;
+  position?: number;
+  permissionOverwrites?: PermissionOverwrite[];
   retention?: {
     // advisory (relays may enforce)
     mode: "infinite" | "rolling-window" | "ttl";
@@ -173,13 +182,41 @@ interface ChannelCreate {
   };
 }
 
+interface PermissionOverwrite {
+  id: string;              // role id, guild id/@everyone, or user public key
+  kind: "role" | "member";
+  allow?: string[];
+  deny?: string[];
+}
+
 interface Message {
   type: "MESSAGE";
   guildId: GuildId;
   channelId: ChannelId;
   messageId: HashHex; // stable client-chosen id; SHOULD hash a collision-resistant message preimage
-  content: string;    // UTF-8 text; later: support attachments
+  content: string;    // UTF-8 text or opaque ciphertext when encrypted=true
   replyTo?: HashHex;  // messageId of parent message
+  attachments?: AttachmentRef[];
+  iv?: string;         // present for encrypted envelopes
+  encrypted?: boolean;
+  external?: unknown;  // app-defined metadata; ignored by core state rules
+}
+
+interface AttachmentRef {
+  id?: string;
+  url?: string;        // HTTP(S), content-addressed URI, or app-defined opaque locator
+  type?: "image" | "video" | "audio" | "file" | string;
+  name?: string;
+  mimeType?: string;
+  size?: number;
+  width?: number;
+  height?: number;
+  hash?: HashHex;      // hash of bytes when the publisher wants integrity binding
+  encrypted?: boolean; // true when content/url is an opaque application-level envelope
+  scheme?: string;
+  iv?: string;
+  content?: string;    // ciphertext or app-defined attachment envelope
+  external?: unknown;
 }
 
 interface EditMessage {
@@ -200,15 +237,26 @@ interface DeleteMessage {
 
 interface ForkFrom {
   type: "FORK_FROM";
-  guildId: GuildId;       // new guild’s ID
+  guildId: GuildId;       // new guildâ€™s ID
   parentGuildId: GuildId;
   parentSeq: number;
   parentRootHash: HashHex; // hash of parent event at parentSeq
   note?: string;
 }
+
+interface Checkpoint {
+  type: "CHECKPOINT";
+  guildId: GuildId;
+  rootHash: HashHex;          // hash(canonical(SerializableGuildState))
+  seq: number;                // MUST match the enclosing GuildEvent.seq
+  state: SerializableGuildState;
+}
 ```
 
-Other governance events (roles, bans, checkpoints) follow similarly.
+Other governance events (roles and bans) follow similarly. `CHECKPOINT` is relay-maintained:
+clients MUST NOT publish it through `PUBLISH`. A checkpoint does not mutate guild state; it anchors
+the current serialized state so relays and clients can rebuild from the checkpoint event plus the
+tail events after it instead of replaying an entire log.
 
 ### 3.3.1 App-scoped objects
 
@@ -253,6 +301,37 @@ Relays MUST validate that the author can participate in the guild, that referenc
 that referenced messages are live. Object semantics and finer permissions are owned by the namespace
 and MAY be enforced by relay plugins or clients. Unknown namespaces must not change core guild state.
 
+The reference namespace `org.cgp.apps` is reserved for portable app, bot, slash-command, and webhook
+records. It is still an app-scoped namespace, not a new core user class:
+
+* `app-manifest`: durable app metadata such as name, description, homepage, optional `endpoint`,
+  optional `credentialRef`, and command summaries. Command summaries MAY include an `options` array
+  using the same schema as `slash-command`.
+* `slash-command`: a portable command registration. Command records MAY include an `endpoint` and
+  `credentialRef` for relay-local or app-runtime command delivery. Command records MAY include an
+  `options` array with up to 25 entries. Each option has a lowercase `name`, a `type` of `string`,
+  `integer`, `number`, `boolean`, `user`, `channel`, `role`, or `mentionable`, optional
+  `description`, optional `required`, optional `autocomplete`, and optional `choices`.
+* `command-invocation`: a durable execution request for a registered slash command. Public channel
+  responses SHOULD be normal `MESSAGE` events signed by the app/bot identity; private acknowledgements
+  or "only visible to you" responses MAY use app objects and client-local rendering. Invocations MAY
+  include an `options` object containing parsed scalar option values. The `cgp.apps.surface-policy`
+  plugin SHOULD reject invocations with missing required options, invalid scalar types, or unsupported
+  choices when the registered command declared an option schema.
+* `command-response`: an optional app-scoped command receipt/response object for ephemeral or
+  app-private responses. Relays SHOULD treat response visibility as advisory unless an application
+  plugin enforces delivery rules. Bot runtimes MAY include `error: true` and a short `code` such as
+  `INVALID_OPTIONS`, `COMMAND_ERROR`, or `COMMAND_TIMEOUT` for client-visible command failures.
+* `webhook`: a webhook registration. Public log values SHOULD contain `credentialRef`, not plaintext
+  secrets, tokens, passwords, or private keys.
+* `agent-profile`: a self-declared profile for automated users or agents. Bots remain normal CGP
+  identities that sign normal events; clients may display a bot badge when this record, member metadata,
+  or the display name indicates automation.
+
+Relays MAY advertise `cgp.apps.surface-policy` to validate these records and require role permissions
+such as `manage_apps`, `manage_integrations`, or `manage_webhooks`. Relays SHOULD NOT grant bots any
+implicit privilege merely because they declare themselves as bots or agents.
+
 ### 3.3.2 Admission, posting policy, and baseline anti-abuse
 
 CGP identities are self-generated public keys. The base protocol is therefore not Sybil-resistant by
@@ -270,10 +349,11 @@ captcha/WebAuthn gates, invite gates, and spam scoring are relay or guild policy
 Relays MAY advertise those policies as plugins in `HELLO_OK.plugins`; these plugins do not change the core
 event format and MUST NOT be represented as top-level core protocol fields.
 
-The reference relay ships with a default plugin named `cgp.relay.rate-limit` that enforces per-socket,
-per-author, and per-guild publish buckets. That plugin is a recommended operational default, not a
-mandatory part of CGP-0.1. Compatible relays may disable it, replace it, or combine it with other policy
-plugins as long as they still enforce the core authorization rules above.
+The reference relay ships with default plugins named `cgp.relay.rate-limit` and
+`cgp.relay.abuse-controls`. These enforce publish buckets, message-size checks, mention flood checks,
+duplicate-message throttles, and command invocation burst limits. They are recommended operational
+defaults, not mandatory parts of CGP-0.1. Compatible relays may disable, replace, or combine them with
+other policy plugins as long as they still enforce the core authorization rules above.
 
 ### 3.4 Canonical state ("UTXO of messages")
 
@@ -336,12 +416,12 @@ interface DirectoryLogSnapshot {
 }
 ```
 
-* Library: `merkletreejs` with SHA‑256 for Merkle roots and inclusion proofs.
+* Library: `merkletreejs` with SHAâ€‘256 for Merkle roots and inclusion proofs.
 
 **Operations:**
 
-* `SET(handle, value)` – add or update an entry.
-* `DELETE(handle)` – marks an entry as deleted (optional; some directories may be append-only with tombstones).
+* `SET(handle, value)` â€“ add or update an entry.
+* `DELETE(handle)` â€“ marks an entry as deleted (optional; some directories may be append-only with tombstones).
 
 Clients can request:
 
@@ -350,7 +430,7 @@ Clients can request:
 
 Clients **should** consult multiple directory operators and require:
 
-* at least `M` of `K` to agree on `(handle → guildId, guildPubkey)`,
+* at least `M` of `K` to agree on `(handle â†’ guildId, guildPubkey)`,
 * monotonic roots over time.
 
 ### 4.3 Optional anchoring
@@ -368,7 +448,7 @@ CGP-0.1 defines a simple WebSocket-based relay protocol.
 ### 5.1 Transport
 
 * Default: WebSocket over TLS (`wss://`).
-* Frames are **JSON arrays** to keep parsing extremely simple (à la Nostr).
+* Frames are **JSON arrays** to keep parsing extremely simple (Ã  la Nostr).
 
 All frames:
 
@@ -378,11 +458,15 @@ type Frame =
   | ["HELLO", HelloFrame]
   | ["HELLO_OK", HelloOkFrame]
   | ["ERROR", ErrorFrame]
-  | ["EVENT", GuildEvent]             // server → client: new event
+  | ["EVENT", GuildEvent]             // server â†’ client: new event
   | ["PUBLISH", PublishFrame]         // client -> server: submit pre-sequenced event
-  | ["SUB", SubFrame]                 // client → server: subscribe
-  | ["UNSUB", UnsubFrame]             // client → server: unsubscribe
-  | ["SNAPSHOT", SnapshotFrame];      // server → client: initial events
+  | ["SUB", SubFrame]                 // client â†’ server: subscribe
+  | ["UNSUB", UnsubFrame]             // client â†’ server: unsubscribe
+  | ["SNAPSHOT", SnapshotFrame]       // server -> client: initial events/history page
+  | ["GET_STATE", StateRequestFrame]  // client -> server: canonical state read
+  | ["GET_HISTORY", HistoryRequestFrame] // client -> server: paginated history read
+  | ["SEARCH", SearchRequestFrame]    // client -> server: permission-filtered search
+  | ["SEARCH_RESULTS", SearchResultsFrame]; // server -> client: search response
 ```
 
 ```ts
@@ -446,8 +530,17 @@ interface SubFrame {
   channels?: ChannelId[];   // optional filter
   fromSeq?: number;         // inclusive
   limit?: number;           // max events in initial snapshot
+  author?: PublicKeyHex;    // optional signed read identity
+  createdAt?: number;
+  signature?: SignatureHex; // signature over canonical({ kind: "SUB", payloadWithoutSignature })
 }
 ```
+
+Public guilds MAY serve public channel snapshots without read authentication. Private guilds and channels
+hidden by permission overwrites require a valid signed read identity. Relays MUST filter `SNAPSHOT`,
+`STATE`, `GET_HISTORY`, and live `EVENT` fan-out to the channels visible to the authenticated reader.
+Banned or kicked users MAY receive the moderation event that removes them so clients can update local
+state, but relays MUST NOT continue serving private guild history after removal.
 
 Server responds:
 
@@ -458,7 +551,84 @@ interface SnapshotFrame {
   subId: string;
   guildId: GuildId;
   events: GuildEvent[];
-  endSeq: number;         // highest seq included
+  endSeq: number;         // current relay log head
+  endHash?: HashHex | null;
+  oldestSeq?: number | null;
+  newestSeq?: number | null;
+  hasMore?: boolean;
+  checkpointSeq?: number | null;
+  checkpointHash?: HashHex | null;
+}
+```
+
+For large logs, relays SHOULD return the latest valid `CHECKPOINT` event plus every tail event after
+that checkpoint. Clients MUST verify the checkpoint `rootHash` against the embedded serialized state
+before using it as a replay anchor. If no valid checkpoint is available, relays MAY fall back to a
+genesis-based snapshot or a paginated `GET_HISTORY` response.
+
+`GET_STATE`, `GET_HISTORY`, `GET_MEMBERS`, and `SEARCH` use the same optional signed read fields (`author`,
+`createdAt`, `signature`) and the same visibility rules. Relays SHOULD reject stale signed read
+requests to limit replay, while keeping the freshness window large enough for mobile clients with
+mild clock skew. If no member plugin handles `GET_MEMBERS`, relays SHOULD derive the member list from
+the canonical guild state rather than returning relay-local placeholder data.
+
+Search is a relay read surface, not a new event type. Reference relays MAY implement it by scanning
+the durable guild log and canonical state; production relays SHOULD maintain indexes. Search results
+MUST be filtered by the same guild/channel visibility checks as `SNAPSHOT`, `STATE`, and
+`GET_HISTORY`. Relays MUST NOT decrypt encrypted payloads for search; encrypted messages may only be
+matched by visible metadata unless a client/plugin supplies its own encrypted-search index.
+
+```ts
+type SearchScope = "messages" | "channels" | "members" | "appObjects";
+
+interface SearchRequestFrame {
+  subId: string;
+  guildId: GuildId;
+  channelId?: ChannelId;
+  query: string;
+  scopes?: SearchScope[]; // default: all supported scopes
+  beforeSeq?: number;
+  afterSeq?: number;
+  limit?: number;
+  includeDeleted?: boolean;
+  includeEncrypted?: boolean; // metadata only; never relay-side decryption
+  includeEvent?: boolean;
+  author?: PublicKeyHex;
+  createdAt?: number;
+  signature?: SignatureHex;
+}
+
+interface SearchResult {
+  kind: "message" | "channel" | "member" | "appObject";
+  guildId: GuildId;
+  channelId?: ChannelId;
+  messageId?: HashHex;
+  userId?: UserId;
+  objectId?: string;
+  namespace?: string;
+  objectType?: string;
+  eventId?: HashHex;
+  seq?: number;
+  createdAt?: number;
+  author?: UserId;
+  encrypted?: boolean;
+  preview?: string;
+  content?: string; // optional current message projection; not part of the signed event
+  event?: GuildEvent; // optional, omitted when includeEvent=false
+}
+
+interface SearchResultsFrame {
+  subId: string;
+  guildId: GuildId;
+  channelId?: ChannelId;
+  query: string;
+  scopes: SearchScope[];
+  results: SearchResult[];
+  hasMore: boolean;
+  oldestSeq?: number | null;
+  newestSeq?: number | null;
+  checkpointSeq?: number | null;
+  checkpointHash?: HashHex | null;
 }
 ```
 
@@ -487,7 +657,7 @@ To send a message / governance action:
    * `seq = null` (or omitted),
    * `prevHash = null` (or omitted),
    * `id = null` (or omitted).
-2. Client signs the **event payload** excluding seq/prevHash/id (or signs a canonical “unsigned” representation – details in `@cgp/core`).
+2. Client signs the **event payload** excluding seq/prevHash/id (or signs a canonical â€œunsignedâ€ representation â€“ details in `@cgp/core`).
 3. Client sends:
 
 ```ts
@@ -510,7 +680,7 @@ Server behavior:
 
   * responds with `["ERROR", { code: "INVALID_EVENT", message: "..." }]` to sender.
 
-**Note:** this makes relay responsible for sequencing. In P2P fallback mode, a temporary “sequencer” peer plays the same role.
+**Note:** this makes relay responsible for sequencing. In P2P fallback mode, a temporary â€œsequencerâ€ peer plays the same role.
 
 ---
 
@@ -574,6 +744,16 @@ Reserved reference plugin names:
 
 * `cgp.relay.rate-limit`: relay-local publish buckets or equivalent anti-spam policy. This is a
   recommended reference plugin, not core CGP state.
+* `cgp.relay.abuse-controls`: relay-local flood and abuse checks for message length, mentions,
+  duplicates, and command invocation bursts. This is operational policy, not core CGP state.
+* `cgp.apps.surface-policy`: relay-local validation and permission checks for the portable
+  `org.cgp.apps` namespace (`app-manifest`, `slash-command`, `command-invocation`,
+  `command-response`, `webhook`, and `agent-profile`).
+  This plugin keeps bots/apps as normal signed CGP identities and app objects; it does not create a
+  privileged bot account type.
+* `cgp.apps.webhook-ingress`: optional HTTP ingress for registered `org.cgp.apps` webhook objects.
+  Implementations SHOULD resolve `credentialRef` to relay-local secrets and MUST NOT store plaintext
+  webhook tokens in the public guild log.
 * `cgp.security.encryption-policy`: relay-local policy that can require or reject encrypted MESSAGE
   envelopes for selected guilds/channels. This plugin must not receive plaintext keys and must not act
   as a key server.
@@ -586,7 +766,7 @@ In pure P2P mode (no relay reachable):
 
 * Peers run a **libp2p node**:
 
-  * use WebRTC/WebSocket transports for browser↔browser and browser↔Node connectivity.
+  * use WebRTC/WebSocket transports for browserâ†”browser and browserâ†”Node connectivity.
 * Use a libp2p protocol ID `"/cgp/0.1"`:
 
   * frames are exactly the same JSON arrays as the relay protocol,
@@ -608,7 +788,7 @@ Full P2P consensus, CRDTs, etc. can be added later; CGP-0.1 intentionally keeps 
 
 ## 7. Retention, ephemerality, and relay behavior
 
-CGP doesn’t force hard rules but defines **recommended defaults**:
+CGP doesnâ€™t force hard rules but defines **recommended defaults**:
 
 ### 7.1 Channel retention policies
 
@@ -654,7 +834,7 @@ Peers (clients):
 
 **Security / integrity**
 
-* Any modification of a guild log’s history is **detectable** to any client that:
+* Any modification of a guild logâ€™s history is **detectable** to any client that:
 
   * previously saw a `rootHash` or checkpoint event,
   * compares new logs and sees inconsistent `prevHash` or `id`s.
@@ -683,6 +863,11 @@ as `cgp.security.encryption-policy` to require encrypted MESSAGE envelopes for s
 or to reject encrypted payloads on relays that require plaintext moderation. Such a plugin verifies only
 envelope shape and local relay policy; it is not a key server and does not make E2EE part of core relay
 state.
+
+Encrypted attachments use the same rule: `attachments[]` may contain plaintext blob references or opaque
+client-defined encrypted envelopes. The relay validates only event shape and permissions; content hashes,
+media keys, thumbnails, and attachment decryption UX are application-layer responsibilities unless a relay
+advertises an optional media/security plugin.
 
 Metadata privacy requires additional client/relay extensions. Recommended mitigations include TLS,
 Tor/I2P/proxy transports, subscribing to broader guild snapshots and filtering locally, batching

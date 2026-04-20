@@ -45,6 +45,8 @@ Instead, it borrows the **ledger idea** and applies it to community governance, 
 
 Relays may load optional plugins to integrate with external systems. When enabled, a relay can advertise plugin metadata in `HELLO_OK` (see `SPEC.md`), including optional client extension information.
 
+The reference relay also ships with optional/default policy plugins for operational concerns such as rate limits, encryption envelope policy, safety reports, and the portable `org.cgp.apps` namespace for app manifests, slash commands, webhooks, and self-declared agent profiles. These are relay policy surfaces over signed CGP events, not new core account types.
+
 Relay implementations may optionally expose plugin-provided extension bundles over HTTP at:
 
 ```

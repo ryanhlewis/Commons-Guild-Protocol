@@ -148,7 +148,7 @@ describe("Stress Testing", () => {
     });
 
     it("benchmarks state reconstruction with large event history", async () => {
-        const { createInitialState, applyEvent, computeEventId } = await import("@cgp/core");
+        const { rebuildStateFromEvents, computeEventId } = await import("@cgp/core");
 
         const EVENT_COUNT = 10000;
         const guildId = "bench-guild";
@@ -204,10 +204,7 @@ describe("Stress Testing", () => {
 
         // 2. Measure Rebuild Time
         const startTime = Date.now();
-        let state = createInitialState(events[0]);
-        for (let i = 1; i < events.length; i++) {
-            state = applyEvent(state, events[i]);
-        }
+        const state = rebuildStateFromEvents(events).state;
         const endTime = Date.now();
 
         const duration = endTime - startTime;

@@ -26,6 +26,7 @@ import {
     SerializableGuildState,
     Checkpoint
 } from "./types";
+import { hashObject } from "./crypto";
 
 export interface GuildState {
     guildId: GuildId;
@@ -120,20 +121,129 @@ export function deserializeState(serialized: SerializableGuildState, headSeq: nu
     };
 }
 
-export function applyEvent(state: GuildState, event: GuildEvent): GuildState {
+export interface RebuiltGuildState {
+    state: GuildState;
+    startIndex: number;
+    checkpointEvent?: GuildEvent;
+}
+
+export function checkpointStateRoot(state: SerializableGuildState): HashHex {
+    return hashObject(state);
+}
+
+export function deserializeCheckpointState(event: GuildEvent): GuildState {
+    const body = event.body as Checkpoint;
+    if (body.type !== "CHECKPOINT") {
+        throw new Error("Event is not a checkpoint");
+    }
+    if (body.guildId !== event.body.guildId) {
+        throw new Error("Checkpoint guildId mismatch");
+    }
+    if (body.state.guildId !== body.guildId) {
+        throw new Error("Checkpoint state guildId mismatch");
+    }
+    if (typeof body.seq === "number" && body.seq !== event.seq) {
+        throw new Error("Checkpoint body seq must match event seq");
+    }
+    if (checkpointStateRoot(body.state) !== body.rootHash) {
+        throw new Error("Checkpoint rootHash does not match state");
+    }
+    return deserializeState(body.state, event.seq, event.id, event.createdAt);
+}
+
+export function isValidCheckpointEvent(event: GuildEvent): boolean {
+    try {
+        deserializeCheckpointState(event);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+export function rebuildStateFromEvents(events: GuildEvent[]): RebuiltGuildState {
+    if (events.length === 0) {
+        throw new Error("Cannot rebuild state from an empty event list");
+    }
+
+    let checkpointIndex = -1;
+    let state: GuildState | undefined;
+    for (let index = events.length - 1; index >= 0; index--) {
+        if (events[index].body.type !== "CHECKPOINT") {
+            continue;
+        }
+        try {
+            state = deserializeCheckpointState(events[index]);
+            checkpointIndex = index;
+            break;
+        } catch {
+            // Ignore malformed checkpoints and fall back to an earlier anchor or genesis.
+        }
+    }
+
+    const startIndex = checkpointIndex >= 0 ? checkpointIndex + 1 : 1;
+    if (!state) {
+        state = createInitialState(events[0]);
+    }
+
+    for (let i = startIndex; i < events.length; i++) {
+        state = applyEvent(state, events[i], { mutable: true });
+    }
+
+    return {
+        state,
+        startIndex,
+        checkpointEvent: checkpointIndex >= 0 ? events[checkpointIndex] : undefined
+    };
+}
+
+export function applyEvent(state: GuildState, event: GuildEvent, options: { mutable?: boolean } = {}): GuildState {
     // Basic validation: seq must be state.headSeq + 1 (unless it's the first event, handled by createInitialState)
     // But here we assume we are applying valid events in order.
 
-    const newState = { ...state }; // Shallow copy
-    // Deep copy maps/sets to avoid mutation issues if we were using immutable patterns strictly,
-    // but for performance in this reference impl we might mutate if we are careful.
-    // Let's do a mix: copy the containers we modify.
-    newState.channels = new Map(state.channels);
-    newState.roles = new Map(state.roles);
-    newState.members = new Map(state.members);
-    newState.bans = new Map(state.bans);
-    newState.messages = new Map(state.messages);
-    newState.appObjects = new Map(state.appObjects);
+    const mutable = options.mutable === true;
+    const newState = mutable ? state : { ...state };
+    const ensureChannels = () => {
+        if (mutable) return newState.channels;
+        if (newState.channels === state.channels) {
+            newState.channels = new Map(state.channels);
+        }
+        return newState.channels;
+    };
+    const ensureRoles = () => {
+        if (mutable) return newState.roles;
+        if (newState.roles === state.roles) {
+            newState.roles = new Map(state.roles);
+        }
+        return newState.roles;
+    };
+    const ensureMembers = () => {
+        if (mutable) return newState.members;
+        if (newState.members === state.members) {
+            newState.members = new Map(state.members);
+        }
+        return newState.members;
+    };
+    const ensureBans = () => {
+        if (mutable) return newState.bans;
+        if (newState.bans === state.bans) {
+            newState.bans = new Map(state.bans);
+        }
+        return newState.bans;
+    };
+    const ensureMessages = () => {
+        if (mutable) return newState.messages;
+        if (newState.messages === state.messages) {
+            newState.messages = new Map(state.messages);
+        }
+        return newState.messages;
+    };
+    const ensureAppObjects = () => {
+        if (mutable) return newState.appObjects;
+        if (newState.appObjects === state.appObjects) {
+            newState.appObjects = new Map(state.appObjects);
+        }
+        return newState.appObjects;
+    };
     newState.headSeq = event.seq;
     newState.headHash = event.id;
     newState.access = state.access;
@@ -163,18 +273,25 @@ export function applyEvent(state: GuildState, event: GuildEvent): GuildState {
         }
         case "CHANNEL_CREATE": {
             const b = body as ChannelCreate;
-            newState.channels.set(b.channelId, {
+            ensureChannels().set(b.channelId, {
                 id: b.channelId,
                 name: b.name,
                 kind: b.kind,
-                retention: b.retention
+                retention: b.retention,
+                categoryId: b.categoryId,
+                description: b.description,
+                topic: b.topic,
+                position: b.position,
+                permissionOverwrites: Array.isArray(b.permissionOverwrites)
+                    ? b.permissionOverwrites
+                    : undefined
             });
             break;
         }
         case "CHANNEL_UPSERT": {
             if (typeof bodyRecord.channelId === "string" && bodyRecord.channelId.trim()) {
-                const current = newState.channels.get(bodyRecord.channelId);
-                newState.channels.set(bodyRecord.channelId, {
+                const current = state.channels.get(bodyRecord.channelId);
+                ensureChannels().set(bodyRecord.channelId, {
                     ...(current ?? {
                         id: bodyRecord.channelId,
                         name: bodyRecord.channelId,
@@ -197,10 +314,10 @@ export function applyEvent(state: GuildState, event: GuildEvent): GuildState {
         }
         case "CHANNEL_DELETE": {
             if (typeof bodyRecord.channelId === "string") {
-                newState.channels.delete(bodyRecord.channelId);
-                for (const [messageId, message] of newState.messages) {
+                ensureChannels().delete(bodyRecord.channelId);
+                for (const [messageId, message] of state.messages) {
                     if (message.channelId === bodyRecord.channelId) {
-                        newState.messages.set(messageId, {
+                        ensureMessages().set(messageId, {
                             ...message,
                             deleted: true
                         });
@@ -211,8 +328,8 @@ export function applyEvent(state: GuildState, event: GuildEvent): GuildState {
         }
         case "ROLE_UPSERT": {
             if (typeof bodyRecord.roleId === "string" && bodyRecord.roleId.trim()) {
-                const current = newState.roles.get(bodyRecord.roleId);
-                newState.roles.set(bodyRecord.roleId, {
+                const current = state.roles.get(bodyRecord.roleId);
+                ensureRoles().set(bodyRecord.roleId, {
                     ...(current ?? {
                         id: bodyRecord.roleId,
                         name: bodyRecord.roleId,
@@ -235,10 +352,10 @@ export function applyEvent(state: GuildState, event: GuildEvent): GuildState {
         }
         case "ROLE_DELETE": {
             if (typeof bodyRecord.roleId === "string") {
-                newState.roles.delete(bodyRecord.roleId);
-                for (const [userId, member] of newState.members) {
+                ensureRoles().delete(bodyRecord.roleId);
+                for (const [userId, member] of state.members) {
                     if (member.roles.has(bodyRecord.roleId)) {
-                        newState.members.set(userId, {
+                        ensureMembers().set(userId, {
                             ...member,
                             roles: new Set([...member.roles].filter((roleId) => roleId !== bodyRecord.roleId))
                         });
@@ -249,60 +366,60 @@ export function applyEvent(state: GuildState, event: GuildEvent): GuildState {
         }
         case "ROLE_ASSIGN": {
             const b = body as RoleAssign;
-            const member = newState.members.get(b.userId) || { userId: b.userId, roles: new Set(), joinedAt: event.createdAt };
-            // Copy roles set
-            member.roles = new Set(member.roles);
+            const current = state.members.get(b.userId);
+            const member = current
+                ? { ...current, roles: new Set(current.roles) }
+                : { userId: b.userId, roles: new Set<string>(), joinedAt: event.createdAt };
             member.roles.add(b.roleId);
-            newState.members.set(b.userId, member);
+            ensureMembers().set(b.userId, member);
             break;
         }
         case "ROLE_REVOKE": {
             const b = body as RoleRevoke;
-            const member = newState.members.get(b.userId);
-            if (member) {
-                member.roles = new Set(member.roles);
+            const current = state.members.get(b.userId);
+            if (current) {
+                const member = { ...current, roles: new Set(current.roles) };
                 member.roles.delete(b.roleId);
-                newState.members.set(b.userId, member);
+                ensureMembers().set(b.userId, member);
             }
             break;
         }
         case "BAN_USER": {
             const b = body as BanUser;
-            newState.bans.set(b.userId, {
+            ensureBans().set(b.userId, {
                 userId: b.userId,
                 reason: b.reason,
                 bannedAt: event.createdAt
             });
-            // Also remove from members?
-            newState.members.delete(b.userId);
+            ensureMembers().delete(b.userId);
             break;
         }
         case "BAN_ADD": {
-            newState.bans.set(bodyRecord.userId, {
+            ensureBans().set(bodyRecord.userId, {
                 userId: bodyRecord.userId,
                 reason: bodyRecord.reason,
                 expiresAt: bodyRecord.expiresAt,
                 bannedAt: event.createdAt
             });
-            newState.members.delete(bodyRecord.userId);
+            ensureMembers().delete(bodyRecord.userId);
             break;
         }
         case "UNBAN_USER": {
             const b = body as UnbanUser;
-            newState.bans.delete(b.userId);
+            ensureBans().delete(b.userId);
             break;
         }
         case "BAN_REMOVE": {
-            newState.bans.delete(bodyRecord.userId);
+            ensureBans().delete(bodyRecord.userId);
             break;
         }
         case "MEMBER_KICK": {
-            newState.members.delete(bodyRecord.userId);
+            ensureMembers().delete(bodyRecord.userId);
             break;
         }
         case "MESSAGE": {
             const b = body as Message;
-            newState.messages.set(b.messageId || event.id, {
+            ensureMessages().set(b.messageId || event.id, {
                 channelId: b.channelId,
                 authorId: event.author
             });
@@ -310,13 +427,13 @@ export function applyEvent(state: GuildState, event: GuildEvent): GuildState {
         }
         case "REACTION_ADD": {
             const reaction = typeof bodyRecord.reaction === "string" ? bodyRecord.reaction.trim() : "";
-            const message = newState.messages.get(bodyRecord.messageId);
+            const message = state.messages.get(bodyRecord.messageId);
             if (reaction && message) {
                 const reactions = { ...(message.reactions ?? {}) };
                 const users = new Set(reactions[reaction] ?? []);
                 users.add(event.author);
                 reactions[reaction] = Array.from(users).sort();
-                newState.messages.set(bodyRecord.messageId, {
+                ensureMessages().set(bodyRecord.messageId, {
                     ...message,
                     reactions
                 });
@@ -325,7 +442,7 @@ export function applyEvent(state: GuildState, event: GuildEvent): GuildState {
         }
         case "REACTION_REMOVE": {
             const reaction = typeof bodyRecord.reaction === "string" ? bodyRecord.reaction.trim() : "";
-            const message = newState.messages.get(bodyRecord.messageId);
+            const message = state.messages.get(bodyRecord.messageId);
             if (reaction && message?.reactions?.[reaction]) {
                 const reactions = { ...message.reactions };
                 const removeUserId = typeof bodyRecord.userId === "string" && bodyRecord.userId.trim()
@@ -337,7 +454,7 @@ export function applyEvent(state: GuildState, event: GuildEvent): GuildState {
                 } else {
                     delete reactions[reaction];
                 }
-                newState.messages.set(bodyRecord.messageId, {
+                ensureMessages().set(bodyRecord.messageId, {
                     ...message,
                     reactions: Object.keys(reactions).length > 0 ? reactions : undefined
                 });
@@ -346,9 +463,9 @@ export function applyEvent(state: GuildState, event: GuildEvent): GuildState {
         }
         case "DELETE_MESSAGE": {
             const b = body as DeleteMessage;
-            const message = newState.messages.get(b.messageId);
+            const message = state.messages.get(b.messageId);
             if (message) {
-                newState.messages.set(b.messageId, {
+                ensureMessages().set(b.messageId, {
                     ...message,
                     deleted: true
                 });
@@ -359,7 +476,7 @@ export function applyEvent(state: GuildState, event: GuildEvent): GuildState {
             if (typeof bodyRecord.namespace === "string" && typeof bodyRecord.objectType === "string" && typeof bodyRecord.objectId === "string") {
                 const target = bodyRecord.target && typeof bodyRecord.target === "object" ? bodyRecord.target : undefined;
                 const key = appObjectStateKey(bodyRecord.namespace, bodyRecord.objectType, bodyRecord.objectId);
-                newState.appObjects.set(key, {
+                ensureAppObjects().set(key, {
                     namespace: bodyRecord.namespace,
                     objectType: bodyRecord.objectType,
                     objectId: bodyRecord.objectId,
@@ -374,15 +491,15 @@ export function applyEvent(state: GuildState, event: GuildEvent): GuildState {
         }
         case "APP_OBJECT_DELETE": {
             if (typeof bodyRecord.namespace === "string" && typeof bodyRecord.objectType === "string" && typeof bodyRecord.objectId === "string") {
-                newState.appObjects.delete(appObjectStateKey(bodyRecord.namespace, bodyRecord.objectType, bodyRecord.objectId));
+                ensureAppObjects().delete(appObjectStateKey(bodyRecord.namespace, bodyRecord.objectType, bodyRecord.objectId));
             }
             break;
         }
         case "EPHEMERAL_POLICY_UPDATE": {
             const b = body as EphemeralPolicyUpdate;
-            const channel = newState.channels.get(b.channelId);
+            const channel = state.channels.get(b.channelId);
             if (channel) {
-                newState.channels.set(b.channelId, {
+                ensureChannels().set(b.channelId, {
                     ...channel,
                     retention: b.retention
                 });
@@ -392,7 +509,10 @@ export function applyEvent(state: GuildState, event: GuildEvent): GuildState {
         case "MEMBER_UPDATE": {
             const b = body as MemberUpdate;
             const targetUserId = bodyRecord.userId || event.author;
-            const member: Member = newState.members.get(targetUserId) || { userId: targetUserId, roles: new Set(), joinedAt: event.createdAt };
+            const current = state.members.get(targetUserId);
+            const member: Member = current
+                ? { ...current, roles: new Set(current.roles) }
+                : { userId: targetUserId, roles: new Set(), joinedAt: event.createdAt };
             if (b.nickname !== undefined) member.nickname = b.nickname;
             if (b.avatar !== undefined) member.avatar = b.avatar;
             if (b.banner !== undefined) member.banner = b.banner;
@@ -401,7 +521,7 @@ export function applyEvent(state: GuildState, event: GuildEvent): GuildState {
             if (bodyRecord.timedOutUntil !== undefined) (member as any).timedOutUntil = bodyRecord.timedOutUntil;
             if (bodyRecord.isMuted !== undefined) (member as any).isMuted = Boolean(bodyRecord.isMuted);
             if (bodyRecord.isDeafened !== undefined) (member as any).isDeafened = Boolean(bodyRecord.isDeafened);
-            newState.members.set(targetUserId, member);
+            ensureMembers().set(targetUserId, member);
             break;
         }
         case "CHECKPOINT": {

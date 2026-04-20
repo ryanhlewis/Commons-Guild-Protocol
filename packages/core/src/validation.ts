@@ -1,7 +1,16 @@
-import { AppObjectDelete, AppObjectUpsert, ChannelCreate, DeleteMessage, EditMessage, GuildEvent, Message } from "./types";
-import { GuildState } from "./state";
+import { AppObjectDelete, AppObjectUpsert, Channel, ChannelCreate, Checkpoint, DeleteMessage, EditMessage, GuildEvent, Message } from "./types";
+import { checkpointStateRoot, GuildState, serializeState } from "./state";
 
-export type PermissionScope = "guild" | "channels" | "roles" | "messages" | "members" | "events" | "invites";
+export type PermissionScope =
+    | "guild"
+    | "channels"
+    | "roles"
+    | "messages"
+    | "members"
+    | "events"
+    | "invites"
+    | "apps"
+    | "webhooks";
 
 const ADMIN_EVENT_TYPES = new Map<string, PermissionScope>([
     ["GUILD_UPDATE", "guild"],
@@ -50,9 +59,11 @@ function assertIsMember(state: GuildState, author: string) {
 }
 
 function assertChannelExists(state: GuildState, channelId: string) {
-    if (!state.channels.has(channelId)) {
+    const channel = state.channels.get(channelId);
+    if (!channel) {
         throw new Error(`Channel ${channelId} does not exist`);
     }
+    return channel;
 }
 
 function normalizePermission(value: string) {
@@ -77,8 +88,156 @@ function permissionSetForMember(state: GuildState, author: string) {
     return permissions;
 }
 
+function channelBasePermissions(state: GuildState, author: string) {
+    const permissions = new Set<string>(["viewchannels", "sendmessages", "connect", "speak"]);
+    const member = state.members.get(author);
+
+    if (state.bans.has(author)) {
+        return new Set<string>();
+    }
+
+    if (state.access === "private" && !member) {
+        return new Set<string>();
+    }
+
+    if (state.ownerId === author) {
+        permissions.add("administrator");
+        return permissions;
+    }
+
+    for (const roleId of member?.roles ?? []) {
+        permissions.add(normalizePermission(roleId));
+        const role = state.roles.get(roleId);
+        for (const permission of role?.permissions ?? []) {
+            permissions.add(normalizePermission(permission));
+        }
+    }
+
+    return permissions;
+}
+
+function normalizedOverwritePermissions(value: unknown) {
+    if (Array.isArray(value)) {
+        return value.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0).map(normalizePermission);
+    }
+
+    if (value instanceof Set) {
+        return [...value].filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0).map(normalizePermission);
+    }
+
+    return [];
+}
+
+function applyOverwrite(permissions: Set<string>, deny: unknown, allow: unknown) {
+    for (const permission of normalizedOverwritePermissions(deny)) {
+        permissions.delete(permission);
+    }
+
+    for (const permission of normalizedOverwritePermissions(allow)) {
+        permissions.add(permission);
+    }
+}
+
+function everyoneOverwriteIds(state: GuildState) {
+    const ids = new Set<string>([state.guildId, "@everyone", "everyone"]);
+    for (const [roleId, role] of state.roles) {
+        if (role.name === "@everyone" || roleId === "@everyone" || roleId === "everyone") {
+            ids.add(roleId);
+        }
+    }
+    return ids;
+}
+
+function channelPermissionOverwrites(channel: Channel) {
+    return Array.isArray(channel.permissionOverwrites) ? channel.permissionOverwrites : [];
+}
+
+function channelPermissionsForMember(state: GuildState, channel: Channel, author: string) {
+    const permissions = channelBasePermissions(state, author);
+    if (permissions.has("administrator")) {
+        return permissions;
+    }
+
+    const overwrites = channelPermissionOverwrites(channel);
+    const everyoneIds = everyoneOverwriteIds(state);
+    const everyoneOverwrite = overwrites.find((overwrite) => overwrite.kind === "role" && everyoneIds.has(overwrite.id));
+    if (everyoneOverwrite) {
+        applyOverwrite(permissions, everyoneOverwrite.deny, everyoneOverwrite.allow);
+    }
+
+    const member = state.members.get(author);
+    if (member) {
+        const roleDeny = new Set<string>();
+        const roleAllow = new Set<string>();
+        for (const overwrite of overwrites) {
+            if (overwrite.kind !== "role" || everyoneIds.has(overwrite.id) || !member.roles.has(overwrite.id)) {
+                continue;
+            }
+            for (const permission of normalizedOverwritePermissions(overwrite.deny)) {
+                roleDeny.add(permission);
+            }
+            for (const permission of normalizedOverwritePermissions(overwrite.allow)) {
+                roleAllow.add(permission);
+            }
+        }
+        applyOverwrite(permissions, roleDeny, roleAllow);
+
+        const memberOverwrite = overwrites.find((overwrite) => overwrite.kind === "member" && overwrite.id === author);
+        if (memberOverwrite) {
+            applyOverwrite(permissions, memberOverwrite.deny, memberOverwrite.allow);
+        }
+
+        const timedOutUntil = (member as any).timedOutUntil;
+        if (typeof timedOutUntil === "string" && Date.parse(timedOutUntil) > Date.now()) {
+            permissions.delete("sendmessages");
+            permissions.delete("speak");
+        }
+    }
+
+    return permissions;
+}
+
 function hasAnyPermission(permissions: Set<string>, names: string[]) {
     return names.some((name) => permissions.has(normalizePermission(name)));
+}
+
+export function canReadGuild(state: GuildState, author?: string) {
+    if (author && state.bans.has(author)) {
+        return false;
+    }
+
+    if (state.access === "private") {
+        return Boolean(author && state.members.has(author));
+    }
+
+    return true;
+}
+
+export function canUseChannelPermission(state: GuildState, author: string | undefined, channelId: string, permission: string) {
+    const channel = state.channels.get(channelId);
+    if (!channel || !canReadGuild(state, author)) {
+        return false;
+    }
+
+    const permissions = channelPermissionsForMember(state, channel, author ?? "");
+    return hasAnyPermission(permissions, [permission]);
+}
+
+export function canViewChannel(state: GuildState, author: string | undefined, channelId: string) {
+    return canUseChannelPermission(state, author, channelId, "viewChannels");
+}
+
+function assertChannelPermission(state: GuildState, author: string, channelId: string, permission: string, action: string) {
+    const channel = assertChannelExists(state, channelId);
+    const permissions = channelPermissionsForMember(state, channel, author);
+    if (!hasAnyPermission(permissions, [permission])) {
+        throw new Error(`User ${author} does not have ${permission} permission to ${action}`);
+    }
+}
+
+function canManageMessagesInChannel(state: GuildState, author: string, channelId: string) {
+    const channel = state.channels.get(channelId);
+    return Boolean(channel && hasAnyPermission(channelPermissionsForMember(state, channel, author), ["manage_messages", "manageMessages"]));
 }
 
 export function canModerateScope(state: GuildState, author: string, scope: PermissionScope) {
@@ -104,6 +263,10 @@ export function canModerateScope(state: GuildState, author: string, scope: Permi
             return hasAnyPermission(permissions, ["manage_events", "manageEvents"]);
         case "invites":
             return hasAnyPermission(permissions, ["create_instant_invite", "createInvites", "manage_invites", "manageInvites"]);
+        case "apps":
+            return hasAnyPermission(permissions, ["manage_apps", "manageApps", "manage_integrations", "manageIntegrations"]);
+        case "webhooks":
+            return hasAnyPermission(permissions, ["manage_webhooks", "manageWebhooks"]);
         case "guild":
             return false;
     }
@@ -142,8 +305,9 @@ export function validateEvent(state: GuildState, event: GuildEvent) {
             break;
         case "REACTION_ADD":
         case "REACTION_REMOVE": {
-            assertChannelExists(state, bodyRecord.channelId);
             assertCanParticipateInGuild(state, author);
+            assertChannelPermission(state, author, bodyRecord.channelId, "viewChannels", "react in channel");
+            assertChannelPermission(state, author, bodyRecord.channelId, "sendMessages", "react in channel");
             if (typeof bodyRecord.reaction !== "string" || !bodyRecord.reaction.trim()) {
                 throw new Error(`${bodyRecord.type} requires a reaction`);
             }
@@ -158,7 +322,7 @@ export function validateEvent(state: GuildState, event: GuildEvent) {
                 bodyRecord.type === "REACTION_REMOVE" &&
                 typeof bodyRecord.userId === "string" &&
                 bodyRecord.userId !== author &&
-                !canModerateScope(state, author, "messages")
+                !canManageMessagesInChannel(state, author, bodyRecord.channelId)
             ) {
                 throw new Error(`User ${author} cannot remove another user's reaction`);
             }
@@ -166,16 +330,17 @@ export function validateEvent(state: GuildState, event: GuildEvent) {
         }
         case "MESSAGE":
             const msgBody = body as Message;
-            assertChannelExists(state, msgBody.channelId);
             assertCanParticipateInGuild(state, author);
+            assertChannelPermission(state, author, msgBody.channelId, "viewChannels", "send into channel");
+            assertChannelPermission(state, author, msgBody.channelId, "sendMessages", "send into channel");
             if (state.messages.has(msgBody.messageId || event.id)) {
                 throw new Error(`Message ${msgBody.messageId || event.id} already exists`);
             }
             break;
         case "EDIT_MESSAGE": {
             const editBody = body as EditMessage;
-            assertChannelExists(state, editBody.channelId);
             assertCanParticipateInGuild(state, author);
+            assertChannelPermission(state, author, editBody.channelId, "viewChannels", "edit in channel");
             const message = state.messages.get(editBody.messageId);
             if (!message || message.deleted) {
                 throw new Error(`Message ${editBody.messageId} does not exist`);
@@ -190,8 +355,8 @@ export function validateEvent(state: GuildState, event: GuildEvent) {
         }
         case "DELETE_MESSAGE": {
             const deleteBody = body as DeleteMessage;
-            assertChannelExists(state, deleteBody.channelId);
             assertCanParticipateInGuild(state, author);
+            assertChannelPermission(state, author, deleteBody.channelId, "viewChannels", "delete in channel");
             const message = state.messages.get(deleteBody.messageId);
             if (!message || message.deleted) {
                 throw new Error(`Message ${deleteBody.messageId} does not exist`);
@@ -199,7 +364,7 @@ export function validateEvent(state: GuildState, event: GuildEvent) {
             if (message.channelId !== deleteBody.channelId) {
                 throw new Error(`Message ${deleteBody.messageId} does not belong to channel ${deleteBody.channelId}`);
             }
-            if (message.authorId !== author && !canModerateScope(state, author, "messages")) {
+            if (message.authorId !== author && !canManageMessagesInChannel(state, author, deleteBody.channelId)) {
                 throw new Error(`User ${author} cannot delete message ${deleteBody.messageId}`);
             }
             break;
@@ -213,7 +378,7 @@ export function validateEvent(state: GuildState, event: GuildEvent) {
             }
             const channelId = appBody.channelId || appBody.target?.channelId;
             if (channelId) {
-                assertChannelExists(state, channelId);
+                assertChannelPermission(state, author, channelId, "viewChannels", "publish app object in channel");
             }
             const targetMessageId = appBody.target?.messageId;
             if (targetMessageId) {
@@ -234,6 +399,26 @@ export function validateEvent(state: GuildState, event: GuildEvent) {
             }
             assertIsMember(state, author);
             break;
+        case "CHECKPOINT": {
+            const checkpoint = body as Checkpoint;
+            if (checkpoint.seq !== event.seq) {
+                throw new Error("CHECKPOINT seq must match event seq");
+            }
+            if (checkpoint.guildId !== state.guildId) {
+                throw new Error("CHECKPOINT guildId must match current state");
+            }
+            if (checkpoint.state.guildId !== state.guildId) {
+                throw new Error("CHECKPOINT state guildId must match current state");
+            }
+            const currentRoot = checkpointStateRoot(serializeState(state));
+            if (checkpoint.rootHash !== currentRoot) {
+                throw new Error("CHECKPOINT rootHash does not match current state");
+            }
+            if (checkpointStateRoot(checkpoint.state) !== checkpoint.rootHash) {
+                throw new Error("CHECKPOINT state does not match rootHash");
+            }
+            break;
+        }
         default: {
             const adminScope = ADMIN_EVENT_TYPES.get(bodyRecord.type);
             if (adminScope) {

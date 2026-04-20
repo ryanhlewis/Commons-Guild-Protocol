@@ -9,6 +9,7 @@
         "@cgp/core": "*",
         "@cgp/relay": "*",
         "@cgp/client": "*",
+        "@cgp/bot": "*",
         "vitest": "^1.2.0"
     }
 }
