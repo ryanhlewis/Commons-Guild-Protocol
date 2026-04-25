@@ -18,6 +18,12 @@ export interface ReplaySnapshotQuery {
     limit?: number;
 }
 
+export interface EventRangeQuery {
+    guildId: GuildId;
+    afterSeq?: number;
+    limit?: number;
+}
+
 export interface MemberPageQuery {
     guildId: GuildId;
     afterUserId?: UserId;
@@ -27,6 +33,12 @@ export interface MemberPageQuery {
 export interface MemberQuery {
     guildId: GuildId;
     userId: UserId;
+}
+
+export interface MemberSearchQuery {
+    guildId: GuildId;
+    query: string;
+    limit?: number;
 }
 
 export interface MemberPage {
@@ -39,6 +51,11 @@ export interface MemberPage {
 export interface MessageRefQuery {
     guildId: GuildId;
     messageId: string;
+}
+
+export interface MessageRefsQuery {
+    guildId: GuildId;
+    messageIds: string[];
 }
 
 const DEFAULT_HISTORY_LIMIT = 100;
@@ -76,6 +93,37 @@ export function normalizeMemberPageLimit(limit: unknown) {
         return DEFAULT_MEMBER_LIMIT;
     }
     return Math.min(MAX_MEMBER_LIMIT, Math.floor(parsed));
+}
+
+function memberSearchTokens(value: unknown) {
+    if (typeof value !== "string") return [];
+    return value
+        .toLowerCase()
+        .split(/[^a-z0-9_.-]+/i)
+        .map((token) => token.trim())
+        .filter((token) => token.length > 0 && token.length <= 128);
+}
+
+function memberSearchTerms(member: SerializableMember) {
+    const terms = new Set<string>();
+    for (const value of [member.userId, member.nickname, member.bio, ...(member.roles ?? [])]) {
+        for (const token of memberSearchTokens(value)) {
+            terms.add(token);
+            if (terms.size >= 48) {
+                return terms;
+            }
+        }
+    }
+    return terms;
+}
+
+function memberMatchesSearch(member: SerializableMember, tokens: string[]) {
+    if (tokens.length === 0) return false;
+    const haystack = [member.userId, member.nickname, member.bio, ...(member.roles ?? [])]
+        .filter((value): value is string => typeof value === "string" && value.length > 0)
+        .join(" ")
+        .toLowerCase();
+    return tokens.every((token) => haystack.includes(token));
 }
 
 function eventChannelId(event: GuildEvent) {
@@ -214,16 +262,23 @@ export function selectReplaySnapshotEvents(log: GuildEvent[], query: ReplaySnaps
 
 export interface Store {
     getLog(guildId: GuildId): Promise<GuildEvent[]> | GuildEvent[];
+    iterateLog?(guildId: GuildId): AsyncIterable<GuildEvent> | Iterable<GuildEvent>;
+    getEventRange?(query: EventRangeQuery): Promise<GuildEvent[]> | GuildEvent[];
     getHistory?(query: HistoryQuery): Promise<GuildEvent[]> | GuildEvent[];
     getSearchEvents?(query: SearchEventsQuery): Promise<GuildEvent[]> | GuildEvent[];
     getReplaySnapshotEvents?(query: ReplaySnapshotQuery): Promise<GuildEvent[]> | GuildEvent[];
     getMembersPage?(query: MemberPageQuery): Promise<MemberPage> | MemberPage;
     getMember?(query: MemberQuery): Promise<SerializableMember | null> | SerializableMember | null;
+    searchMembers?(query: MemberSearchQuery): Promise<MemberPage> | MemberPage;
     getMessageRef?(query: MessageRefQuery): Promise<SerializableMessageRef | null> | SerializableMessageRef | null;
+    getMessageRefs?(query: MessageRefsQuery): Promise<Map<string, SerializableMessageRef>> | Map<string, SerializableMessageRef>;
     append(guildId: GuildId, event: GuildEvent): Promise<void> | void;
+    appendEvents?(guildId: GuildId, events: GuildEvent[]): Promise<void> | void;
     getLastEvent(guildId: GuildId): Promise<GuildEvent | undefined> | GuildEvent | undefined;
     getGuildIds(): Promise<GuildId[]> | GuildId[];
     deleteEvent(guildId: GuildId, seq: number): Promise<void> | void;
+    deleteEvents?(guildId: GuildId, seqs: number[]): Promise<void> | void;
+    compact?(query?: { start?: string; end?: string }): Promise<void> | void;
     close(): Promise<void> | void;
 }
 
@@ -232,11 +287,33 @@ export class MemoryStore implements Store {
     private channelLogs = new Map<GuildId, Map<ChannelId, GuildEvent[]>>();
     private members = new Map<GuildId, Map<UserId, SerializableMember>>();
     private memberOrder = new Map<GuildId, UserId[]>();
+    private memberSearchIndex = new Map<GuildId, Map<string, Set<UserId>>>();
+    private memberSearchOrder = new Map<GuildId, string[]>();
+    private memberSearchDocs = new Map<GuildId, Map<UserId, Set<string>>>();
     private messageRefs = new Map<GuildId, Map<string, SerializableMessageRef>>();
     private channelMessageRefs = new Map<GuildId, Map<ChannelId, Set<string>>>();
 
     getLog(guildId: GuildId): GuildEvent[] {
         return this.logs.get(guildId) || [];
+    }
+
+    *iterateLog(guildId: GuildId): Iterable<GuildEvent> {
+        yield* this.getLog(guildId);
+    }
+
+    getEventRange(query: EventRangeQuery): GuildEvent[] {
+        const limit = Math.min(10000, Math.max(1, Math.floor(Number(query.limit) || 5000)));
+        const events: GuildEvent[] = [];
+        for (const event of this.getLog(query.guildId)) {
+            if (query.afterSeq !== undefined && event.seq <= query.afterSeq) {
+                continue;
+            }
+            events.push(event);
+            if (events.length >= limit) {
+                break;
+            }
+        }
+        return events;
     }
 
     getHistory(query: HistoryQuery): GuildEvent[] {
@@ -280,22 +357,99 @@ export class MemoryStore implements Store {
         return this.members.get(query.guildId)?.get(query.userId) ?? null;
     }
 
+    searchMembers(query: MemberSearchQuery): MemberPage {
+        const limit = normalizeMemberPageLimit(query.limit);
+        const tokens = memberSearchTokens(query.query);
+        const firstToken = tokens[0];
+        if (!firstToken) {
+            return { members: [], nextCursor: null, hasMore: false };
+        }
+
+        const members = this.members.get(query.guildId) || new Map<UserId, SerializableMember>();
+        const index = this.memberSearchIndex.get(query.guildId) || new Map<string, Set<UserId>>();
+        const terms = this.memberSearchOrder.get(query.guildId) || [];
+        const seen = new Set<UserId>();
+        const matched: SerializableMember[] = [];
+
+        for (let termIndex = this.firstTermAtOrAfter(terms, firstToken); termIndex < terms.length; termIndex += 1) {
+            const term = terms[termIndex];
+            if (!term.startsWith(firstToken)) {
+                break;
+            }
+            for (const userId of index.get(term) || []) {
+                if (seen.has(userId)) {
+                    continue;
+                }
+                seen.add(userId);
+                const member = members.get(userId);
+                if (!member || !memberMatchesSearch(member, tokens)) {
+                    continue;
+                }
+                matched.push(member);
+                if (matched.length >= limit + 1) {
+                    const visible = matched.slice(0, limit);
+                    return {
+                        members: visible,
+                        nextCursor: visible.length > 0 ? visible[visible.length - 1].userId : null,
+                        hasMore: true,
+                        totalApprox: members.size
+                    };
+                }
+            }
+        }
+
+        return {
+            members: matched,
+            nextCursor: null,
+            hasMore: false,
+            totalApprox: members.size
+        };
+    }
+
     getMessageRef(query: MessageRefQuery): SerializableMessageRef | null {
         return this.messageRefs.get(query.guildId)?.get(query.messageId) ?? null;
     }
 
+    getMessageRefs(query: MessageRefsQuery): Map<string, SerializableMessageRef> {
+        const refs = new Map<string, SerializableMessageRef>();
+        const guildRefs = this.messageRefs.get(query.guildId);
+        if (!guildRefs) {
+            return refs;
+        }
+        for (const messageId of new Set(query.messageIds)) {
+            const ref = guildRefs.get(messageId);
+            if (ref) {
+                refs.set(messageId, ref);
+            }
+        }
+        return refs;
+    }
+
     append(guildId: GuildId, event: GuildEvent) {
+        this.appendEvents(guildId, [event]);
+    }
+
+    appendEvents(guildId: GuildId, events: GuildEvent[]) {
+        if (events.length === 0) {
+            return;
+        }
         const log = this.logs.get(guildId) || [];
-        log.push(event);
+        const guildChannels = this.channelLogs.get(guildId) || new Map<ChannelId, GuildEvent[]>();
+
+        for (const event of events) {
+            log.push(event);
+            for (const channelId of eventChannelIds(event)) {
+                const channelLog = guildChannels.get(channelId) || [];
+                channelLog.push(event);
+                guildChannels.set(channelId, channelLog);
+            }
+            this.applyDerivedIndexes(guildId, event);
+        }
+
         this.logs.set(guildId, log);
-        for (const channelId of eventChannelIds(event)) {
-            const guildChannels = this.channelLogs.get(guildId) || new Map<ChannelId, GuildEvent[]>();
-            const channelLog = guildChannels.get(channelId) || [];
-            channelLog.push(event);
-            guildChannels.set(channelId, channelLog);
+        if (guildChannels.size > 0) {
             this.channelLogs.set(guildId, guildChannels);
         }
-        this.applyDerivedIndexes(guildId, event);
     }
 
     getLastEvent(guildId: GuildId): GuildEvent | undefined {
@@ -309,11 +463,26 @@ export class MemoryStore implements Store {
     }
 
     deleteEvent(guildId: GuildId, seq: number) {
+        this.deleteEvents(guildId, [seq]);
+    }
+
+    deleteEvents(guildId: GuildId, seqs: number[]) {
         const log = this.logs.get(guildId);
         if (!log) return;
-        const index = log.findIndex(e => e.seq === seq);
-        if (index !== -1) {
-            log.splice(index, 1);
+        const deleteSet = new Set(seqs.filter((seq) => Number.isInteger(seq)));
+        if (deleteSet.size === 0) return;
+
+        let writeIndex = 0;
+        for (let readIndex = 0; readIndex < log.length; readIndex += 1) {
+            const event = log[readIndex];
+            if (deleteSet.has(event.seq)) {
+                continue;
+            }
+            log[writeIndex++] = event;
+        }
+
+        if (writeIndex !== log.length) {
+            log.length = writeIndex;
             this.rebuildGuildIndexes(guildId);
         }
     }
@@ -330,6 +499,9 @@ export class MemoryStore implements Store {
         const guildChannels = new Map<ChannelId, GuildEvent[]>();
         this.members.delete(guildId);
         this.memberOrder.delete(guildId);
+        this.memberSearchIndex.delete(guildId);
+        this.memberSearchOrder.delete(guildId);
+        this.memberSearchDocs.delete(guildId);
         this.messageRefs.delete(guildId);
         this.channelMessageRefs.delete(guildId);
         for (const event of this.logs.get(guildId) || []) {
@@ -359,6 +531,24 @@ export class MemoryStore implements Store {
         return order;
     }
 
+    private guildMemberSearchIndex(guildId: GuildId) {
+        const index = this.memberSearchIndex.get(guildId) || new Map<string, Set<UserId>>();
+        this.memberSearchIndex.set(guildId, index);
+        return index;
+    }
+
+    private guildMemberSearchOrder(guildId: GuildId) {
+        const order = this.memberSearchOrder.get(guildId) || [];
+        this.memberSearchOrder.set(guildId, order);
+        return order;
+    }
+
+    private guildMemberSearchDocs(guildId: GuildId) {
+        const docs = this.memberSearchDocs.get(guildId) || new Map<UserId, Set<string>>();
+        this.memberSearchDocs.set(guildId, docs);
+        return docs;
+    }
+
     private firstMemberAfter(order: UserId[], userId: UserId) {
         let low = 0;
         let high = order.length;
@@ -381,17 +571,85 @@ export class MemoryStore implements Store {
         order.splice(index, 0, userId);
     }
 
+    private firstTermAtOrAfter(order: string[], term: string) {
+        let low = 0;
+        let high = order.length;
+        while (low < high) {
+            const mid = (low + high) >> 1;
+            if (order[mid].localeCompare(term) < 0) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        return low;
+    }
+
+    private insertMemberSearchTerm(order: string[], term: string) {
+        const index = this.firstTermAtOrAfter(order, term);
+        if (order[index] === term) {
+            return;
+        }
+        order.splice(index, 0, term);
+    }
+
+    private deleteMemberSearchTerm(order: string[], term: string) {
+        const index = this.firstTermAtOrAfter(order, term);
+        if (order[index] === term) {
+            order.splice(index, 1);
+        }
+    }
+
+    private deleteMemberSearchKeys(guildId: GuildId, userId: UserId) {
+        const docs = this.guildMemberSearchDocs(guildId);
+        const previousTerms = docs.get(userId);
+        if (!previousTerms) {
+            return;
+        }
+
+        const index = this.guildMemberSearchIndex(guildId);
+        const order = this.guildMemberSearchOrder(guildId);
+        for (const term of previousTerms) {
+            const users = index.get(term);
+            if (!users) {
+                continue;
+            }
+            users.delete(userId);
+            if (users.size === 0) {
+                index.delete(term);
+                this.deleteMemberSearchTerm(order, term);
+            }
+        }
+        docs.delete(userId);
+    }
+
+    private indexMemberForSearch(guildId: GuildId, member: SerializableMember) {
+        this.deleteMemberSearchKeys(guildId, member.userId);
+        const terms = memberSearchTerms(member);
+        this.guildMemberSearchDocs(guildId).set(member.userId, terms);
+        const index = this.guildMemberSearchIndex(guildId);
+        const order = this.guildMemberSearchOrder(guildId);
+        for (const term of terms) {
+            const users = index.get(term) || new Set<UserId>();
+            users.add(member.userId);
+            index.set(term, users);
+            this.insertMemberSearchTerm(order, term);
+        }
+    }
+
     private setIndexedMember(guildId: GuildId, members: Map<UserId, SerializableMember>, member: SerializableMember) {
         if (!members.has(member.userId)) {
             this.insertMemberOrder(this.guildMemberOrder(guildId), member.userId);
         }
         members.set(member.userId, member);
+        this.indexMemberForSearch(guildId, member);
     }
 
     private deleteIndexedMember(guildId: GuildId, members: Map<UserId, SerializableMember>, userId: UserId) {
         if (!members.delete(userId)) {
             return;
         }
+        this.deleteMemberSearchKeys(guildId, userId);
         const order = this.memberOrder.get(guildId);
         if (!order) {
             return;
@@ -453,7 +711,7 @@ export class MemoryStore implements Store {
                 if (typeof body.userId !== "string" || typeof body.roleId !== "string") break;
                 const current = members.get(body.userId);
                 if (current) {
-                    members.set(body.userId, {
+                    this.setIndexedMember(guildId, members, {
                         ...current,
                         roles: current.roles.filter((roleId) => roleId !== body.roleId)
                     });
@@ -464,7 +722,7 @@ export class MemoryStore implements Store {
                 if (typeof body.roleId !== "string") break;
                 for (const [userId, member] of members) {
                     if (member.roles.includes(body.roleId)) {
-                        members.set(userId, {
+                        this.setIndexedMember(guildId, members, {
                             ...member,
                             roles: member.roles.filter((roleId) => roleId !== body.roleId)
                         });

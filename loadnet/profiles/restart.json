@@ -1,0 +1,17 @@
+{
+  "name": "restart",
+  "relays": 4,
+  "subscriberWorkers": 4,
+  "subscribersPerWorker": 50,
+  "publisherWorkers": 1,
+  "messagesPerPublisher": 2000,
+  "batchSize": 100,
+  "channels": 8,
+  "latencyMs": 45,
+  "jitterMs": 15,
+  "lossPercent": 0.05,
+  "churnEveryMs": 500,
+  "relayRestartEveryMs": 2500,
+  "relayRestartCount": 2,
+  "durationMs": 90000
+}

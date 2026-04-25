@@ -1,0 +1,15 @@
+{
+  "name": "churn",
+  "relays": 4,
+  "subscriberWorkers": 8,
+  "subscribersPerWorker": 75,
+  "publisherWorkers": 2,
+  "messagesPerPublisher": 800,
+  "batchSize": 80,
+  "channels": 8,
+  "latencyMs": 35,
+  "jitterMs": 10,
+  "lossPercent": 0.02,
+  "churnEveryMs": 250,
+  "durationMs": 60000
+}

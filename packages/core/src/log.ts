@@ -1,8 +1,14 @@
 import { hashObject } from "./crypto";
 import { GuildEvent, HashHex } from "./types";
 
-export function computeEventId(unsigned: Omit<GuildEvent, "id" | "signature">): HashHex {
-    return hashObject(unsigned);
+export function computeEventId(unsigned: Omit<GuildEvent, "id" | "signature"> | GuildEvent): HashHex {
+    return hashObject({
+        seq: unsigned.seq,
+        prevHash: unsigned.prevHash,
+        createdAt: unsigned.createdAt,
+        author: unsigned.author,
+        body: unsigned.body
+    });
 }
 
 export function validateChain(events: GuildEvent[]): boolean {

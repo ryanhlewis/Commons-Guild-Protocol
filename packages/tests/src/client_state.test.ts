@@ -3,6 +3,15 @@ import { RelayServer } from "@cgp/relay/src/server";
 import { CgpClient } from "@cgp/client/src/client";
 import * as secp from "@noble/secp256k1";
 
+async function waitFor(predicate: () => boolean, timeoutMs = 5000) {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+        if (predicate()) return;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    throw new Error("Timed out waiting for client state");
+}
+
 describe("Client State Tracking", () => {
     let relay: RelayServer;
     const PORT = 7453;
@@ -32,7 +41,7 @@ describe("Client State Tracking", () => {
 
         // 1. Create Guild
         const guildId = await client.createGuild("State Test Guild");
-        await new Promise(r => setTimeout(r, 100));
+        await waitFor(() => client.getGuildState(guildId)?.name === "State Test Guild");
 
         let state = client.getGuildState(guildId);
         expect(state).toBeDefined();
@@ -41,7 +50,7 @@ describe("Client State Tracking", () => {
 
         // 2. Create Channel
         const channelId = await client.createChannel(guildId, "general", "text");
-        await new Promise(r => setTimeout(r, 100));
+        await waitFor(() => client.getGuildState(guildId)?.channels.has(channelId) === true);
 
         state = client.getGuildState(guildId);
         expect(state?.channels.has(channelId)).toBe(true);
@@ -50,7 +59,7 @@ describe("Client State Tracking", () => {
         // 3. Assign Role
         const otherUser = "02" + "1".repeat(64); // Fake pubkey
         await client.assignRole(guildId, otherUser, "admin");
-        await new Promise(r => setTimeout(r, 100));
+        await waitFor(() => client.getGuildState(guildId)?.members.get(otherUser)?.roles.has("admin") === true);
 
         state = client.getGuildState(guildId);
         const member = state?.members.get(otherUser);
@@ -59,7 +68,7 @@ describe("Client State Tracking", () => {
 
         // 4. Ban User
         await client.banUser(guildId, otherUser, "Spam");
-        await new Promise(r => setTimeout(r, 100));
+        await waitFor(() => client.getGuildState(guildId)?.bans.has(otherUser) === true);
 
         state = client.getGuildState(guildId);
         expect(state?.bans.has(otherUser)).toBe(true);
@@ -75,7 +84,7 @@ describe("Client State Tracking", () => {
 
         const guildId = await client1.createGuild("Snapshot Guild");
         const channelId = await client1.createChannel(guildId, "snapshot-channel", "text");
-        await new Promise(r => setTimeout(r, 200));
+        await waitFor(() => client1.getGuildState(guildId)?.channels.has(channelId) === true);
 
         // Client 2 connects and subscribes
         const client2 = new CgpClient({ relays: [relayUrl] }); // Read-only
@@ -83,7 +92,7 @@ describe("Client State Tracking", () => {
 
         // Subscribe
         client2.subscribe(guildId);
-        await new Promise(r => setTimeout(r, 200));
+        await waitFor(() => client2.getGuildState(guildId)?.channels.has(channelId) === true);
 
         const state = client2.getGuildState(guildId);
         expect(state).toBeDefined();
@@ -98,7 +107,7 @@ describe("Client State Tracking", () => {
         await client.connect();
 
         const guildId = await client.createGuild("App Object Helper Guild");
-        await new Promise(r => setTimeout(r, 100));
+        await waitFor(() => client.getGuildState(guildId)?.name === "App Object Helper Guild");
 
         await client.upsertAppObject(guildId, "org.cgp.apps", "agent-profile", pubKey, {
             target: { userId: pubKey },
@@ -108,7 +117,12 @@ describe("Client State Tracking", () => {
                 agent: true
             }
         });
-        await new Promise(r => setTimeout(r, 100));
+        await waitFor(() => Array.from(client.getGuildState(guildId)?.appObjects.values() ?? []).some((object) =>
+            object.namespace === "org.cgp.apps" &&
+            object.objectType === "agent-profile" &&
+            object.objectId === pubKey &&
+            object.value?.bot === true
+        ));
 
         let state = client.getGuildState(guildId);
         expect(Array.from(state?.appObjects.values() ?? []).some((object) =>
@@ -121,7 +135,11 @@ describe("Client State Tracking", () => {
         await client.deleteAppObject(guildId, "org.cgp.apps", "agent-profile", pubKey, {
             target: { userId: pubKey }
         });
-        await new Promise(r => setTimeout(r, 100));
+        await waitFor(() => !Array.from(client.getGuildState(guildId)?.appObjects.values() ?? []).some((object) =>
+            object.namespace === "org.cgp.apps" &&
+            object.objectType === "agent-profile" &&
+            object.objectId === pubKey
+        ));
 
         state = client.getGuildState(guildId);
         expect(Array.from(state?.appObjects.values() ?? []).some((object) =>
@@ -131,5 +149,29 @@ describe("Client State Tracking", () => {
         )).toBe(false);
 
         client.close();
+    });
+
+    it("rejects stale or forked state replacement anchors", async () => {
+        const privKey = secp.utils.randomPrivateKey();
+        const pubKey = Buffer.from(secp.getPublicKey(privKey, true)).toString("hex");
+        const client = new CgpClient({ relays: [], keyPair: { pub: pubKey, priv: privKey } });
+
+        const guildId = await client.createGuild("Anchor Guild");
+        const state = client.getGuildState(guildId);
+        expect(state).toBeDefined();
+
+        expect((client as any).responseAnchorCanReplaceState(guildId, state!.headSeq, "bad-hash")).toBe(false);
+        expect((client as any).responseAnchorCanReplaceState(guildId, state!.headSeq - 1, state!.headHash)).toBe(false);
+
+        (client as any).trustedRelayHeads.set(guildId, {
+            seq: state!.headSeq + 10,
+            hash: "future-trusted-head",
+            count: 2,
+            observedAt: Date.now()
+        });
+        expect((client as any).responseAnchorCanReplaceState(guildId, state!.headSeq, state!.headHash)).toBe(true);
+
+        (client as any).state.delete(guildId);
+        expect((client as any).responseAnchorCanReplaceState(guildId, state!.headSeq, state!.headHash)).toBe(false);
     });
 });

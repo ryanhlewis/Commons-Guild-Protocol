@@ -1,0 +1,16 @@
+{
+  "name": "soak",
+  "wireFormat": "binary-v1",
+  "relays": 6,
+  "subscriberWorkers": 12,
+  "subscribersPerWorker": 250,
+  "publisherWorkers": 3,
+  "messagesPerPublisher": 10000,
+  "batchSize": 250,
+  "channels": 16,
+  "latencyMs": 45,
+  "jitterMs": 15,
+  "lossPercent": 0.05,
+  "churnEveryMs": 500,
+  "durationMs": 300000
+}

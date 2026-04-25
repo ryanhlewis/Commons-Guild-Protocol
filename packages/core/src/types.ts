@@ -333,6 +333,8 @@ export interface SerializableGuildState {
 export interface SerializableMessageRef {
     channelId: ChannelId;
     authorId: UserId;
+    eventId?: HashHex;
+    seq?: number;
     deleted?: boolean;
     reactions?: Record<string, UserId[]>;
 }
@@ -370,6 +372,23 @@ export interface ForkFrom {
     parentSeq: number;
     parentRootHash: HashHex;
     note?: string;
+}
+
+export interface RelayHeadUnsigned {
+    protocol: "cgp/0.1";
+    relayId: string;
+    relayPublicKey: PublicKeyHex;
+    guildId: GuildId;
+    headSeq: number;
+    headHash: HashHex | null;
+    prevHash: HashHex | null;
+    checkpointSeq?: number | null;
+    checkpointHash?: HashHex | null;
+    observedAt: number;
+}
+
+export interface RelayHead extends RelayHeadUnsigned {
+    signature: SignatureHex;
 }
 
 export type EventBody =

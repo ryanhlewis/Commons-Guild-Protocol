@@ -1,0 +1,138 @@
+{
+  "title": "CGP Relay",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "job",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "query": "label_values(cgp_relay_uptime_seconds, job)",
+        "current": {
+          "selected": false,
+          "text": "cgp-relay",
+          "value": "cgp-relay"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Relays Up",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(up{job=~\"$job\"})",
+          "legendFormat": "up"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Clients",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(cgp_relay_websocket_clients{job=~\"$job\"})",
+          "legendFormat": "clients"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Subscriptions",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(cgp_relay_subscriptions{job=~\"$job\"})",
+          "legendFormat": "subscriptions"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Head Conflicts",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(cgp_relay_head_conflict_guilds{job=~\"$job\"})",
+          "legendFormat": "conflict guilds"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Event Loop Delay",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [
+        {
+          "expr": "cgp_relay_event_loop_delay_p99_seconds{job=~\"$job\"}",
+          "legendFormat": "{{instance}} p99"
+        },
+        {
+          "expr": "cgp_relay_event_loop_delay_mean_seconds{job=~\"$job\"}",
+          "legendFormat": "{{instance}} mean"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Fanout Backpressure",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [
+        {
+          "expr": "cgp_relay_fanout_queued_frames{job=~\"$job\"}",
+          "legendFormat": "{{instance}} queued frames"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Hosted Guilds And Pubsub Topics",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        {
+          "expr": "cgp_relay_hosted_guilds{job=~\"$job\"}",
+          "legendFormat": "{{instance}} guilds"
+        },
+        {
+          "expr": "cgp_relay_pubsub_topics{job=~\"$job\"}",
+          "legendFormat": "{{instance}} pubsub topics"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Pubsub Pending Guilds",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [
+        {
+          "expr": "cgp_relay_pubsub_pending_guilds{job=~\"$job\"}",
+          "legendFormat": "{{instance}} pending"
+        }
+      ]
+    }
+  ]
+}

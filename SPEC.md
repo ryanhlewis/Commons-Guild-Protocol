@@ -20,6 +20,8 @@
   | ["SNAPSHOT", SnapshotFrame]       // server -> client: initial events/history page
   | ["GET_STATE", StateRequestFrame]  // client -> server: canonical state read
   | ["GET_HISTORY", HistoryRequestFrame] // client -> server: paginated history read
+  | ["GET_LOG_RANGE", LogRangeRequestFrame] // relay/client -> server: contiguous anti-entropy range
+  | ["LOG_RANGE", LogRangeFrame]       // server -> relay/client: contiguous log range
   | ["SEARCH", SearchRequestFrame]    // client -> server: permission-filtered search
   | ["SEARCH_RESULTS", SearchResultsFrame]; // server -> client: search response
 - On-chain message storage. Only optional anchoring of small hashes to external L1s.
@@ -448,7 +450,16 @@ CGP-0.1 defines a simple WebSocket-based relay protocol.
 ### 5.1 Transport
 
 * Default: WebSocket over TLS (`wss://`).
-* Frames are **JSON arrays** to keep parsing extremely simple (Ã  la Nostr).
+* Baseline frames are **JSON arrays** to keep parsing extremely simple (similar to Nostr).
+* Relays MAY negotiate `wireFormat` in `HELLO`. Supported compatible formats are:
+  * `json`: UTF-8 JSON array frames.
+  * `binary-json`: UTF-8 JSON array frames sent as binary websocket messages.
+  * `binary-v1`: compact binary envelope with a kind string and JSON payload.
+  * `binary-v2`: compact binary envelope with typed hot-path opcodes for `PUBLISH` and
+    `PUBLISH_BATCH`; all other frame kinds use a generic kind-string opcode.
+* Binary formats are transport encodings only. After parsing, the logical frame and authorization rules
+  are identical to the JSON array form. Implementations MUST NOT make core semantics depend on a
+  particular wire encoding.
 
 All frames:
 
@@ -487,6 +498,7 @@ On connection:
 ```ts
 interface HelloFrame {
   protocol: "cgp/0.1";
+  wireFormat?: "json" | "binary-json" | "binary-v1" | "binary-v2";
   clientName?: string;
   clientVersion?: string;
   auth?: {
@@ -505,6 +517,8 @@ interface HelloOkFrame {
   protocol: "cgp/0.1";
   relayName?: string;
   relayVersion?: string;
+  wireFormat?: "json" | "binary-json" | "binary-v1" | "binary-v2";
+  supportedWireFormats?: ("json" | "binary-json" | "binary-v1" | "binary-v2")[];
   features?: string[]; // e.g. ["ephemeral", "checkpoints", "directory-cache"]
   plugins?: RelayPluginDescriptor[];
 }
@@ -577,6 +591,68 @@ the durable guild log and canonical state; production relays SHOULD maintain ind
 MUST be filtered by the same guild/channel visibility checks as `SNAPSHOT`, `STATE`, and
 `GET_HISTORY`. Relays MUST NOT decrypt encrypted payloads for search; encrypted messages may only be
 matched by visible metadata unless a client/plugin supplies its own encrypted-search index.
+
+`GET_LOG_RANGE` is the native relay anti-entropy surface. It exists so self-hosted relays can repair
+from peer relays without requiring an external message bus. Responses are bounded, contiguous, and
+hash-chain-verifiable by the receiver.
+
+```ts
+interface LogRangeRequestFrame {
+  subId: string;
+  guildId: GuildId;
+  afterSeq?: number; // return events after this local sequence; -1 means genesis
+  limit?: number;    // implementation-bounded; reference relay caps at 10k
+  author?: PublicKeyHex;
+  createdAt?: number;
+  signature?: SignatureHex;
+}
+
+interface LogRangeFrame {
+  subId: string;
+  guildId: GuildId;
+  afterSeq: number;
+  events: GuildEvent[];
+  count: number;
+  hasMore: boolean;
+  nextAfterSeq: number;
+  rangeHash: HashHex; // hash of { guildId, afterSeq, eventIds }
+  endSeq: number;
+  endHash: HashHex | null;
+  checkpointSeq?: number | null;
+  checkpointHash?: HashHex | null;
+}
+```
+
+Receivers MUST verify every event id, signature, sequence, and `prevHash` before appending. If the
+local head is non-empty, the first returned event MUST have `seq = localHead.seq + 1` and
+`prevHash = localHead.id`. After sync completes, the local head MUST equal the source `endHash`.
+Relays MUST apply normal read authorization and visibility rules; operators syncing private guilds
+should sign with a key authorized to read the full guild log.
+
+When a receiver can query multiple peer relays, it SHOULD compare signed `RelayHead` responses before
+requesting log ranges and SHOULD repair only from a peer whose `headSeq`/`headHash` matches the
+configured canonical quorum. A receiver MUST NOT silently overwrite a local head that is ahead of the
+quorum or divergent at the quorum sequence.
+
+### 5.3.1 Relay pubsub and channel partitioning
+
+CGP does not require an external message bus. A single relay can sequence, store, and fan out events by
+itself. Production relay clusters SHOULD still use a durable pubsub or equivalent replicated transport
+between relay processes so live fanout and follower persistence do not depend on one process.
+
+Recommended relay-to-relay topics are:
+
+```ts
+guild:<guildId>:log                  // durable full-guild replication topic
+guild:<guildId>:channel:<channelId>  // optimized live channel fanout topic
+guild:<guildId>:heads                // signed RelayHead gossip/checkpoint topic
+```
+
+Operators MAY shard pubsub by topic hash. Topic sharding is an implementation detail: every shard MUST
+preserve per-topic order, and receivers MUST still validate event sequence, `prevHash`, signatures, and
+signed relay heads before accepting replicated data. Retained pubsub replay windows are operational
+accelerators only; durable repair still uses `GET_LOG_RANGE`, quorum head comparison, backup/restore,
+and store compaction/verification tooling.
 
 ```ts
 type SearchScope = "messages" | "channels" | "members" | "appObjects";

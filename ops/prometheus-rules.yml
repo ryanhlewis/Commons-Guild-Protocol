@@ -1,0 +1,47 @@
+groups:
+  - name: cgp-relay-slo
+    rules:
+      - alert: CgpRelayDown
+        expr: up{job=~".*cgp.*"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "CGP relay is unreachable"
+          description: "A relay scrape target has been down for more than 1 minute."
+
+      - alert: CgpRelayHighEventLoopDelay
+        expr: cgp_relay_event_loop_delay_p99_seconds > 0.25
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CGP relay event loop p99 is high"
+          description: "P99 event-loop delay is above 250ms for 5 minutes. Check CPU saturation, slow storage, or overloaded websocket fanout."
+
+      - alert: CgpRelayFanoutBackpressure
+        expr: cgp_relay_fanout_queued_frames > 10000
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CGP relay fanout queues are backing up"
+          description: "Queued websocket fanout frames stayed above 10k. Check slow consumers, network egress, and partition placement."
+
+      - alert: CgpRelayHeadConflicts
+        expr: cgp_relay_head_conflict_guilds > 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "CGP relay-head conflict evidence detected"
+          description: "At least one guild has signed relay-head conflict evidence. Preserve logs and run compare-heads before repair."
+
+      - alert: CgpRelayPubsubSubscriptionBacklog
+        expr: cgp_relay_pubsub_pending_guilds > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CGP relay has pending pubsub guild subscriptions"
+          description: "A relay has waited more than 5 minutes to establish guild pubsub subscriptions. Check pubsub reachability and repair with relay-head quorum if needed."

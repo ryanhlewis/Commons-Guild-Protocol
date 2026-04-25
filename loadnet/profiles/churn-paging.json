@@ -1,0 +1,15 @@
+{
+  "name": "churn-paging",
+  "relays": 4,
+  "subscriberWorkers": 4,
+  "subscribersPerWorker": 80,
+  "publisherWorkers": 2,
+  "messagesPerPublisher": 1500,
+  "batchSize": 150,
+  "channels": 2,
+  "latencyMs": 35,
+  "jitterMs": 10,
+  "lossPercent": 0.02,
+  "churnEveryMs": 250,
+  "durationMs": 70000
+}

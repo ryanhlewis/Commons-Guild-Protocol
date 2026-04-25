@@ -20,6 +20,32 @@ describe("State Reconstruction", () => {
     const guildId = "test_guild_id";
     const ownerId = "owner_pubkey";
 
+    it("computes canonical event ids without id or signature fields", () => {
+        const body: GuildCreate = {
+            type: "GUILD_CREATE",
+            guildId,
+            name: "Canonical ID"
+        };
+        const canonical = computeEventId({
+            seq: 0,
+            prevHash: null,
+            createdAt: 123,
+            author: ownerId,
+            body
+        });
+        const mutated = computeEventId({
+            id: "transient-id",
+            seq: 0,
+            prevHash: null,
+            createdAt: 123,
+            author: ownerId,
+            body,
+            signature: "transient-signature"
+        });
+
+        expect(mutated).toBe(canonical);
+    });
+
     it("creates initial state from GUILD_CREATE", () => {
         const body: GuildCreate = {
             type: "GUILD_CREATE",

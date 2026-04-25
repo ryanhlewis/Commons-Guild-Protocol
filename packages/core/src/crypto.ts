@@ -1,10 +1,19 @@
 import { sha256 } from "@noble/hashes/sha256";
+import { hmac } from "@noble/hashes/hmac";
 import * as secp from "@noble/secp256k1";
+import { ECDH, createPublicKey, createVerify, webcrypto } from "node:crypto";
 import stringify from "safe-stable-stringify";
 import { HashHex, PublicKeyHex, SignatureHex } from "./types";
 
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+
+if (!secp.etc.hmacSha256Sync) {
+    secp.etc.hmacSha256Sync = (key, ...msgs) => hmac(sha256, key, secp.etc.concatBytes(...msgs));
+}
+
 export function hashObject(obj: unknown): HashHex {
-    const bytes = new TextEncoder().encode(stringify(obj));
+    const bytes = textEncoder.encode(stringify(obj));
     const h = sha256(bytes);
     return Buffer.from(h).toString("hex");
 }
@@ -13,6 +22,10 @@ export async function sign(
     privKey: Uint8Array,
     msgHashHex: HashHex
 ): Promise<SignatureHex> {
+    if (typeof process !== "undefined" && Boolean(process.versions?.node)) {
+        const sig = secp.sign(msgHashHex, privKey);
+        return sig.toCompactHex();
+    }
     const sig = await secp.signAsync(msgHashHex, privKey);
     return sig.toCompactHex();
 }
@@ -29,6 +42,79 @@ export function verify(
     }
 }
 
+const secp256k1SpkiPrefix = Buffer.from("3056301006072a8648ce3d020106052b8104000a034200", "hex");
+const nativePublicKeyCache = new Map<string, ReturnType<typeof createPublicKey>>();
+const nativePublicKeyCacheLimit = 4096;
+
+function compactSignatureToDer(sigHex: string) {
+    const bytes = Buffer.from(sigHex, "hex");
+    if (bytes.length !== 64) {
+        return undefined;
+    }
+
+    const derInt = (input: Buffer) => {
+        let value = input;
+        while (value.length > 1 && value[0] === 0 && (value[1] & 0x80) === 0) {
+            value = value.subarray(1);
+        }
+        if ((value[0] & 0x80) !== 0) {
+            value = Buffer.concat([Buffer.from([0]), value]);
+        }
+        return Buffer.concat([Buffer.from([0x02, value.length]), value]);
+    };
+
+    const r = derInt(bytes.subarray(0, 32));
+    const s = derInt(bytes.subarray(32, 64));
+    return Buffer.concat([Buffer.from([0x30, r.length + s.length]), r, s]);
+}
+
+function nativeSecp256k1PublicKey(pubKeyHex: PublicKeyHex) {
+    const cached = nativePublicKeyCache.get(pubKeyHex);
+    if (cached) {
+        return cached;
+    }
+
+    const source = Buffer.from(pubKeyHex, "hex");
+    const uncompressed = source.length === 65 && source[0] === 4
+        ? source
+        : ECDH.convertKey(source, "secp256k1", undefined, undefined, "uncompressed");
+    const key = createPublicKey({
+        key: Buffer.concat([secp256k1SpkiPrefix, Buffer.from(uncompressed)]),
+        format: "der",
+        type: "spki"
+    });
+
+    nativePublicKeyCache.set(pubKeyHex, key);
+    if (nativePublicKeyCache.size > nativePublicKeyCacheLimit) {
+        const oldestKey = nativePublicKeyCache.keys().next().value;
+        if (oldestKey) {
+            nativePublicKeyCache.delete(oldestKey);
+        }
+    }
+    return key;
+}
+
+export function verifyObject(
+    pubKeyHex: PublicKeyHex,
+    obj: unknown,
+    sigHex: SignatureHex
+): boolean {
+    const canonical = stringify(obj) ?? "";
+    try {
+        const derSignature = compactSignatureToDer(sigHex);
+        if (derSignature) {
+            const verifier = createVerify("sha256");
+            verifier.update(canonical, "utf8");
+            verifier.end();
+            return verifier.verify(nativeSecp256k1PublicKey(pubKeyHex), derSignature);
+        }
+    } catch {
+        // Fall through to the portable noble verifier below.
+    }
+
+    return verify(pubKeyHex, hashObject(obj), sigHex);
+}
+
 export function getPublicKey(privKey: Uint8Array): PublicKeyHex {
     return Buffer.from(secp.getPublicKey(privKey, true)).toString("hex");
 }
@@ -40,8 +126,6 @@ export function generatePrivateKey(): Uint8Array {
 export function getSharedSecret(privKey: Uint8Array, pubKeyHex: PublicKeyHex): Uint8Array {
     return secp.getSharedSecret(privKey, pubKeyHex);
 }
-
-import { webcrypto } from "node:crypto";
 
 export async function encrypt(
     keyBytes: Uint8Array,
@@ -57,7 +141,7 @@ export async function encrypt(
     );
 
     const iv = webcrypto.getRandomValues(new Uint8Array(12));
-    const encoded = new TextEncoder().encode(plaintext);
+    const encoded = textEncoder.encode(plaintext);
 
     const encrypted = await webcrypto.subtle.encrypt(
         { name: "AES-GCM", iv },
@@ -93,7 +177,7 @@ export async function decrypt(
         encrypted
     );
 
-    return new TextDecoder().decode(decrypted);
+    return textDecoder.decode(decrypted);
 }
 
 export function generateSymmetricKey(): string {

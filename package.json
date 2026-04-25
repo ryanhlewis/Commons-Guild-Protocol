@@ -5,6 +5,18 @@
   "private": true,
   "scripts": {
     "test": "vitest run",
+    "test:fuzz": "vitest run packages/tests/src/fuzz.test.ts",
+    "security:scan": "tsx scripts/security-scan.ts",
+    "conformance:relay": "tsx scripts/conformance.ts",
+    "ci:gate": "tsx scripts/ci-gate.ts",
+    "gate:brutal": "tsx scripts/brutal-gate.ts",
+    "bench:pubsub": "tsx scripts/pubsub-wire-bench.ts",
+    "load:relay": "tsx scripts/relay-load-test.ts",
+    "load:verify": "tsx scripts/verify-load-report.ts",
+    "ops:relay": "tsx scripts/relay-ops.ts",
+    "loadnet:compose": "tsx loadnet/generate-compose.ts",
+    "loadnet:run": "tsx loadnet/run.ts",
+    "loadnet:verify": "tsx loadnet/verify-summary.ts",
     "dev:relay": "npm run dev --workspace=@cgp/relay",
     "dev:client": "npm run dev --workspace=@cgp/client"
   },
@@ -13,7 +25,7 @@
   ],
   "devDependencies": {
     "typescript": "^5.0.0",
-    "vitest": "^1.0.0",
+    "vitest": "^4.1.4",
     "@types/node": "^20.0.0"
   }
 }

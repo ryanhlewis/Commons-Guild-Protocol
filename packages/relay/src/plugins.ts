@@ -252,6 +252,7 @@ export interface RelayPlugin {
     onGetMembers?: (args: { guildId: string; author?: string; socket?: WebSocket }, ctx: RelayPluginContext) => Promise<SerializableMember[] | undefined>;
     onFrame?: (args: { socket: WebSocket; kind: string; payload: unknown }, ctx: RelayPluginContext) => boolean | Promise<boolean>;
     onHttp?: (args: RelayPluginHttpArgs, ctx: RelayPluginContext) => boolean | Promise<boolean>;
+    onEventsAppended?: (args: { events: GuildEvent[]; socket?: WebSocket }, ctx: RelayPluginContext) => void | Promise<void>;
     onEventAppended?: (args: { event: GuildEvent; socket?: WebSocket }, ctx: RelayPluginContext) => void | Promise<void>;
     onClose?: (ctx: RelayPluginContext) => void | Promise<void>;
 }
@@ -264,22 +265,30 @@ function positiveIntegerFromEnv(name: string, fallback: number) {
 }
 
 function takeRateToken(buckets: Map<string, RateBucket>, key: string, limit: number, windowMs: number) {
+    return takeRateTokens(buckets, key, limit, windowMs, 1);
+}
+
+function takeRateTokens(buckets: Map<string, RateBucket>, key: string, limit: number, windowMs: number, count: number) {
     if (limit <= 0) return true;
+    const amount = Math.max(1, Math.floor(count));
 
     const now = Date.now();
     const current = buckets.get(key);
 
     if (!current || now - current.windowStartedAt >= windowMs) {
-        buckets.set(key, { windowStartedAt: now, count: 1 });
+        if (amount > limit) {
+            return false;
+        }
+        buckets.set(key, { windowStartedAt: now, count: amount });
         pruneRateBuckets(buckets, windowMs, now);
         return true;
     }
 
-    if (current.count >= limit) {
+    if (current.count + amount > limit) {
         return false;
     }
 
-    current.count += 1;
+    current.count += amount;
     return true;
 }
 
@@ -301,8 +310,25 @@ function publishClientEventId(payload: unknown) {
         : undefined;
 }
 
+function publishBatchId(payload: unknown) {
+    return typeof (payload as { batchId?: unknown })?.batchId === "string"
+        ? (payload as { batchId: string }).batchId
+        : undefined;
+}
+
+function publishPayloads(kind: string, payload: unknown) {
+    if (kind === "PUBLISH") {
+        return [payload];
+    }
+    if (kind === "PUBLISH_BATCH") {
+        const events = (payload as { events?: unknown })?.events;
+        return Array.isArray(events) ? events : [];
+    }
+    return [];
+}
+
 function sendRateLimitError(socket: WebSocket, message: string, payload?: unknown) {
-    socket.send(JSON.stringify(["ERROR", { code: "RATE_LIMITED", message, clientEventId: publishClientEventId(payload) }]));
+    socket.send(JSON.stringify(["ERROR", { code: "RATE_LIMITED", message, clientEventId: publishClientEventId(payload), batchId: publishBatchId(payload) }]));
 }
 
 export function createRateLimitPolicyPlugin(policy: Partial<RateLimitPolicy> = {}): RelayPlugin {
@@ -325,7 +351,8 @@ export function createRateLimitPolicyPlugin(policy: Partial<RateLimitPolicy> = {
             policy: { ...resolved }
         },
         onFrame: ({ socket, kind, payload }) => {
-            if (kind !== "PUBLISH") {
+            const publishes = publishPayloads(kind, payload);
+            if (publishes.length === 0) {
                 return false;
             }
 
@@ -335,23 +362,32 @@ export function createRateLimitPolicyPlugin(policy: Partial<RateLimitPolicy> = {
                 socketIds.set(socket, socketId);
             }
 
-            if (!takeRateToken(buckets, `socket:${socketId}`, resolved.socketPublishesPerWindow, resolved.rateWindowMs)) {
+            if (!takeRateTokens(buckets, `socket:${socketId}`, resolved.socketPublishesPerWindow, resolved.rateWindowMs, publishes.length)) {
                 sendRateLimitError(socket, "Socket publish rate limit exceeded", payload);
                 return true;
             }
 
-            const publish = payload as { author?: unknown; body?: { guildId?: unknown } };
-            const author = typeof publish?.author === "string" ? publish.author : "";
-            const guildId = typeof publish?.body?.guildId === "string" ? publish.body.guildId : "";
-
-            if (author && !takeRateToken(buckets, `author:${author}`, resolved.authorPublishesPerWindow, resolved.rateWindowMs)) {
-                sendRateLimitError(socket, "Author publish rate limit exceeded", payload);
-                return true;
+            const authorCounts = new Map<string, number>();
+            const guildCounts = new Map<string, number>();
+            for (const publish of publishes as Array<{ author?: unknown; body?: { guildId?: unknown } }>) {
+                const author = typeof publish?.author === "string" ? publish.author : "";
+                const guildId = typeof publish?.body?.guildId === "string" ? publish.body.guildId : "";
+                if (author) authorCounts.set(author, (authorCounts.get(author) ?? 0) + 1);
+                if (guildId) guildCounts.set(guildId, (guildCounts.get(guildId) ?? 0) + 1);
             }
 
-            if (guildId && !takeRateToken(buckets, `guild:${guildId}`, resolved.guildPublishesPerWindow, resolved.rateWindowMs)) {
-                sendRateLimitError(socket, "Guild publish rate limit exceeded", payload);
-                return true;
+            for (const [author, count] of authorCounts) {
+                if (!takeRateTokens(buckets, `author:${author}`, resolved.authorPublishesPerWindow, resolved.rateWindowMs, count)) {
+                    sendRateLimitError(socket, "Author publish rate limit exceeded", payload);
+                    return true;
+                }
+            }
+
+            for (const [guildId, count] of guildCounts) {
+                if (!takeRateTokens(buckets, `guild:${guildId}`, resolved.guildPublishesPerWindow, resolved.rateWindowMs, count)) {
+                    sendRateLimitError(socket, "Guild publish rate limit exceeded", payload);
+                    return true;
+                }
             }
 
             return false;
@@ -389,53 +425,55 @@ export function createAbuseControlPolicyPlugin(policy: AbuseControlPolicy = {}):
             policy: { ...resolved }
         },
         onFrame: ({ socket, kind, payload }) => {
-            if (kind !== "PUBLISH") {
+            const publishes = publishPayloads(kind, payload);
+            if (publishes.length === 0) {
                 return false;
             }
 
-            const publish = payload as { author?: unknown; body?: Record<string, unknown> };
-            const author = typeof publish?.author === "string" ? publish.author : "";
-            const body = isRecord(publish?.body) ? publish.body : undefined;
-            if (!author || !body) {
-                return false;
-            }
+            for (const publish of publishes as Array<{ author?: unknown; body?: Record<string, unknown> }>) {
+                const author = typeof publish?.author === "string" ? publish.author : "";
+                const body = isRecord(publish?.body) ? publish.body : undefined;
+                if (!author || !body) {
+                    continue;
+                }
 
-            const guildId = stringField(body, "guildId");
-            const channelId = stringField(body, "channelId");
-            if (body.type === "MESSAGE") {
-                const content = stringField(body, "content");
-                if (resolved.maxMessageChars > 0 && content.length > resolved.maxMessageChars) {
-                    sendPolicyError(socket, "ABUSE_POLICY_BLOCKED", `Message content exceeds ${resolved.maxMessageChars} characters.`, payload);
-                    return true;
+                const guildId = stringField(body, "guildId");
+                const channelId = stringField(body, "channelId");
+                if (body.type === "MESSAGE") {
+                    const content = stringField(body, "content");
+                    if (resolved.maxMessageChars > 0 && content.length > resolved.maxMessageChars) {
+                        sendPolicyError(socket, "ABUSE_POLICY_BLOCKED", `Message content exceeds ${resolved.maxMessageChars} characters.`, payload);
+                        return true;
+                    }
+                    if (resolved.maxMentionsPerMessage > 0 && countMentions(content) > resolved.maxMentionsPerMessage) {
+                        sendPolicyError(socket, "ABUSE_POLICY_BLOCKED", `Message exceeds ${resolved.maxMentionsPerMessage} mentions.`, payload);
+                        return true;
+                    }
+                    if (
+                        resolved.duplicateMessagesPerWindow > 0 &&
+                        content &&
+                        !takeRateToken(
+                            duplicateBuckets,
+                            `dup:${guildId}:${channelId}:${author}:${shortContentHash(content)}`,
+                            resolved.duplicateMessagesPerWindow,
+                            resolved.windowMs
+                        )
+                    ) {
+                        sendPolicyError(socket, "ABUSE_RATE_LIMITED", "Duplicate message flood detected.", payload);
+                        return true;
+                    }
                 }
-                if (resolved.maxMentionsPerMessage > 0 && countMentions(content) > resolved.maxMentionsPerMessage) {
-                    sendPolicyError(socket, "ABUSE_POLICY_BLOCKED", `Message exceeds ${resolved.maxMentionsPerMessage} mentions.`, payload);
-                    return true;
-                }
+
                 if (
-                    resolved.duplicateMessagesPerWindow > 0 &&
-                    content &&
-                    !takeRateToken(
-                        duplicateBuckets,
-                        `dup:${guildId}:${channelId}:${author}:${shortContentHash(content)}`,
-                        resolved.duplicateMessagesPerWindow,
-                        resolved.windowMs
-                    )
+                    body.type === "APP_OBJECT_UPSERT" &&
+                    body.namespace === "org.cgp.apps" &&
+                    body.objectType === "command-invocation" &&
+                    resolved.commandInvocationsPerWindow > 0 &&
+                    !takeRateToken(commandBuckets, `command:${guildId}:${author}`, resolved.commandInvocationsPerWindow, resolved.windowMs)
                 ) {
-                    sendPolicyError(socket, "ABUSE_RATE_LIMITED", "Duplicate message flood detected.", payload);
+                    sendPolicyError(socket, "ABUSE_RATE_LIMITED", "Command invocation rate limit exceeded.", payload);
                     return true;
                 }
-            }
-
-            if (
-                body.type === "APP_OBJECT_UPSERT" &&
-                body.namespace === "org.cgp.apps" &&
-                body.objectType === "command-invocation" &&
-                resolved.commandInvocationsPerWindow > 0 &&
-                !takeRateToken(commandBuckets, `command:${guildId}:${author}`, resolved.commandInvocationsPerWindow, resolved.windowMs)
-            ) {
-                sendPolicyError(socket, "ABUSE_RATE_LIMITED", "Command invocation rate limit exceeded.", payload);
-                return true;
             }
 
             return false;
@@ -444,7 +482,7 @@ export function createAbuseControlPolicyPlugin(policy: AbuseControlPolicy = {}):
 }
 
 function sendPolicyError(socket: WebSocket, code: string, message: string, payload?: unknown) {
-    socket.send(JSON.stringify(["ERROR", { code, message, clientEventId: publishClientEventId(payload) }]));
+    socket.send(JSON.stringify(["ERROR", { code, message, clientEventId: publishClientEventId(payload), batchId: publishBatchId(payload) }]));
 }
 
 function listApplies<T extends string>(allowed: T[] | undefined, value: T | undefined) {

@@ -1,5 +1,6 @@
-import { RelayServer } from "./server";
-import type { RelayServerOptions } from "./server";
+import { LocalRelayPubSubAdapter, RelayServer } from "./server";
+import type { RelayPubSubAdapter, RelayPubSubEnvelope, RelayPubSubSubscribeOptions, RelayServerOptions, RelayWireFormat } from "./server";
+import { ShardedWebSocketRelayPubSubAdapter, WebSocketPubSubHub, WebSocketRelayPubSubAdapter } from "./pubsub_ws";
 
 import { Store, MemoryStore } from "./store";
 import { LevelStore } from "./store_level";
@@ -30,6 +31,10 @@ import type {
 
 export {
     RelayServer,
+    LocalRelayPubSubAdapter,
+    ShardedWebSocketRelayPubSubAdapter,
+    WebSocketPubSubHub,
+    WebSocketRelayPubSubAdapter,
     Store,
     MemoryStore,
     LevelStore,
@@ -53,6 +58,10 @@ export type {
     RelayPluginContext,
     RelayPluginHttpArgs,
     RateLimitPolicy,
+    RelayPubSubAdapter,
+    RelayPubSubEnvelope,
+    RelayPubSubSubscribeOptions,
+    RelayWireFormat,
     SafetyReportPolicy,
     WebhookIngressPolicy,
     RelayServerOptions
@@ -66,6 +75,8 @@ if (require.main === module) {
         const PORT = parseInt(process.env.CGP_RELAY_PORT || process.env.PORT || "7447", 10);
         const DB_PATH = process.env.CGP_RELAY_DB || "./relay-db";
         const PLUGINS_SPEC = process.env.CGP_RELAY_PLUGINS;
+        const PUBSUB_URL = process.env.CGP_RELAY_PUBSUB_URL;
+        const PUBSUB_URLS = process.env.CGP_RELAY_PUBSUB_URLS;
         // Clean database if --clean flag is passed
         if (shouldClean) {
             const fs = await import('fs');
@@ -102,7 +113,16 @@ if (require.main === module) {
             }
         }
 
-        new RelayServer(PORT, DB_PATH, plugins);
+        const pubSubUrls = (PUBSUB_URLS || PUBSUB_URL || "")
+            .split(",")
+            .map((entry) => entry.trim())
+            .filter(Boolean);
+        const pubSubAdapter = pubSubUrls.length > 1
+            ? new ShardedWebSocketRelayPubSubAdapter(pubSubUrls)
+            : pubSubUrls.length === 1
+                ? new WebSocketRelayPubSubAdapter(pubSubUrls[0])
+                : undefined;
+        new RelayServer(PORT, DB_PATH, plugins, { pubSubAdapter });
     })();
 }
 

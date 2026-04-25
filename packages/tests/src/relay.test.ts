@@ -1,10 +1,39 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { RelayServer } from "@cgp/relay/src/server"; // Import directly from src to avoid build step in dev
+import { LocalRelayPubSubAdapter, RelayServer } from "@cgp/relay/src/server"; // Import directly from src to avoid build step in dev
 import { MemoryStore } from "@cgp/relay/src/store";
+import { LevelStore } from "@cgp/relay/src/store_level";
 import { CgpClient } from "@cgp/client/src/client";
-import { hashObject, sign } from "@cgp/core";
+import { GuildEvent, computeEventId, hashObject, sign } from "@cgp/core";
 import * as secp from "@noble/secp256k1";
+import fs from "fs/promises";
 import WebSocket from "ws";
+
+class RecordingPubSubAdapter extends LocalRelayPubSubAdapter {
+    public publishedTopics: string[] = [];
+
+    publish(topic: string, envelope: any) {
+        this.publishedTopics.push(topic);
+        return super.publish(topic, envelope);
+    }
+}
+
+function testEvent(seq: number, body: any, author = "test-author"): GuildEvent {
+    const event = {
+        id: "",
+        seq,
+        prevHash: seq > 0 ? `prev-${seq}` : null,
+        createdAt: 1_700_000_000_000 + seq,
+        author,
+        body,
+        signature: `sig-${seq}`
+    } as GuildEvent;
+    event.id = computeEventId(event);
+    return event;
+}
+
+function seqKeyForTest(seq: number) {
+    return seq.toString().padStart(10, "0");
+}
 
 describe("CGP relay basic messaging", () => {
     let relay: RelayServer;
@@ -25,6 +54,32 @@ describe("CGP relay basic messaging", () => {
             await fs.rm(DB_PATH, { recursive: true, force: true });
         } catch (e) {
             console.error("Failed to cleanup test DB", e);
+        }
+    });
+
+    it("serves channel history directly from LevelStore channel indexes with marker fallback", async () => {
+        const dbPath = `./test-level-channel-index-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        const store = new LevelStore(dbPath);
+        const guildId = "guild-fast-history";
+        const channelId = "general";
+        try {
+            await (store as any).db.open();
+            await store.appendEvents(guildId, [
+                testEvent(0, { type: "GUILD_CREATE", guildId, name: "Fast History" }),
+                testEvent(1, { type: "CHANNEL_CREATE", guildId, channelId, name: "general", kind: "text" }),
+                testEvent(2, { type: "MESSAGE", guildId, channelId, messageId: "m1", content: "one" }),
+                testEvent(3, { type: "MESSAGE", guildId, channelId, messageId: "m2", content: "two" })
+            ]);
+
+            const fastHistory = await store.getHistory({ guildId, channelId, limit: 10 });
+            expect(fastHistory.map((event) => event.body.type)).toEqual(["CHANNEL_CREATE", "MESSAGE", "MESSAGE"]);
+
+            await (store as any).db.put(`guild:${guildId}:chan:${encodeURIComponent(channelId)}:seq:${seqKeyForTest(2)}`, "1");
+            const fallbackHistory = await store.getHistory({ guildId, channelId, afterSeq: 1, limit: 10 });
+            expect(fallbackHistory.map((event) => (event.body as any).messageId)).toEqual(["m1", "m2"]);
+        } finally {
+            await store.close();
+            await fs.rm(dbPath, { recursive: true, force: true });
         }
     });
 
@@ -105,6 +160,60 @@ describe("CGP relay basic messaging", () => {
         await new Promise((res) => setTimeout(res, 200));
     });
 
+    it("rejects forged live events before dedupe state is poisoned", async () => {
+        const privKey = secp.utils.randomPrivateKey();
+        const pubKey = Buffer.from(secp.getPublicKey(privKey, true)).toString("hex");
+        const client = new CgpClient({ relays: [], keyPair: { pub: pubKey, priv: privKey } });
+        const createdAt = Date.now();
+        const guildId = hashObject({ name: "forged-client-event", createdAt });
+        const body = {
+            type: "GUILD_CREATE",
+            guildId,
+            name: "Forged Client Event"
+        } as any;
+        const signature = await sign(privKey, hashObject({ body, author: pubKey, createdAt }));
+        const event: GuildEvent = {
+            id: "",
+            seq: 0,
+            prevHash: null,
+            createdAt,
+            author: pubKey,
+            body,
+            signature
+        };
+        event.id = computeEventId(event);
+
+        await (client as any).handleMessage(JSON.stringify(["EVENT", { ...event, id: hashObject("forged-id") }]));
+        await (client as any).messageQueue;
+        expect(client.getGuildState(guildId)).toBeUndefined();
+
+        await (client as any).handleMessage(JSON.stringify(["EVENT", event]));
+        await (client as any).messageQueue;
+        expect(client.getGuildState(guildId)?.guildId).toBe(guildId);
+    });
+
+    it("uses the first configured live relay as the deterministic writer", () => {
+        const client = new CgpClient({ relays: ["ws://primary", "ws://secondary"] });
+        const sentFrames: string[] = [];
+        const primary = {
+            readyState: WebSocket.OPEN,
+            send: (frame: string) => sentFrames.push(`primary:${frame}`)
+        };
+        const secondary = {
+            readyState: WebSocket.OPEN,
+            send: (frame: string) => sentFrames.push(`secondary:${frame}`)
+        };
+
+        (client as any).sockets = [secondary, primary];
+        (client as any).socketUrls = new Map([
+            [secondary, "ws://secondary"],
+            [primary, "ws://primary"]
+        ]);
+
+        expect((client as any).sendRawFrameToWriterSocket("test-frame")).toBe(true);
+        expect(sentFrames).toEqual(["primary:test-frame"]);
+    });
+
     it("serves paginated channel history snapshots", async () => {
         const privKey = secp.utils.randomPrivateKey();
         const pubKey = Buffer.from(secp.getPublicKey(privKey, true)).toString("hex");
@@ -148,6 +257,314 @@ describe("CGP relay basic messaging", () => {
 
         ws.close();
         alice.close();
+    });
+
+    it("fans out live events across relay instances through a pubsub adapter", async () => {
+        const pubSub = new LocalRelayPubSubAdapter();
+        const storeA = new MemoryStore();
+        const storeB = new MemoryStore();
+        const relayA = new RelayServer(PORT + 4, storeA, [], {
+            instanceId: "relay-pubsub-a",
+            pubSubAdapter: pubSub
+        });
+        const relayB = new RelayServer(PORT + 5, storeB, [], {
+            instanceId: "relay-pubsub-b",
+            pubSubAdapter: pubSub,
+            wireFormat: "binary-json"
+        });
+
+        const ownerPrivKey = secp.utils.randomPrivateKey();
+        const ownerPubKey = Buffer.from(secp.getPublicKey(ownerPrivKey, true)).toString("hex");
+        const owner = new CgpClient({
+            relays: [`ws://localhost:${PORT + 4}`],
+            keyPair: { pub: ownerPubKey, priv: ownerPrivKey }
+        });
+        const observer = new CgpClient({
+            relays: [`ws://localhost:${PORT + 5}`],
+            keyPair: { pub: ownerPubKey, priv: ownerPrivKey }
+        });
+
+        try {
+            await Promise.all([owner.connect(), observer.connect()]);
+            const guildId = await owner.createGuild("PubSub Guild");
+            const channelId = await owner.createChannel(guildId, "live", "text");
+            await new Promise((res) => setTimeout(res, 200));
+
+            const received: string[] = [];
+            observer.on("event", (event) => {
+                if (event.body.type === "MESSAGE") {
+                    received.push((event.body as any).content);
+                }
+            });
+            observer.subscribe(guildId);
+            await new Promise((res) => setTimeout(res, 200));
+            const replayStarted = Date.now();
+            while (storeB.getLog(guildId).length < 2 && Date.now() - replayStarted < 3000) {
+                await new Promise((res) => setTimeout(res, 50));
+            }
+
+            await owner.sendMessage(guildId, channelId, "pubsub live delivery");
+            await new Promise((res) => setTimeout(res, 1000));
+            expect(received.filter((content) => content === "pubsub live delivery")).toEqual(["pubsub live delivery"]);
+        } finally {
+            owner.close();
+            observer.close();
+            await relayA.close();
+            await relayB.close();
+            pubSub.close();
+        }
+    });
+
+    it("routes pubsub fanout through channel topics for channel-specific subscribers", async () => {
+        const pubSub = new RecordingPubSubAdapter();
+        const storeA = new MemoryStore();
+        const storeB = new MemoryStore();
+        const relayA = new RelayServer(PORT + 70, storeA, [], {
+            instanceId: "relay-channel-pubsub-a",
+            pubSubAdapter: pubSub,
+            pubSubLiveTopics: true
+        });
+        const relayB = new RelayServer(PORT + 71, storeB, [], {
+            instanceId: "relay-channel-pubsub-b",
+            pubSubAdapter: pubSub,
+            pubSubLiveTopics: true
+        });
+
+        const ownerPrivKey = secp.utils.randomPrivateKey();
+        const ownerPubKey = Buffer.from(secp.getPublicKey(ownerPrivKey, true)).toString("hex");
+        const owner = new CgpClient({
+            relays: [`ws://localhost:${PORT + 70}`],
+            keyPair: { pub: ownerPubKey, priv: ownerPrivKey }
+        });
+        let observer: WebSocket | undefined;
+
+        try {
+            await owner.connect();
+            const guildId = await owner.createGuild("Channel PubSub Guild");
+            const channelOne = await owner.createChannel(guildId, "one", "text");
+            const channelTwo = await owner.createChannel(guildId, "two", "text");
+            await new Promise((res) => setTimeout(res, 200));
+
+            observer = new WebSocket(`ws://localhost:${PORT + 71}`);
+            await new Promise<void>((resolve, reject) => {
+                observer!.once("open", () => resolve());
+                observer!.once("error", reject);
+            });
+
+            const received: string[] = [];
+            observer.on("message", (raw) => {
+                const [kind, payload] = JSON.parse(raw.toString());
+                const events = kind === "EVENT" ? [payload] : kind === "BATCH" && Array.isArray(payload) ? payload : [];
+                for (const event of events) {
+                    if (event?.body?.type === "MESSAGE") {
+                        received.push(event.body.content);
+                    }
+                }
+            });
+            observer.send(JSON.stringify(["SUB", {
+                subId: "channel-two-only",
+                guildId,
+                channels: [channelTwo]
+            }]));
+            await new Promise((res) => setTimeout(res, 200));
+            const replayStarted = Date.now();
+            while (storeB.getLog(guildId).length < 3 && Date.now() - replayStarted < 3000) {
+                await new Promise((res) => setTimeout(res, 50));
+            }
+
+            pubSub.publishedTopics = [];
+            await owner.sendMessage(guildId, channelOne, "channel one should stay local");
+            await owner.sendMessage(guildId, channelTwo, "channel two should fan out");
+            await new Promise((res) => setTimeout(res, 500));
+
+            expect(received).not.toContain("channel one should stay local");
+            expect(received).toContain("channel two should fan out");
+            expect(pubSub.publishedTopics).not.toContain(`guild:${guildId}`);
+            expect(pubSub.publishedTopics).toContain(`guild:${guildId}:log`);
+            expect(pubSub.publishedTopics).toContain(`guild:${guildId}:channels`);
+            expect(pubSub.publishedTopics).toContain(`guild:${guildId}:channel:${encodeURIComponent(channelOne)}`);
+            expect(pubSub.publishedTopics).toContain(`guild:${guildId}:channel:${encodeURIComponent(channelTwo)}`);
+        } finally {
+            observer?.close();
+            owner.close();
+            await relayA.close();
+            await relayB.close();
+            pubSub.close();
+        }
+    });
+
+    it("replicates canonical log events into independent relay stores", async () => {
+        const pubSub = new LocalRelayPubSubAdapter();
+        const storeA = new MemoryStore();
+        const storeB = new MemoryStore();
+        const relayA = new RelayServer(PORT + 80, storeA, [], {
+            instanceId: "relay-durable-a",
+            pubSubAdapter: pubSub
+        });
+        const relayB = new RelayServer(PORT + 81, storeB, [], {
+            instanceId: "relay-durable-b",
+            pubSubAdapter: pubSub
+        });
+
+        const ownerPrivKey = secp.utils.randomPrivateKey();
+        const ownerPubKey = Buffer.from(secp.getPublicKey(ownerPrivKey, true)).toString("hex");
+        const bootstrap = new CgpClient({
+            relays: [`ws://localhost:${PORT + 80}`, `ws://localhost:${PORT + 81}`],
+            keyPair: { pub: ownerPubKey, priv: ownerPrivKey }
+        });
+        const publisher = new CgpClient({
+            relays: [`ws://localhost:${PORT + 80}`],
+            keyPair: { pub: ownerPubKey, priv: ownerPrivKey }
+        });
+
+        try {
+            await bootstrap.connect();
+            const guildId = await bootstrap.createGuild("Durable PubSub Guild");
+            const channelId = await bootstrap.createChannel(guildId, "replicated", "text");
+            await new Promise((res) => setTimeout(res, 300));
+
+            await publisher.connect();
+            await publisher.publishReliable({
+                type: "MESSAGE",
+                guildId,
+                channelId,
+                messageId: `replicated-${Date.now()}`,
+                content: "durably replicated"
+            }, { timeoutMs: 5000 });
+
+            await new Promise((res) => setTimeout(res, 500));
+            const replicatedHistory = await storeB.getHistory({ guildId, channelId, limit: 10 });
+            expect(replicatedHistory.some((event) =>
+                event.body.type === "MESSAGE" && (event.body as any).content === "durably replicated"
+            )).toBe(true);
+        } finally {
+            bootstrap.close();
+            publisher.close();
+            await relayA.close();
+            await relayB.close();
+            pubSub.close();
+        }
+    });
+
+    it("delivers replicated pubsub messages exactly once to channel subscribers", async () => {
+        const pubSub = new LocalRelayPubSubAdapter();
+        const storeA = new MemoryStore();
+        const storeB = new MemoryStore();
+        const relayA = new RelayServer(PORT + 82, storeA, [], {
+            instanceId: "relay-single-delivery-a",
+            pubSubAdapter: pubSub,
+            wireFormat: "binary-v1"
+        });
+        const relayB = new RelayServer(PORT + 83, storeB, [], {
+            instanceId: "relay-single-delivery-b",
+            pubSubAdapter: pubSub,
+            wireFormat: "binary-v1"
+        });
+
+        const ownerPrivKey = secp.utils.randomPrivateKey();
+        const ownerPubKey = Buffer.from(secp.getPublicKey(ownerPrivKey, true)).toString("hex");
+        const owner = new CgpClient({
+            relays: [`ws://localhost:${PORT + 82}`],
+            keyPair: { pub: ownerPubKey, priv: ownerPrivKey }
+        });
+        const observer = new CgpClient({
+            relays: [`ws://localhost:${PORT + 83}`],
+            keyPair: { pub: ownerPubKey, priv: ownerPrivKey },
+            wireFormat: "binary-v1"
+        });
+
+        try {
+            await Promise.all([owner.connect(), observer.connect()]);
+            const guildId = await owner.createGuild("Single Delivery Guild");
+            const channelId = await owner.createChannel(guildId, "live", "text");
+            await new Promise((res) => setTimeout(res, 250));
+
+            const received: string[] = [];
+            observer.on("event", (event) => {
+                if (event.body.type === "MESSAGE") {
+                    received.push((event.body as any).content);
+                }
+            });
+            observer.subscribe(guildId);
+            await new Promise((res) => setTimeout(res, 250));
+            const replayStarted = Date.now();
+            while (storeB.getLog(guildId).length < 2 && Date.now() - replayStarted < 3000) {
+                await new Promise((res) => setTimeout(res, 50));
+            }
+
+            await owner.sendMessage(guildId, channelId, "single delivery only");
+            await new Promise((res) => setTimeout(res, 1000));
+
+            expect(received.filter((content) => content === "single delivery only")).toEqual(["single delivery only"]);
+        } finally {
+            owner.close();
+            observer.close();
+            await relayA.close();
+            await relayB.close();
+            pubSub.close();
+        }
+    });
+
+    it("catches up relay history over binary peer control reads", async () => {
+        const relayAPrivKey = Buffer.from(secp.utils.randomPrivateKey()).toString("hex");
+        const relayASeedPub = Buffer.from(secp.getPublicKey(relayAPrivKey, true)).toString("hex");
+        const relayBPrivKey = Buffer.from(secp.utils.randomPrivateKey()).toString("hex");
+        const relayBPubKey = Buffer.from(secp.getPublicKey(relayBPrivKey, true)).toString("hex");
+        const storeA = new MemoryStore();
+        const storeB = new MemoryStore();
+        const relayA = new RelayServer(PORT + 84, storeA, [], {
+            instanceId: "relay-peer-source-a",
+            relayPrivateKeyHex: relayAPrivKey,
+            trustedPeerReadPublicKeys: [relayBPubKey],
+            wireFormat: "binary-v1",
+            enableDefaultPlugins: false
+        });
+        const relayB = new RelayServer(PORT + 85, storeB, [], {
+            instanceId: "relay-peer-follower-b",
+            relayPrivateKeyHex: relayBPrivKey,
+            trustedPeerReadPublicKeys: [relayASeedPub],
+            peerUrls: [`ws://localhost:${PORT + 84}`],
+            peerCatchupIntervalMs: 0,
+            wireFormat: "binary-v1",
+            enableDefaultPlugins: false
+        });
+
+        const ownerPrivKey = secp.utils.randomPrivateKey();
+        const ownerPubKey = Buffer.from(secp.getPublicKey(ownerPrivKey, true)).toString("hex");
+        const owner = new CgpClient({
+            relays: [`ws://localhost:${PORT + 84}`],
+            keyPair: { pub: ownerPubKey, priv: ownerPrivKey },
+            wireFormat: "binary-v1"
+        });
+
+        try {
+            await owner.connect();
+            const guildId = await owner.createGuild("Binary Peer Catchup Guild");
+            const channelId = await owner.createChannel(guildId, "replicated", "text");
+            await owner.sendMessage(guildId, channelId, "binary peer catchup");
+            await new Promise((res) => setTimeout(res, 300));
+
+            await (relayB as any).requestPeerLogCatchup(guildId, 2);
+
+            let replicated = false;
+            const started = Date.now();
+            while (Date.now() - started < 5000) {
+                const history = await storeB.getHistory({ guildId, channelId, limit: 10 });
+                replicated = history.some((event) =>
+                    event.body.type === "MESSAGE" && (event.body as any).content === "binary peer catchup"
+                );
+                if (replicated) {
+                    break;
+                }
+                await new Promise((res) => setTimeout(res, 100));
+            }
+
+            expect(replicated).toBe(true);
+        } finally {
+            owner.close();
+            await relayA.close();
+            await relayB.close();
+        }
     });
 
     it("official client wraps history requests and reliable publish acknowledgements", async () => {
@@ -278,6 +695,294 @@ describe("CGP relay basic messaging", () => {
         expect(memberSearch.results.map((result) => result.userId)).toContain(ownerPubKey);
 
         owner.close();
+    });
+
+    it("accepts high-throughput batch publishes with one batch acknowledgement", async () => {
+        const ownerPrivKey = secp.utils.randomPrivateKey();
+        const ownerPubKey = Buffer.from(secp.getPublicKey(ownerPrivKey, true)).toString("hex");
+        const owner = new CgpClient({ relays: [relayUrl], keyPair: { pub: ownerPubKey, priv: ownerPrivKey } });
+        await owner.connect();
+
+        const guildId = await owner.createGuild("Batch Publish Guild");
+        const channelId = await owner.createChannel(guildId, "batch", "text");
+        await new Promise((res) => setTimeout(res, 200));
+
+        const acks = await owner.publishBatchReliable([
+            { type: "MESSAGE", guildId, channelId, messageId: `batch-1-${Date.now()}`, content: "first batch message" },
+            { type: "MESSAGE", guildId, channelId, messageId: `batch-2-${Date.now()}`, content: "second batch message" },
+            { type: "MESSAGE", guildId, channelId, messageId: `batch-3-${Date.now()}`, content: "third batch message" }
+        ]);
+
+        expect(acks).toHaveLength(3);
+        expect(acks.map((ack) => ack.seq)).toEqual([...acks.map((ack) => ack.seq)].sort((a, b) => a - b));
+        owner.close();
+    });
+
+    it("fans out batch publishes as one live batch frame", async () => {
+        const ownerPrivKey = secp.utils.randomPrivateKey();
+        const ownerPubKey = Buffer.from(secp.getPublicKey(ownerPrivKey, true)).toString("hex");
+        const owner = new CgpClient({ relays: [relayUrl], keyPair: { pub: ownerPubKey, priv: ownerPrivKey } });
+        const observer = new CgpClient({ relays: [relayUrl], keyPair: { pub: ownerPubKey, priv: ownerPrivKey } });
+        await Promise.all([owner.connect(), observer.connect()]);
+
+        const guildId = await owner.createGuild("Batch Fanout Guild");
+        const channelId = await owner.createChannel(guildId, "batch-fanout", "text");
+        await new Promise((res) => setTimeout(res, 200));
+
+        let batchFrameCount = 0;
+        const received: string[] = [];
+        observer.on("frame", (frame: any) => {
+            if (frame?.kind === "BATCH") {
+                batchFrameCount++;
+            }
+        });
+        observer.on("event", (event: GuildEvent) => {
+            if (event.body.type === "MESSAGE") {
+                received.push((event.body as any).content);
+            }
+        });
+        observer.subscribe(guildId);
+        await new Promise((res) => setTimeout(res, 200));
+
+        await owner.publishBatchReliable([
+            { type: "MESSAGE", guildId, channelId, messageId: `fanout-batch-1-${Date.now()}`, content: "fanout one" },
+            { type: "MESSAGE", guildId, channelId, messageId: `fanout-batch-2-${Date.now()}`, content: "fanout two" },
+            { type: "MESSAGE", guildId, channelId, messageId: `fanout-batch-3-${Date.now()}`, content: "fanout three" }
+        ]);
+
+        const start = Date.now();
+        while (received.length < 3 && Date.now() - start < 3000) {
+            await new Promise((res) => setTimeout(res, 50));
+        }
+
+        expect(batchFrameCount).toBeGreaterThanOrEqual(1);
+        expect(received).toEqual(expect.arrayContaining(["fanout one", "fanout two", "fanout three"]));
+        owner.close();
+        observer.close();
+    });
+
+    it("fans out mixed guild-wide and channel batches to channel-scoped subscribers", async () => {
+        const ownerPrivKey = secp.utils.randomPrivateKey();
+        const ownerPubKey = Buffer.from(secp.getPublicKey(ownerPrivKey, true)).toString("hex");
+        const owner = new CgpClient({ relays: [relayUrl], keyPair: { pub: ownerPubKey, priv: ownerPrivKey } });
+        let observer: WebSocket | undefined;
+
+        try {
+            await owner.connect();
+            const guildId = await owner.createGuild("Mixed Batch Fanout Guild");
+            const channelId = await owner.createChannel(guildId, "mixed-batch", "text");
+            await new Promise((res) => setTimeout(res, 200));
+
+            observer = new WebSocket(relayUrl);
+            await new Promise<void>((resolve, reject) => {
+                observer!.once("open", () => resolve());
+                observer!.once("error", reject);
+            });
+
+            const receivedTypes: string[] = [];
+            const receivedMessages: string[] = [];
+            observer.on("message", (raw) => {
+                const [kind, payload] = JSON.parse(raw.toString());
+                const events = kind === "EVENT" ? [payload] : kind === "BATCH" && Array.isArray(payload) ? payload : [];
+                for (const event of events) {
+                    if (!event?.body?.type) continue;
+                    receivedTypes.push(event.body.type);
+                    if (event.body.type === "MESSAGE") {
+                        receivedMessages.push(event.body.content);
+                    }
+                }
+            });
+
+            observer.send(JSON.stringify(["SUB", {
+                subId: "mixed-batch-channel-only",
+                guildId,
+                channels: [channelId]
+            }]));
+            await new Promise((res) => setTimeout(res, 200));
+            receivedTypes.length = 0;
+            receivedMessages.length = 0;
+
+            await owner.publishBatchReliable([
+                {
+                    type: "ROLE_UPSERT",
+                    guildId,
+                    roleId: `mixed-role-${Date.now()}`,
+                    name: "Mixed Role",
+                    permissions: []
+                },
+                {
+                    type: "MESSAGE",
+                    guildId,
+                    channelId,
+                    messageId: `mixed-message-${Date.now()}`,
+                    content: "mixed channel message"
+                }
+            ]);
+
+            const start = Date.now();
+            while ((receivedTypes.length < 2 || !receivedMessages.includes("mixed channel message")) && Date.now() - start < 3000) {
+                await new Promise((res) => setTimeout(res, 50));
+            }
+
+            expect(receivedTypes).toContain("ROLE_UPSERT");
+            expect(receivedMessages).toContain("mixed channel message");
+        } finally {
+            observer?.close();
+            owner.close();
+        }
+    });
+
+    it("supports binary-json wire frames for client publish and relay responses", async () => {
+        const binaryPort = PORT + 60;
+        const binaryRelay = new RelayServer(binaryPort, new MemoryStore(), [], { wireFormat: "binary-json" });
+        const ownerPrivKey = secp.utils.randomPrivateKey();
+        const ownerPubKey = Buffer.from(secp.getPublicKey(ownerPrivKey, true)).toString("hex");
+        const owner = new CgpClient({
+            relays: [`ws://localhost:${binaryPort}`],
+            keyPair: { pub: ownerPubKey, priv: ownerPrivKey },
+            wireFormat: "binary-json"
+        });
+
+        try {
+            await owner.connect();
+            const guildId = await owner.createGuild("Binary Wire Guild");
+            const channelId = await owner.createChannel(guildId, "binary", "text");
+            const ack = await owner.publishReliable({
+                type: "MESSAGE",
+                guildId,
+                channelId,
+                messageId: `binary-${Date.now()}`,
+                content: "binary wire message"
+            });
+            expect(ack.guildId).toBe(guildId);
+
+            const history = await owner.getHistory({ guildId, channelId, limit: 1 });
+            expect(history.events.map((event: any) => event.body.content)).toContain("binary wire message");
+        } finally {
+            owner.close();
+            await binaryRelay.close();
+        }
+    });
+
+    it("negotiates relay wire format per socket", async () => {
+        const port = PORT + 61;
+        const relay = new RelayServer(port, new MemoryStore(), [], { wireFormat: "json" });
+        const relayUrl = `ws://localhost:${port}`;
+        const binarySocket = new WebSocket(relayUrl);
+        const jsonSocket = new WebSocket(relayUrl);
+
+        try {
+            await Promise.all([
+                new Promise<void>((resolve, reject) => {
+                    binarySocket.once("open", () => resolve());
+                    binarySocket.once("error", reject);
+                }),
+                new Promise<void>((resolve, reject) => {
+                    jsonSocket.once("open", () => resolve());
+                    jsonSocket.once("error", reject);
+                })
+            ]);
+
+            const binaryHello = new Promise<boolean>((resolve, reject) => {
+                const timer = setTimeout(() => reject(new Error("Timed out waiting for binary HELLO_OK")), 5000);
+                binarySocket.on("message", (data, isBinary) => {
+                    const [kind] = JSON.parse(data.toString());
+                    if (kind !== "HELLO_OK") return;
+                    clearTimeout(timer);
+                    resolve(Boolean(isBinary));
+                });
+            });
+            const jsonHello = new Promise<boolean>((resolve, reject) => {
+                const timer = setTimeout(() => reject(new Error("Timed out waiting for json HELLO_OK")), 5000);
+                jsonSocket.on("message", (data, isBinary) => {
+                    const [kind] = JSON.parse(data.toString());
+                    if (kind !== "HELLO_OK") return;
+                    clearTimeout(timer);
+                    resolve(Boolean(isBinary));
+                });
+            });
+
+            binarySocket.send(Buffer.from(JSON.stringify(["HELLO", { protocol: "cgp/0.1", wireFormat: "binary-json" }]), "utf8"));
+            jsonSocket.send(JSON.stringify(["HELLO", { protocol: "cgp/0.1", wireFormat: "json" }]));
+
+            expect(await binaryHello).toBe(true);
+            expect(await jsonHello).toBe(false);
+        } finally {
+            binarySocket.close();
+            jsonSocket.close();
+            await relay.close();
+        }
+    });
+
+    it("applies relay rate limits to publish batches", async () => {
+        const limitedPort = PORT + 50;
+        const limitedRelay = new RelayServer(limitedPort, new MemoryStore(), [], {
+            rateLimitPolicy: {
+                rateWindowMs: 50,
+                socketPublishesPerWindow: 2,
+                authorPublishesPerWindow: 2,
+                guildPublishesPerWindow: 2
+            }
+        });
+        const ownerPrivKey = secp.utils.randomPrivateKey();
+        const ownerPubKey = Buffer.from(secp.getPublicKey(ownerPrivKey, true)).toString("hex");
+        const owner = new CgpClient({ relays: [`ws://localhost:${limitedPort}`], keyPair: { pub: ownerPubKey, priv: ownerPrivKey } });
+
+        try {
+            await owner.connect();
+            const guildId = await owner.createGuild("Batch Limited Guild");
+            const channelId = await owner.createChannel(guildId, "batch-limited", "text");
+            await new Promise((resolve) => setTimeout(resolve, 80));
+
+            await expect(owner.publishBatchReliable([
+                { type: "MESSAGE", guildId, channelId, messageId: `limited-batch-1-${Date.now()}`, content: "limited one" },
+                { type: "MESSAGE", guildId, channelId, messageId: `limited-batch-2-${Date.now()}`, content: "limited two" },
+                { type: "MESSAGE", guildId, channelId, messageId: `limited-batch-3-${Date.now()}`, content: "limited three" }
+            ], { timeoutMs: 1000 })).rejects.toThrow(/rate/i);
+        } finally {
+            owner.close();
+            await limitedRelay.close();
+        }
+    });
+
+    it("keeps MemoryStore member search indexed across member updates and removals", () => {
+        const store = new MemoryStore();
+        const guildId = "memory-member-search-guild";
+        const ownerId = "owner-fast-index-user";
+        const memberId = "indexed-fast-search-user";
+        const event = (seq: number, body: any, author = ownerId): GuildEvent => ({
+            id: `memory-search-${seq}`,
+            guildId,
+            seq,
+            prevHash: seq > 0 ? `memory-search-${seq - 1}` : null,
+            author,
+            signature: "test-signature",
+            createdAt: seq,
+            body
+        });
+
+        store.append(guildId, event(0, { type: "GUILD_CREATE", guildId, name: "Memory Search" }));
+        store.append(guildId, event(1, { type: "ROLE_ASSIGN", guildId, userId: memberId, roleId: "bluecrew" }));
+        store.append(guildId, event(2, {
+            type: "MEMBER_UPDATE",
+            guildId,
+            userId: memberId,
+            nickname: "Scale Operator",
+            bio: "Shard maintainer"
+        }));
+
+        expect(store.searchMembers({ guildId, query: "scale", limit: 10 }).members.map((member) => member.userId))
+            .toContain(memberId);
+        expect(store.searchMembers({ guildId, query: "blue", limit: 10 }).members.map((member) => member.userId))
+            .toContain(memberId);
+
+        store.append(guildId, event(3, { type: "ROLE_REVOKE", guildId, userId: memberId, roleId: "bluecrew" }));
+        expect(store.searchMembers({ guildId, query: "bluecrew", limit: 10 }).members.map((member) => member.userId))
+            .not.toContain(memberId);
+
+        store.append(guildId, event(4, { type: "BAN_ADD", guildId, userId: memberId, reason: "test" }));
+        expect(store.searchMembers({ guildId, query: "scale", limit: 10 }).members.map((member) => member.userId))
+            .not.toContain(memberId);
     });
 
     it("serves canonical replayed guild state snapshots", async () => {
@@ -854,6 +1559,48 @@ describe("CGP relay basic messaging", () => {
         expect(history.events.some((event: any) => event.body.content === "hidden relay history")).toBe(true);
 
         ws.close();
+        owner.close();
+    });
+
+    it("treats publish batch retries with the same batchId as idempotent", async () => {
+        const ownerPrivKey = secp.utils.randomPrivateKey();
+        const ownerPubKey = Buffer.from(secp.getPublicKey(ownerPrivKey, true)).toString("hex");
+        const owner = new CgpClient({ relays: [relayUrl], keyPair: { pub: ownerPubKey, priv: ownerPrivKey } });
+        await owner.connect();
+
+        const guildId = await owner.createGuild("Idempotent Batch Guild");
+        const channelId = await owner.createChannel(guildId, "general", "text");
+        const bodies = [
+            {
+                type: "MESSAGE",
+                guildId,
+                channelId,
+                messageId: "idempotent-0",
+                content: "retry-me-0"
+            },
+            {
+                type: "MESSAGE",
+                guildId,
+                channelId,
+                messageId: "idempotent-1",
+                content: "retry-me-1"
+            }
+        ] as any[];
+
+        const first = await owner.publishBatchReliable(bodies, { batchId: "retry-batch", timeoutMs: 20_000 });
+        const second = await owner.publishBatchReliable(bodies, { batchId: "retry-batch", timeoutMs: 20_000 });
+        expect(first).toHaveLength(2);
+        expect(second).toHaveLength(2);
+        expect(second.map((ack) => ack.seq)).toEqual(first.map((ack) => ack.seq));
+        expect(second.map((ack) => ack.eventId)).toEqual(first.map((ack) => ack.eventId));
+
+        const history = await owner.getHistory({ guildId, channelId, limit: 50 });
+        const published = history.events.filter((event: any) =>
+            event.body?.type === "MESSAGE" &&
+            (event.body?.messageId === "idempotent-0" || event.body?.messageId === "idempotent-1")
+        );
+        expect(published).toHaveLength(2);
+
         owner.close();
     });
 

@@ -1,0 +1,17 @@
+{
+  "name": "soak-long",
+  "wireFormat": "binary-v1",
+  "relays": 6,
+  "pubSubShards": 3,
+  "subscriberWorkers": 8,
+  "subscribersPerWorker": 150,
+  "publisherWorkers": 3,
+  "messagesPerPublisher": 60000,
+  "batchSize": 250,
+  "channels": 24,
+  "latencyMs": 60,
+  "jitterMs": 20,
+  "lossPercent": 0.1,
+  "churnEveryMs": 5000,
+  "durationMs": 7200000
+}

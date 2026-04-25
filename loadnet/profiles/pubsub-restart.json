@@ -1,0 +1,19 @@
+{
+  "name": "pubsub-restart",
+  "relays": 4,
+  "subscriberWorkers": 4,
+  "subscribersPerWorker": 50,
+  "publisherWorkers": 1,
+  "messagesPerPublisher": 1600,
+  "batchSize": 100,
+  "channels": 8,
+  "latencyMs": 45,
+  "jitterMs": 15,
+  "lossPercent": 0.05,
+  "churnEveryMs": 500,
+  "relayRestartEveryMs": 0,
+  "relayRestartCount": 0,
+  "pubSubRestartEveryMs": 2500,
+  "pubSubRestartCount": 2,
+  "durationMs": 90000
+}

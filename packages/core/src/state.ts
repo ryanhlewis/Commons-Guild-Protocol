@@ -421,7 +421,9 @@ export function applyEvent(state: GuildState, event: GuildEvent, options: { muta
             const b = body as Message;
             ensureMessages().set(b.messageId || event.id, {
                 channelId: b.channelId,
-                authorId: event.author
+                authorId: event.author,
+                eventId: event.id,
+                seq: event.seq
             });
             break;
         }

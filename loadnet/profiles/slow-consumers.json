@@ -1,0 +1,17 @@
+{
+  "name": "slow-consumers",
+  "relays": 4,
+  "subscriberWorkers": 8,
+  "subscribersPerWorker": 100,
+  "publisherWorkers": 2,
+  "messagesPerPublisher": 1000,
+  "batchSize": 100,
+  "channels": 8,
+  "latencyMs": 35,
+  "jitterMs": 10,
+  "lossPercent": 0.02,
+  "churnEveryMs": 0,
+  "slowConsumerPercent": 10,
+  "slowConsumerDelayMs": 250,
+  "durationMs": 75000
+}

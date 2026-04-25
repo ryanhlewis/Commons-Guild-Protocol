@@ -1,0 +1,15 @@
+{
+  "name": "smoke",
+  "relays": 3,
+  "subscriberWorkers": 4,
+  "subscribersPerWorker": 25,
+  "publisherWorkers": 1,
+  "messagesPerPublisher": 200,
+  "batchSize": 50,
+  "channels": 4,
+  "latencyMs": 25,
+  "jitterMs": 5,
+  "lossPercent": 0,
+  "churnEveryMs": 0,
+  "durationMs": 30000
+}

@@ -1,0 +1,15 @@
+{
+  "name": "1k",
+  "relays": 4,
+  "subscriberWorkers": 10,
+  "subscribersPerWorker": 100,
+  "publisherWorkers": 2,
+  "messagesPerPublisher": 1000,
+  "batchSize": 100,
+  "channels": 8,
+  "latencyMs": 40,
+  "jitterMs": 10,
+  "lossPercent": 0.05,
+  "churnEveryMs": 0,
+  "durationMs": 60000
+}

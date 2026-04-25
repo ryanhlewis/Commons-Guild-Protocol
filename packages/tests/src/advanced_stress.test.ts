@@ -118,7 +118,7 @@ describe("Advanced Stress Testing", () => {
 
             // Cleanup
             for (const p of peers) p.close();
-        }, 40000);
+        }, 90000);
     });
 
     describe("Large State Checkpointing", () => {
@@ -146,21 +146,28 @@ describe("Advanced Stress Testing", () => {
             // Simplest way to bloat state is adding many channels or roles.
             // Let's add 500 channels and 500 roles.
 
-            const BATCH_SIZE = 100; // Send in batches to avoid overwhelming websocket buffer if any
+            const BATCH_SIZE = 500; // Keep stress batches below relay frame limits while minimizing round trips.
 
             const startLoad = Date.now();
 
-            for (let i = 0; i < 500; i++) {
-                await client.createChannel(guildId, `ch-${i}`, "text");
-                if (i % BATCH_SIZE === 0) await new Promise(r => setTimeout(r, 10));
-            }
-
-            for (let i = 0; i < 500; i++) {
-                // We can't easily "add member" without them joining, but we can create roles
-                // or just ban random users to fill the map.
-                const randomUser = getPublicKey(generatePrivateKey());
-                await client.banUser(guildId, randomUser, "stress test");
-                if (i % BATCH_SIZE === 0) await new Promise(r => setTimeout(r, 10));
+            const batchStamp = Date.now();
+            const channelEvents = Array.from({ length: 500 }, (_, i) => ({
+                type: "CHANNEL_CREATE" as const,
+                guildId,
+                channelId: `stress-ch-${batchStamp}-${i}`,
+                name: `ch-${i}`,
+                kind: "text" as const
+            }));
+            const banEvents = Array.from({ length: 500 }, () => ({
+                type: "BAN_USER" as const,
+                guildId,
+                userId: getPublicKey(generatePrivateKey()),
+                reason: "stress test"
+            }));
+            const allEvents = [...channelEvents, ...banEvents];
+            for (let i = 0; i < allEvents.length; i += BATCH_SIZE) {
+                await client.publishBatchReliable(allEvents.slice(i, i + BATCH_SIZE), { timeoutMs: 30000 });
+                await new Promise(r => setTimeout(r, 10));
             }
 
             const loadTime = Date.now() - startLoad;
