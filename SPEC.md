@@ -334,7 +334,97 @@ Relays MAY advertise `cgp.apps.surface-policy` to validate these records and req
 such as `manage_apps`, `manage_integrations`, or `manage_webhooks`. Relays SHOULD NOT grant bots any
 implicit privilege merely because they declare themselves as bots or agents.
 
-### 3.3.2 Admission, posting policy, and baseline anti-abuse
+### 3.3.2 Guardian recovery app namespace
+
+Account recovery is an application-layer identity backup workflow. Core CGP relays do not issue
+accounts, hold private keys, send email/SMS, or decide who owns a user key. A client MAY use the
+`org.cgp.recovery` namespace for portable social recovery objects, but those objects are opaque app
+payloads from the relay's perspective.
+
+The reference recovery model is:
+
+* normal sign-in uses a locally cached CGP private key;
+* new-device sign-in first prefers an encrypted recovery-key backup;
+* guardian recovery reconstructs the original CGP private key only on the recovering client after
+  a threshold number of guardian approvals;
+* a single guardian MUST NOT recover the account unless the owner explicitly configured
+  `threshold: 1` and the client discloses that weaker policy.
+
+Reference object kinds:
+
+```ts
+interface RecoveryVaultObject {
+  namespace: "org.cgp.recovery";
+  objectType: "recovery-vault";
+  value: {
+    version: 1;
+    ownerPublicKey: PublicKeyHex;
+    threshold: number;
+    guardianCount: number;
+    vaultCiphertext: string;      // encrypted identity backup or share metadata
+    recoveryTopic: string;        // opaque random/topic id, not a guardian identifier
+    createdAt: number;
+  };
+}
+
+interface GuardianInviteEnvelope {
+  namespace: "org.cgp.recovery";
+  objectType: "guardian-invite";
+  value: {
+    version: 1;
+    inviteId: string;
+    ownerPublicKey: PublicKeyHex;
+    threshold: number;
+    ciphertext: string;           // encrypted to the invited guardian user's key
+  };
+}
+
+interface RecoveryRequestObject {
+  namespace: "org.cgp.recovery";
+  objectType: "recovery-request";
+  value: {
+    version: 1;
+    requestId: string;
+    accountHandle?: string;       // optional UX hint; clients should not trust it as identity proof
+    requesterSessionKey: PublicKeyHex;
+    recoveryTopic?: string;       // opaque topic derived from the accepted invite
+    pow?: string;                 // relay-local anti-abuse proof
+    createdAt: number;
+  };
+}
+
+interface GuardianApprovalEnvelope {
+  namespace: "org.cgp.recovery";
+  objectType: "guardian-approval";
+  value: {
+    version: 1;
+    requestId: string;
+    guardianPublicKey: PublicKeyHex;
+    ciphertext: string;           // encrypted to requesterSessionKey
+    createdAt: number;
+  };
+}
+```
+
+Relays and directories MUST NOT require plaintext guardian usernames, email addresses, phone
+numbers, or hashes of those identifiers in public recovery records. Username/email hashes are not a
+privacy boundary because likely guardians are enumerable. Core relays MUST NOT send recovery email
+or SMS; such delivery is an optional bridge outside the core relay trust model. Guardian invites and
+approvals SHOULD be delivered as encrypted user-to-user messages or encrypted app objects.
+
+Relay plugins MAY throttle recovery requests, require proof-of-work, coalesce duplicate requests,
+and let guardians mute recovery topics. Rejection responses SHOULD be generic so attackers cannot
+enumerate whether a handle exists, whether a guessed guardian is correct, or how many guardians have
+approved.
+
+Recovering the same CGP private key restores the user's authority and lets the client decrypt old
+pairwise DM envelopes and group-key envelopes that were wrapped to that key. If a user creates a new
+identity instead, old encrypted history remains unreadable unless another participant supplies a
+signed, verifiable transcript or re-wraps current group keys to the new identity. Plaintext copies
+resent by another participant are imports, not canonical log truth, unless the client verifies the
+original event signatures, message ids, author keys, hash-chain positions, and relay-head quorum.
+
+### 3.3.3 Admission, posting policy, and baseline anti-abuse
 
 CGP identities are self-generated public keys. The base protocol is therefore not Sybil-resistant by
 identity alone. Sybil resistance comes from guild and relay policy:
@@ -821,7 +911,11 @@ Reserved reference plugin names:
 * `cgp.relay.rate-limit`: relay-local publish buckets or equivalent anti-spam policy. This is a
   recommended reference plugin, not core CGP state.
 * `cgp.relay.abuse-controls`: relay-local flood and abuse checks for message length, mentions,
-  duplicates, and command invocation bursts. This is operational policy, not core CGP state.
+  duplicates, command invocation bursts, and guardian recovery request floods. This is operational
+  policy, not core CGP state.
+* `cgp.relay.recovery-abuse`: optional relay-local policy for `org.cgp.recovery` request
+  throttling, proof-of-work requirements, duplicate coalescing, guardian mute/block lists, and
+  generic rejection messages that avoid guardian enumeration.
 * `cgp.apps.surface-policy`: relay-local validation and permission checks for the portable
   `org.cgp.apps` namespace (`app-manifest`, `slash-command`, `command-invocation`,
   `command-response`, `webhook`, and `agent-profile`).

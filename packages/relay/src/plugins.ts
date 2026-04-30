@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "http";
+import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "crypto";
 import type { WebSocket } from "ws";
 import {
@@ -124,6 +125,10 @@ export interface AbuseControlPolicy {
      * Maximum command invocation objects per author/guild/window. Set 0 to disable. Defaults to 20.
      */
     commandInvocationsPerWindow?: number;
+    /**
+     * Maximum guardian recovery requests per author/guild/window. Set 0 to disable. Defaults to 3.
+     */
+    recoveryRequestsPerWindow?: number;
 }
 
 export interface WebhookIngressPolicy {
@@ -255,6 +260,318 @@ export interface RelayPlugin {
     onEventsAppended?: (args: { events: GuildEvent[]; socket?: WebSocket }, ctx: RelayPluginContext) => void | Promise<void>;
     onEventAppended?: (args: { event: GuildEvent; socket?: WebSocket }, ctx: RelayPluginContext) => void | Promise<void>;
     onClose?: (ctx: RelayPluginContext) => void | Promise<void>;
+}
+
+export type SandboxedPluginHook =
+    | "onInit"
+    | "onConfig"
+    | "onGetMembers"
+    | "onFrame"
+    | "onHttp"
+    | "onEventsAppended"
+    | "onEventAppended"
+    | "onClose";
+
+export interface SandboxedCommandPluginOptions {
+    name: string;
+    command: string;
+    args?: string[];
+    cwd?: string;
+    env?: Record<string, string>;
+    hooks?: SandboxedPluginHook[];
+    timeoutMs?: number;
+    maxStdoutBytes?: number;
+    maxStderrBytes?: number;
+    maxHttpBodyBytes?: number;
+    metadata?: PluginMetadata;
+    inputs?: PluginInputSchema[];
+    staticDir?: string;
+}
+
+const SANDBOX_PROTOCOL = "cgp.relay.sandboxed-plugin.v1";
+const DEFAULT_SANDBOX_HOOKS: SandboxedPluginHook[] = [
+    "onInit",
+    "onConfig",
+    "onGetMembers",
+    "onFrame",
+    "onHttp",
+    "onEventsAppended",
+    "onEventAppended",
+    "onClose"
+];
+
+export function createSandboxedCommandPlugin(options: SandboxedCommandPluginOptions): RelayPlugin {
+    const enabledHooks = new Set<SandboxedPluginHook>(options.hooks ?? DEFAULT_SANDBOX_HOOKS);
+    const plugin: RelayPlugin = {
+        name: options.name,
+        metadata: options.metadata ?? {
+            name: options.name,
+            description: "Sandboxed relay plugin executed as an isolated command.",
+            version: "1"
+        },
+        inputs: options.inputs,
+        staticDir: options.staticDir
+    };
+
+    if (enabledHooks.has("onInit")) {
+        plugin.onInit = async (ctx) => {
+            await runSandboxedPluginHook(options, "onInit", ctx, {});
+        };
+    }
+
+    if (enabledHooks.has("onConfig")) {
+        plugin.onConfig = async ({ config }, ctx) => {
+            await runSandboxedPluginHook(options, "onConfig", ctx, { config });
+        };
+    }
+
+    if (enabledHooks.has("onGetMembers")) {
+        plugin.onGetMembers = async ({ guildId, author }, ctx) => {
+            const result = await runSandboxedPluginHook(options, "onGetMembers", ctx, { guildId, author });
+            return Array.isArray(result.members) ? result.members as SerializableMember[] : undefined;
+        };
+    }
+
+    if (enabledHooks.has("onFrame")) {
+        plugin.onFrame = async ({ socket, kind, payload }, ctx) => {
+            const result = await runSandboxedPluginHook(options, "onFrame", ctx, { kind, payload });
+            const handled = booleanField(result, "handled") === true;
+            if (handled) {
+                sendSandboxedPluginErrorFrame(socket, result, payload);
+            }
+            return handled;
+        };
+    }
+
+    if (enabledHooks.has("onHttp")) {
+        plugin.onHttp = async ({ req, res, rawUrl, pathname, pathSegments }, ctx) => {
+            const body = await readSandboxedHttpBody(req, options.maxHttpBodyBytes ?? 256 * 1024);
+            const result = await runSandboxedPluginHook(options, "onHttp", ctx, {
+                method: req.method ?? "GET",
+                url: req.url ?? rawUrl,
+                rawUrl,
+                pathname,
+                pathSegments,
+                headers: sanitizeHttpHeaders(req.headers),
+                body
+            });
+            if (booleanField(result, "handled") !== true) {
+                return false;
+            }
+            writeSandboxedHttpResponse(res, result);
+            return true;
+        };
+    }
+
+    if (enabledHooks.has("onEventsAppended")) {
+        plugin.onEventsAppended = async ({ events }, ctx) => {
+            await runSandboxedPluginHook(options, "onEventsAppended", ctx, { events });
+        };
+    }
+
+    if (enabledHooks.has("onEventAppended")) {
+        plugin.onEventAppended = async ({ event }, ctx) => {
+            await runSandboxedPluginHook(options, "onEventAppended", ctx, { event });
+        };
+    }
+
+    if (enabledHooks.has("onClose")) {
+        plugin.onClose = async (ctx) => {
+            await runSandboxedPluginHook(options, "onClose", ctx, {});
+        };
+    }
+
+    return plugin;
+}
+
+async function runSandboxedPluginHook(
+    options: SandboxedCommandPluginOptions,
+    hook: SandboxedPluginHook,
+    ctx: RelayPluginContext,
+    args: Record<string, unknown>
+): Promise<Record<string, unknown>> {
+    const timeoutMs = Math.max(1, Math.floor(options.timeoutMs ?? 2000));
+    const maxStdoutBytes = Math.max(1, Math.floor(options.maxStdoutBytes ?? 1024 * 1024));
+    const maxStderrBytes = Math.max(1, Math.floor(options.maxStderrBytes ?? 64 * 1024));
+    const request = {
+        protocol: SANDBOX_PROTOCOL,
+        pluginName: options.name,
+        hook,
+        relayPublicKey: ctx.relayPublicKey,
+        args
+    };
+
+    return await new Promise<Record<string, unknown>>((resolve, reject) => {
+        const child = spawn(options.command, options.args ?? [], {
+            cwd: options.cwd,
+            env: sandboxedPluginEnv(options.env),
+            windowsHide: true,
+            stdio: ["pipe", "pipe", "pipe"]
+        });
+        let settled = false;
+        let stdout = Buffer.alloc(0);
+        let stderr = Buffer.alloc(0);
+
+        const finish = (error?: Error, result?: Record<string, unknown>) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            child.removeAllListeners();
+            child.stdout.removeAllListeners();
+            child.stderr.removeAllListeners();
+            child.stdin.removeAllListeners();
+            if (error) {
+                reject(error);
+                return;
+            }
+            resolve(result ?? {});
+        };
+
+        const timer = setTimeout(() => {
+            child.kill("SIGKILL");
+            finish(new Error(`Sandboxed plugin ${options.name} hook ${hook} timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+        timer.unref();
+
+        child.stdout.on("data", (chunk: Buffer) => {
+            if (settled) return;
+            if (stdout.length + chunk.length > maxStdoutBytes) {
+                child.kill("SIGKILL");
+                finish(new Error(`Sandboxed plugin ${options.name} hook ${hook} exceeded stdout limit`));
+                return;
+            }
+            stdout = Buffer.concat([stdout, chunk]);
+        });
+
+        child.stderr.on("data", (chunk: Buffer) => {
+            if (settled) return;
+            if (stderr.length + chunk.length > maxStderrBytes) {
+                child.kill("SIGKILL");
+                finish(new Error(`Sandboxed plugin ${options.name} hook ${hook} exceeded stderr limit`));
+                return;
+            }
+            stderr = Buffer.concat([stderr, chunk]);
+        });
+
+        child.once("error", (error) => {
+            finish(error);
+        });
+
+        child.once("close", (code, signal) => {
+            if (settled) return;
+            const stderrText = stderr.toString("utf8").trim();
+            if (code !== 0 || signal) {
+                const suffix = stderrText ? `: ${stderrText.slice(0, 500)}` : "";
+                finish(new Error(`Sandboxed plugin ${options.name} hook ${hook} failed (${signal ?? code})${suffix}`));
+                return;
+            }
+            const raw = stdout.toString("utf8").trim();
+            if (!raw) {
+                finish(undefined, {});
+                return;
+            }
+            try {
+                const parsed: unknown = JSON.parse(raw);
+                if (!isRecord(parsed)) {
+                    finish(new Error(`Sandboxed plugin ${options.name} hook ${hook} returned non-object JSON`));
+                    return;
+                }
+                finish(undefined, parsed);
+            } catch (error: any) {
+                finish(new Error(`Sandboxed plugin ${options.name} hook ${hook} returned invalid JSON: ${error?.message ?? String(error)}`));
+            }
+        });
+
+        child.stdin.once("error", (error) => {
+            finish(error);
+        });
+        child.stdin.end(JSON.stringify(request));
+    });
+}
+
+function sandboxedPluginEnv(overlay: Record<string, string> | undefined): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = {};
+    for (const key of ["PATH", "Path", "SystemRoot", "COMSPEC", "TEMP", "TMP"]) {
+        const value = process.env[key];
+        if (value !== undefined) {
+            env[key] = value;
+        }
+    }
+    env.NODE_NO_WARNINGS = process.env.NODE_NO_WARNINGS ?? "1";
+    for (const [key, value] of Object.entries(overlay ?? {})) {
+        env[key] = value;
+    }
+    return env;
+}
+
+async function readSandboxedHttpBody(req: IncomingMessage, maxBytes: number) {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for await (const chunk of req) {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        total += buffer.length;
+        if (total > maxBytes) {
+            throw new Error(`Sandboxed plugin HTTP request body exceeded ${maxBytes} bytes`);
+        }
+        chunks.push(buffer);
+    }
+    return Buffer.concat(chunks).toString("utf8");
+}
+
+function sanitizeHttpHeaders(headers: IncomingMessage["headers"]) {
+    const result: Record<string, string> = {};
+    for (const [key, value] of Object.entries(headers)) {
+        if (typeof value === "string") {
+            result[key] = value;
+        } else if (Array.isArray(value)) {
+            result[key] = value.join(", ");
+        }
+    }
+    return result;
+}
+
+function writeSandboxedHttpResponse(res: ServerResponse, result: Record<string, unknown>) {
+    const rawStatusCode = result.statusCode;
+    res.statusCode = typeof rawStatusCode === "number" && Number.isInteger(rawStatusCode) && rawStatusCode >= 100 && rawStatusCode <= 599
+        ? rawStatusCode
+        : 200;
+
+    const headers = isRecord(result.headers) ? result.headers : {};
+    for (const [key, value] of Object.entries(headers)) {
+        if (key.toLowerCase() === "content-length") {
+            continue;
+        }
+        if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+            res.setHeader(key, String(value));
+        }
+    }
+
+    const body = result.body;
+    if (body === undefined || body === null) {
+        res.end();
+        return;
+    }
+    if (typeof body === "string") {
+        res.end(body);
+        return;
+    }
+    if (!res.hasHeader("content-type")) {
+        res.setHeader("content-type", "application/json; charset=utf-8");
+    }
+    res.end(JSON.stringify(body));
+}
+
+function sendSandboxedPluginErrorFrame(socket: WebSocket, result: Record<string, unknown>, payload: unknown) {
+    const rawError = isRecord(result.error) ? result.error : isRecord(result.errorFrame) ? result.errorFrame : undefined;
+    if (!rawError) {
+        return;
+    }
+    socket.send(JSON.stringify(["ERROR", {
+        code: stringField(rawError, "code") || "SANDBOX_PLUGIN_REJECTED",
+        message: stringField(rawError, "message") || "Sandboxed plugin rejected the frame.",
+        clientEventId: publishClientEventId(payload),
+        batchId: publishBatchId(payload)
+    }]));
 }
 
 function positiveIntegerFromEnv(name: string, fallback: number) {
@@ -411,16 +728,18 @@ export function createAbuseControlPolicyPlugin(policy: AbuseControlPolicy = {}):
         maxMessageChars: Math.max(0, Math.floor(policy.maxMessageChars ?? positiveIntegerFromEnv("CGP_RELAY_MAX_MESSAGE_CHARS", 6000))),
         maxMentionsPerMessage: Math.max(0, Math.floor(policy.maxMentionsPerMessage ?? positiveIntegerFromEnv("CGP_RELAY_MAX_MENTIONS", 20))),
         duplicateMessagesPerWindow: Math.max(0, Math.floor(policy.duplicateMessagesPerWindow ?? positiveIntegerFromEnv("CGP_RELAY_DUPLICATE_MESSAGE_LIMIT", 4))),
-        commandInvocationsPerWindow: Math.max(0, Math.floor(policy.commandInvocationsPerWindow ?? positiveIntegerFromEnv("CGP_RELAY_COMMAND_INVOCATION_LIMIT", 20)))
+        commandInvocationsPerWindow: Math.max(0, Math.floor(policy.commandInvocationsPerWindow ?? positiveIntegerFromEnv("CGP_RELAY_COMMAND_INVOCATION_LIMIT", 20))),
+        recoveryRequestsPerWindow: Math.max(0, Math.floor(policy.recoveryRequestsPerWindow ?? positiveIntegerFromEnv("CGP_RELAY_RECOVERY_REQUEST_LIMIT", 3)))
     };
     const duplicateBuckets = new Map<string, RateBucket>();
     const commandBuckets = new Map<string, RateBucket>();
+    const recoveryBuckets = new Map<string, RateBucket>();
 
     return {
         name: "cgp.relay.abuse-controls",
         metadata: {
             name: "Reference abuse controls",
-            description: "Relay-local anti-spam policy for message length, mention storms, duplicate floods, and command invocation bursts.",
+            description: "Relay-local anti-spam policy for message length, mention storms, duplicate floods, command bursts, and recovery request floods.",
             version: "1",
             policy: { ...resolved }
         },
@@ -473,6 +792,20 @@ export function createAbuseControlPolicyPlugin(policy: AbuseControlPolicy = {}):
                 ) {
                     sendPolicyError(socket, "ABUSE_RATE_LIMITED", "Command invocation rate limit exceeded.", payload);
                     return true;
+                }
+
+                if (
+                    body.type === "APP_OBJECT_UPSERT" &&
+                    body.namespace === "org.cgp.recovery" &&
+                    body.objectType === "recovery-request" &&
+                    resolved.recoveryRequestsPerWindow > 0
+                ) {
+                    const target = isRecord(body.value) ? stringField(body.value, "recoveryTopic") || stringField(body.value, "accountHandle") : "";
+                    const bucketKey = `recovery:${guildId}:${author}:${target || "generic"}`;
+                    if (!takeRateToken(recoveryBuckets, bucketKey, resolved.recoveryRequestsPerWindow, resolved.windowMs)) {
+                        sendPolicyError(socket, "ABUSE_RATE_LIMITED", "Recovery request rate limit exceeded.", payload);
+                        return true;
+                    }
                 }
             }
 
@@ -649,33 +982,35 @@ export function createEncryptionPolicyPlugin(policy: EncryptionPolicy = {}): Rel
             policy: { ...resolved }
         },
         onFrame: ({ socket, kind, payload }) => {
-            if (kind !== "PUBLISH") {
+            const publishes = publishPayloads(kind, payload);
+            if (publishes.length === 0) {
                 return false;
             }
 
-            const publish = payload as { body?: { type?: unknown; guildId?: unknown; channelId?: unknown; encrypted?: unknown; iv?: unknown; content?: unknown } };
-            const body = publish?.body;
-            if (body?.type !== "MESSAGE") {
-                return false;
-            }
+            for (const publish of publishes as Array<{ body?: { type?: unknown; guildId?: unknown; channelId?: unknown; encrypted?: unknown; iv?: unknown; content?: unknown } }>) {
+                const body = publish?.body;
+                if (body?.type !== "MESSAGE") {
+                    continue;
+                }
 
-            const guildId = typeof body.guildId === "string" ? body.guildId : undefined;
-            const channelId = typeof body.channelId === "string" ? body.channelId : undefined;
-            if (!listApplies(resolved.guildIds, guildId) || !listApplies(resolved.channelIds, channelId)) {
-                return false;
-            }
+                const guildId = typeof body.guildId === "string" ? body.guildId : undefined;
+                const channelId = typeof body.channelId === "string" ? body.channelId : undefined;
+                if (!listApplies(resolved.guildIds, guildId) || !listApplies(resolved.channelIds, channelId)) {
+                    continue;
+                }
 
-            const isEncrypted = body.encrypted === true;
-            if (isEncrypted && !resolved.allowEncryptedMessages) {
-                sendPolicyError(socket, "ENCRYPTED_PAYLOAD_REJECTED", "This relay does not accept encrypted message payloads for this guild/channel.", payload);
-                return true;
-            }
-
-            if (resolved.requireEncryptedMessages) {
-                const hasEnvelope = isEncrypted && typeof body.iv === "string" && body.iv.length > 0 && typeof body.content === "string" && body.content.length > 0;
-                if (!hasEnvelope) {
-                    sendPolicyError(socket, "ENCRYPTION_REQUIRED", "This relay requires encrypted message payloads for this guild/channel.", payload);
+                const isEncrypted = body.encrypted === true;
+                if (isEncrypted && !resolved.allowEncryptedMessages) {
+                    sendPolicyError(socket, "ENCRYPTED_PAYLOAD_REJECTED", "This relay does not accept encrypted message payloads for this guild/channel.", payload);
                     return true;
+                }
+
+                if (resolved.requireEncryptedMessages) {
+                    const hasEnvelope = isEncrypted && typeof body.iv === "string" && body.iv.length > 0 && typeof body.content === "string" && body.content.length > 0;
+                    if (!hasEnvelope) {
+                        sendPolicyError(socket, "ENCRYPTION_REQUIRED", "This relay requires encrypted message payloads for this guild/channel.", payload);
+                        return true;
+                    }
                 }
             }
 

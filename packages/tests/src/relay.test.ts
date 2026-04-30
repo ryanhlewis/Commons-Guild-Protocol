@@ -263,24 +263,26 @@ describe("CGP relay basic messaging", () => {
         const pubSub = new LocalRelayPubSubAdapter();
         const storeA = new MemoryStore();
         const storeB = new MemoryStore();
-        const relayA = new RelayServer(PORT + 4, storeA, [], {
+        const relayA = new RelayServer(0, storeA, [], {
             instanceId: "relay-pubsub-a",
             pubSubAdapter: pubSub
         });
-        const relayB = new RelayServer(PORT + 5, storeB, [], {
+        const relayB = new RelayServer(0, storeB, [], {
             instanceId: "relay-pubsub-b",
             pubSubAdapter: pubSub,
             wireFormat: "binary-json"
         });
+        const relayAUrl = `ws://localhost:${relayA.getPort()}`;
+        const relayBUrl = `ws://localhost:${relayB.getPort()}`;
 
         const ownerPrivKey = secp.utils.randomPrivateKey();
         const ownerPubKey = Buffer.from(secp.getPublicKey(ownerPrivKey, true)).toString("hex");
         const owner = new CgpClient({
-            relays: [`ws://localhost:${PORT + 4}`],
+            relays: [relayAUrl],
             keyPair: { pub: ownerPubKey, priv: ownerPrivKey }
         });
         const observer = new CgpClient({
-            relays: [`ws://localhost:${PORT + 5}`],
+            relays: [relayBUrl],
             keyPair: { pub: ownerPubKey, priv: ownerPrivKey }
         });
 

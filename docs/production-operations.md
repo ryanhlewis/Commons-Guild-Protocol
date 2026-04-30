@@ -65,6 +65,13 @@ npm run ops:relay -- backup-jsonl --db ./relay-db --output ./backup/relay.jsonl
 npm run ops:relay -- restore-jsonl --db ./relay-db-restored --input ./backup/relay.jsonl
 ```
 
+Run the local operational drill before deploying relay changes. It exercises durable backup/restore,
+health/readiness/metrics endpoints, failover repair paths, and sandboxed plugin rejection behavior:
+
+```bash
+npm run ops:drill
+```
+
 Compare signed heads across peers:
 
 ```bash
@@ -84,6 +91,18 @@ npm run ops:relay -- sync-from-relay --db ./relay-db --guild <guild-id> --relay 
 ```
 
 Never silently repair over a local head that is ahead of quorum or divergent at the quorum sequence. Preserve the DB and signed head evidence for incident response.
+
+## Plugin Isolation
+
+Trusted built-in plugins may run in-process. Untrusted or community plugins should be wrapped with
+`createSandboxedCommandPlugin`, which invokes a separate command per hook over the
+`cgp.relay.sandboxed-plugin.v1` JSON protocol.
+
+The sandbox adapter passes only sanitized hook arguments plus the relay public key. It does not pass
+the relay store, live `WebSocket`, HTTP response object, or publish/broadcast functions. Operators
+should still run the command under an OS/container sandbox when filesystem or network isolation is
+required; the relay wrapper enforces process separation, bounded stdout/stderr, HTTP body limits, and
+timeouts.
 
 ## Soak And Release Gates
 

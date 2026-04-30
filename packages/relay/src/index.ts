@@ -12,6 +12,7 @@ import {
     createProofOfWorkPolicyPlugin,
     createRateLimitPolicyPlugin,
     createSafetyReportPlugin,
+    createSandboxedCommandPlugin,
     createWebhookIngressPlugin
 } from "./plugins";
 import type {
@@ -26,6 +27,8 @@ import type {
     RelayPluginHttpArgs,
     RateLimitPolicy,
     SafetyReportPolicy,
+    SandboxedCommandPluginOptions,
+    SandboxedPluginHook,
     WebhookIngressPolicy
 } from "./plugins";
 
@@ -45,6 +48,7 @@ export {
     createProofOfWorkPolicyPlugin,
     createRateLimitPolicyPlugin,
     createSafetyReportPlugin,
+    createSandboxedCommandPlugin,
     createWebhookIngressPlugin
 };
 export type {
@@ -63,6 +67,8 @@ export type {
     RelayPubSubSubscribeOptions,
     RelayWireFormat,
     SafetyReportPolicy,
+    SandboxedCommandPluginOptions,
+    SandboxedPluginHook,
     WebhookIngressPolicy,
     RelayServerOptions
 };

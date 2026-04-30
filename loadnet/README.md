@@ -40,6 +40,14 @@ Results are written into `loadnet/results/summary-*.json`.
 
 Compose generation clears `loadnet/run-data` by default so stale readiness or metrics files cannot contaminate a run. Pass `--keep-data` only when intentionally inspecting an old run directory.
 
+## Call Verification Smoke
+
+Hollow call signaling has a focused relay/loadnet smoke that runs in-process with two relay nodes and shared pubsub. It publishes the same `CALL_EVENT` envelope the app emits for DM calls, guild voice rooms, guest invite joins, and reconnect history backfill.
+
+```powershell
+npm run loadnet:call-verification
+```
+
 ## Profiles
 
 Profiles live in `loadnet/profiles`.

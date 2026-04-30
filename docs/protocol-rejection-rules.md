@@ -100,11 +100,33 @@ Plugins may reject otherwise valid events for local policy. Examples include:
 - rate-limit policy
 - proof-of-work or proof-of-compression policy
 - invite-abuse policy
+- guardian recovery request-abuse policy
 - media quota policy
 - raid-mode policy
 - jurisdictional or community moderation policy
 
 Plugin rejections must be explicit policy failures. They must not mutate canonical event identity, sequence rules, hash-chain rules, or signature rules.
+
+Relays that load untrusted plugin policy should prefer the sandboxed command plugin adapter. A
+sandboxed plugin may return an explicit `ERROR` frame for rejected client frames, but it receives
+only JSON hook inputs and cannot directly mutate relay storage or canonical sequencing state.
+
+## Guardian Recovery Abuse Rejection
+
+Guardian recovery is app-layer social recovery, not relay-side account custody. Relays may accept
+opaque `org.cgp.recovery` objects, but they should reject recovery traffic when:
+
+- a public recovery record contains plaintext guardian usernames, email addresses, phone numbers, or hashes of those identifiers
+- a request omits the relay's required proof-of-work or anti-abuse token
+- a handle, requester key, guardian hint, recovery topic, or source network exceeds the relay's recovery request budget
+- repeated requests are not coalesced into an existing pending notification
+- the target guardian has muted, blocked, or paused recovery notifications for that topic
+- the object tries to store a private key, plaintext guardian share, password, email token, or relay-readable recovery secret
+
+Recovery rejection responses should be generic. A relay should not reveal whether the account handle
+exists, whether the guardian hint was correct, whether a guardian has approved, or which approvals
+are still missing. Guardian identities belong in encrypted recovery policy or client UI, not in an
+enumeration oracle.
 
 ## Recovery and Repair
 
