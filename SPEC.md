@@ -1039,6 +1039,21 @@ client-defined encrypted envelopes. The relay validates only event shape and per
 media keys, thumbnails, and attachment decryption UX are application-layer responsibilities unless a relay
 advertises an optional media/security plugin.
 
+Media storage is intentionally provider-routed instead of assumed to be relay-local. A relay MAY advertise
+media placement policy through a plugin, including providers such as IPFS pinning endpoints, HTTPS object
+storage, relay-local caches, or application-specific archives. Provider records can declare accepted MIME
+classes, tags, maximum sizes, retention mode, adult-content policy, encryption requirements, and a human
+mission such as "meme archive" or "anime art host". Clients should request an upload intent before attaching
+large media, then store only a durable locator and provider metadata in the CGP event. By default, relays
+should treat media bytes as out-of-log data; the append-only CGP log stores the message, hashes, policy
+metadata, and retrieval hints, not the blob itself.
+
+IPFS-like providers are content-addressed pinning/storage operators, not a guarantee that every node stores
+every object. A provider can pin only the classes it chooses to host, reject classes it does not want, charge
+for retention, or operate as a best-effort cache. Clients must tolerate provider disappearance by keeping
+local copies until upload verification succeeds, preferring encrypted media for private content, and allowing
+the guild or author to re-pin to another provider without rewriting the historical message event.
+
 Metadata privacy requires additional client/relay extensions. Recommended mitigations include TLS,
 Tor/I2P/proxy transports, subscribing to broader guild snapshots and filtering locally, batching
 subscriptions, padding event sizes, delaying publishes, pseudonymous per-guild keys, and private directory

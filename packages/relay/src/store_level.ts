@@ -1,4 +1,6 @@
 ﻿import { Level } from "level";
+import fs from "node:fs/promises";
+import path from "node:path";
 import { GuildEvent, GuildId, SerializableMember, SerializableMessageRef } from "@cgp/core";
 import {
     eventChannelIds,
@@ -13,7 +15,8 @@ import {
     ReplaySnapshotQuery,
     SearchEventsQuery,
     selectHistoryEvents,
-    Store
+    Store,
+    StoreStorageEstimate
 } from "./store";
 
 const MIN_SEQ_KEY = "0000000000";
@@ -210,9 +213,11 @@ interface MemberIndexSnapshot {
 
 export class LevelStore implements Store {
     private db: Level<string, string>;
+    private dbPath: string;
 
-    constructor(path: string) {
-        this.db = new Level(path);
+    constructor(dbPath: string) {
+        this.dbPath = path.resolve(dbPath);
+        this.db = new Level(dbPath);
     }
 
     async append(guildId: GuildId, event: GuildEvent) {
@@ -563,6 +568,45 @@ export class LevelStore implements Store {
         }
         if (typeof db.db?.compactRange === "function") {
             await db.db.compactRange(start, end);
+        }
+    }
+
+    async estimateStorage(): Promise<StoreStorageEstimate> {
+        const checkedAt = Date.now();
+        let bytes = 0;
+        let files = 0;
+
+        const walk = async (dir: string) => {
+            const entries = await fs.readdir(dir, { withFileTypes: true });
+            for (const entry of entries) {
+                const fullPath = path.join(dir, entry.name);
+                if (entry.isDirectory()) {
+                    await walk(fullPath);
+                    continue;
+                }
+                if (!entry.isFile()) {
+                    continue;
+                }
+                const stat = await fs.stat(fullPath);
+                bytes += stat.size;
+                files += 1;
+            }
+        };
+
+        try {
+            await walk(this.dbPath);
+            return { bytes, files, path: this.dbPath, checkedAt };
+        } catch (error: any) {
+            if (error?.code === "ENOENT") {
+                return { bytes: 0, files: 0, path: this.dbPath, checkedAt };
+            }
+            return {
+                bytes,
+                files,
+                path: this.dbPath,
+                checkedAt,
+                error: error?.message || String(error)
+            };
         }
     }
 

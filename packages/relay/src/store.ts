@@ -1,5 +1,13 @@
 import { ChannelId, GuildEvent, GuildId, SerializableMember, SerializableMessageRef, UserId } from "@cgp/core";
 
+export interface StoreStorageEstimate {
+    bytes: number;
+    files?: number;
+    path?: string;
+    checkedAt: number;
+    error?: string;
+}
+
 export interface HistoryQuery {
     guildId: GuildId;
     channelId?: ChannelId;
@@ -279,6 +287,7 @@ export interface Store {
     deleteEvent(guildId: GuildId, seq: number): Promise<void> | void;
     deleteEvents?(guildId: GuildId, seqs: number[]): Promise<void> | void;
     compact?(query?: { start?: string; end?: string }): Promise<void> | void;
+    estimateStorage?(): Promise<StoreStorageEstimate> | StoreStorageEstimate;
     close(): Promise<void> | void;
 }
 
@@ -489,6 +498,14 @@ export class MemoryStore implements Store {
 
     close() {
         // No-op
+    }
+
+    estimateStorage(): StoreStorageEstimate {
+        return {
+            bytes: 0,
+            files: 0,
+            checkedAt: Date.now()
+        };
     }
 
     private channelEvents(guildId: GuildId, channelId: ChannelId) {

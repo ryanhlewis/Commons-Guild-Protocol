@@ -429,10 +429,7 @@ async function main() {
         ].map((task) => task.catch((error) => {
             restarterError = error;
         }));
-        collector = run(bin("docker"), ["compose", "-f", composeFile, "ps", "-q", "collector"], "pipe");
-        if (!collector) {
-            throw new Error("collector container not found");
-        }
+        collector = `${projectName}-collector-1`;
         const collectorExit = await waitContainer(collector, maxRunMs);
         stopRestarter = true;
         await Promise.all(restarters);
