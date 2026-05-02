@@ -137,6 +137,20 @@ async function publishCall(
     );
 }
 
+async function publishTransientCall(
+    client: CgpClient,
+    guildId: string,
+    channelId: string,
+    roomId: string,
+    fromUserId: string,
+    payload: Record<string, any>
+) {
+    return await client.publishTransientReliable(
+        callEventBody(guildId, channelId, roomId, fromUserId, payload) as any,
+        { timeoutMs: 5000 }
+    );
+}
+
 describe("call verification loadnet relay pass", () => {
     it("delivers DM, guild voice, guest invite, and reconnect call signaling through relays", async () => {
         const pubSub = new LocalRelayPubSubAdapter();
@@ -273,6 +287,35 @@ describe("call verification loadnet relay pass", () => {
                 videoEnabled: true,
                 screenEnabled: false
             });
+            const durableVoiceSeqBeforeTransient = storeA.getLog(voiceGuildId).length;
+            await publishTransientCall(alice, voiceGuildId, voiceChannelId, voiceRoomId, aliceKeys.pub, {
+                kind: "fallback-audio",
+                transport: "relay-websocket",
+                sequence: 1,
+                capturedAt: Date.now(),
+                sampleRate: 16000,
+                pcmBase64: Buffer.alloc(640, 2).toString("base64")
+            });
+            await publishTransientCall(alice, voiceGuildId, voiceChannelId, voiceRoomId, aliceKeys.pub, {
+                kind: "fallback-video",
+                transport: "relay-websocket",
+                sequence: 1,
+                capturedAt: Date.now(),
+                streamKind: "camera",
+                frame: `data:image/jpeg;base64,${Buffer.alloc(8192, 3).toString("base64")}`,
+                width: 320,
+                height: 180
+            });
+            await publishTransientCall(alice, voiceGuildId, voiceChannelId, voiceRoomId, aliceKeys.pub, {
+                kind: "fallback-video",
+                transport: "relay-websocket",
+                sequence: 1,
+                capturedAt: Date.now(),
+                streamKind: "screen",
+                frame: `data:image/jpeg;base64,${Buffer.alloc(16384, 4).toString("base64")}`,
+                width: 960,
+                height: 540
+            });
 
             await waitForCallEvent(observed, "guild voice join relay delivery", (body) =>
                 body.roomId === voiceRoomId &&
@@ -284,6 +327,25 @@ describe("call verification loadnet relay pass", () => {
                 body.payload.kind === "media-state" &&
                 body.payload.audioEnabled === false
             );
+            await waitForCallEvent(observed, "relay WebSocket fallback audio delivery", (body) =>
+                body.roomId === voiceRoomId &&
+                body.payload.kind === "fallback-audio" &&
+                body.payload.transport === "relay-websocket" &&
+                body.payload.sampleRate === 16000
+            );
+            await waitForCallEvent(observed, "relay WebSocket camera fallback delivery", (body) =>
+                body.roomId === voiceRoomId &&
+                body.payload.kind === "fallback-video" &&
+                body.payload.transport === "relay-websocket" &&
+                body.payload.streamKind === "camera"
+            );
+            await waitForCallEvent(observed, "relay WebSocket screen fallback delivery", (body) =>
+                body.roomId === voiceRoomId &&
+                body.payload.kind === "fallback-video" &&
+                body.payload.transport === "relay-websocket" &&
+                body.payload.streamKind === "screen"
+            );
+            expect(storeA.getLog(voiceGuildId)).toHaveLength(durableVoiceSeqBeforeTransient);
             const voiceCode = callVerificationCode(voiceRoomId, aliceKeys.pub, bobKeys.pub);
             expect(voiceCode).toEqual(callVerificationCode(voiceRoomId, bobKeys.pub, aliceKeys.pub));
             expect(voiceCode).not.toEqual(dmCode);

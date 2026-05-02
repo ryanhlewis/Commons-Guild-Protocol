@@ -160,6 +160,7 @@ export interface RelayPubSubEnvelope {
   head?: RelayHead;
   frame?: string;
   liveTopics?: boolean;
+  transient?: boolean;
 }
 
 export interface RelayPubSubSubscribeOptions {
@@ -232,7 +233,9 @@ export class LocalRelayPubSubAdapter implements RelayPubSubAdapter {
           ? [envelope.event]
           : [];
     const headSeq = Number(envelope.head?.headSeq);
-    if (events.length > 0) {
+    if (envelope.transient) {
+      // Transient relay media is live fanout only. It must not be retained or replayed.
+    } else if (events.length > 0) {
       let minSeq = Number.POSITIVE_INFINITY;
       let maxSeq = Number.NEGATIVE_INFINITY;
       for (const event of events) {
@@ -2526,6 +2529,8 @@ export class RelayServer {
       if (fullEvent) {
         await this.runOnEventAppended(fullEvent, socket);
       }
+    } else if (kind === "PUBLISH_TRANSIENT") {
+      await this.publishTransientEvent(objectPayload(payload) as PublishPayload, socket);
     } else if (kind === "PUBLISH_BATCH") {
       const p = objectPayload(payload) as {
         batchId?: string;
@@ -3530,6 +3535,16 @@ export class RelayServer {
           ? [envelope.event]
           : [];
     if (events.length === 0) {
+      return;
+    }
+
+    if (envelope.transient) {
+      this.deliverPubSubEvents(
+        envelope.guildId,
+        events,
+        events.length,
+        envelope.frame,
+      );
       return;
     }
 
@@ -5782,6 +5797,78 @@ export class RelayServer {
     return results;
   }
 
+  private async publishTransientEvent(
+    p: PublishPayload,
+    socket?: WebSocket,
+  ): Promise<GuildEvent | undefined> {
+    const { body, author, signature, createdAt, clientEventId } = p;
+    const targetGuildId =
+      body && typeof body === "object" && !Array.isArray(body)
+        ? (body as unknown as Record<string, unknown>).guildId
+        : undefined;
+    const sendError = (code: string, message: string) => {
+      if (socket) {
+        this.sendFrame(socket, "ERROR", { code, message, clientEventId });
+      }
+    };
+
+    if (typeof targetGuildId !== "string" || !targetGuildId.trim()) {
+      sendError("VALIDATION_FAILED", "Transient event body requires a guildId");
+      return undefined;
+    }
+    if (body.type === "CHECKPOINT") {
+      sendError(
+        "VALIDATION_FAILED",
+        "CHECKPOINT events are relay-maintained and cannot be published by clients",
+      );
+      return undefined;
+    }
+    if (typeof author !== "string" || typeof signature !== "string" || typeof createdAt !== "number") {
+      sendError("VALIDATION_FAILED", "Transient publish requires author, signature, and createdAt");
+      return undefined;
+    }
+    if (!verifyObject(author, { body, author, createdAt }, signature)) {
+      sendError("INVALID_SIGNATURE", "Signature verification failed");
+      return undefined;
+    }
+
+    const rebuilt = await this.rebuildGuildState(targetGuildId);
+    if (rebuilt && !canReadGuild(rebuilt.state, author)) {
+      sendError("FORBIDDEN", "You do not have permission to publish transient events to this guild");
+      return undefined;
+    }
+
+    const fullEvent = {
+      id: hashObject({
+        transient: true,
+        body,
+        author,
+        signature,
+        createdAt,
+        clientEventId,
+      }),
+      seq: Number.NaN,
+      prevHash: null,
+      createdAt,
+      author,
+      body,
+      signature,
+      transient: true,
+    } as GuildEvent & { transient: true };
+
+    if (socket) {
+      this.sendFrame(socket, "PUB_TRANSIENT_ACK", {
+        clientEventId,
+        guildId: targetGuildId,
+        eventId: fullEvent.id,
+        seq: Number.NaN,
+      });
+    }
+
+    this.broadcastTransient(targetGuildId, fullEvent);
+    return fullEvent;
+  }
+
   private async appendSequencedEvent(
     p: PublishPayload,
     socket?: WebSocket,
@@ -7323,6 +7410,40 @@ export class RelayServer {
     }
   }
 
+  private publishTransientEventToPubSub(
+    guildId: GuildId,
+    event: GuildEvent,
+    frame?: string,
+  ) {
+    if (!this.pubSubAdapter || !this.pubSubLiveTopics) {
+      return;
+    }
+
+    const publish = (topic: string) => {
+      void Promise.resolve(
+        this.pubSubAdapter!.publish(topic, {
+          originId: this.relayInstanceId,
+          guildId,
+          event,
+          frame,
+          transient: true,
+          liveTopics: true,
+        }),
+      ).catch((e) => {
+        console.error(`Relay transient pubsub publish failed for topic ${topic}:`, e);
+      });
+    };
+
+    const state = this.stateCache.get(guildId);
+    const channelId = state ? eventChannelId(state, event) : undefined;
+    if (!channelId) {
+      publish(this.pubSubTopic(guildId));
+      return;
+    }
+    publish(this.pubSubAllChannelsTopic(guildId));
+    publish(this.pubSubChannelTopic(guildId, channelId));
+  }
+
   private broadcast(guildId: GuildId, event: GuildEvent) {
     const frame =
       process.env.CGP_RELAY_PUBSUB_INCLUDE_FRAME === "1"
@@ -7330,6 +7451,15 @@ export class RelayServer {
         : undefined;
     this.deliverBroadcastFrame(guildId, event, frame);
     this.publishEventToPubSub(guildId, event, frame);
+  }
+
+  private broadcastTransient(guildId: GuildId, event: GuildEvent) {
+    const frame =
+      process.env.CGP_RELAY_PUBSUB_INCLUDE_FRAME === "1"
+        ? stringifyCgpFrame("EVENT", event)
+        : undefined;
+    this.deliverBroadcastFrame(guildId, event, frame);
+    this.publishTransientEventToPubSub(guildId, event, frame);
   }
 
   private broadcastBatch(guildId: GuildId, events: GuildEvent[]) {

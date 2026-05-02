@@ -13,6 +13,7 @@ describe("Checkpoint Tests", () => {
     let relay: RelayServer;
     let client: CgpClient;
     let guildId: string;
+    let checkpointMemberId: string;
     let keyPair: { publicKey: string; privateKey: Uint8Array };
 
     beforeAll(async () => {
@@ -50,7 +51,8 @@ describe("Checkpoint Tests", () => {
         // 2. Add some events
         const channelId = await client.createChannel(guildId, "general", "text");
         await client.sendMessage(guildId, channelId, "Hello World");
-        await client.assignRole(guildId, keyPair.publicKey, "admin");
+        checkpointMemberId = `member-${keyPair.publicKey}`;
+        await client.assignRole(guildId, checkpointMemberId, "admin");
 
         // Wait for events to be processed
         await new Promise(resolve => setTimeout(resolve, 500));
@@ -73,6 +75,6 @@ describe("Checkpoint Tests", () => {
         expect(reconstructedState.guildId).toBe(guildId);
         expect(reconstructedState.name).toBe("Checkpoint Guild");
         expect(reconstructedState.channels.has(channelId)).toBe(true);
-        expect(reconstructedState.members.get(keyPair.publicKey)?.roles.has("admin")).toBe(true);
+        expect(reconstructedState.members.get(checkpointMemberId)?.roles.has("admin")).toBe(true);
     });
 });

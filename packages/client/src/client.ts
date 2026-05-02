@@ -659,6 +659,9 @@ export class CgpClient extends EventEmitter {
         if (!event || typeof event !== "object") {
             return false;
         }
+        if ((event as GuildEvent & { transient?: boolean }).transient === true) {
+            return this.verifiesSignedTransientEvent(event as GuildEvent & { transient: true });
+        }
         if (
             typeof event.id !== "string" ||
             !Number.isSafeInteger(event.seq) ||
@@ -687,6 +690,24 @@ export class CgpClient extends EventEmitter {
         }
 
         return true;
+    }
+
+    private verifiesSignedTransientEvent(event: GuildEvent & { transient: true }) {
+        if (
+            typeof event.id !== "string" ||
+            typeof event.createdAt !== "number" ||
+            typeof event.author !== "string" ||
+            typeof event.signature !== "string" ||
+            !event.body ||
+            typeof event.body !== "object"
+        ) {
+            return false;
+        }
+        return verify(event.author, hashObject({
+            body: event.body,
+            author: event.author,
+            createdAt: event.createdAt
+        }), event.signature);
     }
 
     private acceptsSignedEvent(event: GuildEvent) {
@@ -827,6 +848,12 @@ export class CgpClient extends EventEmitter {
                         return;
                     }
 
+                    if ((event as GuildEvent & { transient?: boolean }).transient === true) {
+                        this.rememberSeenEvent(event.id);
+                        this.emit("event", event);
+                        return;
+                    }
+
                     // console.log(`Client received EVENT seq ${event.seq} type ${event.body.type}`);
                     const updateResult = await this.updateState(event);
                     if (updateResult === "applied" || updateResult === "stale") {
@@ -953,6 +980,8 @@ export class CgpClient extends EventEmitter {
                     this.emit("plugin_config_ok", payload);
                 } else if (kind === "PUB_ACK") {
                     this.emit("publish_ack", payload);
+                } else if (kind === "PUB_TRANSIENT_ACK") {
+                    this.emit("publish_transient_ack", payload);
                 } else if (kind === "PUB_BATCH_ACK") {
                     this.emit("publish_batch_ack", payload);
                 } else if (kind === "BATCH") {
@@ -1687,6 +1716,67 @@ export class CgpClient extends EventEmitter {
             this.on("error_frame", errorHandler);
 
             writer = this.sendEncodedFrameToWriterSocketWithSocket(encodeCgpFrame("PUBLISH", payload, this.wireFormat));
+
+            if (!writer) {
+                cleanup();
+                reject(new Error("No open relay connection"));
+                return;
+            }
+            writer.once?.("close", writerClosedHandler);
+            writer.once?.("error", writerClosedHandler);
+        });
+    }
+
+    async publishTransientReliable(body: EventBody, options: PublishReliableOptions = {}): Promise<PublishAck> {
+        if (!this.keyPair) throw new Error("No keypair");
+        if (this.relays.length === 0) {
+            throw new Error("Transient publishes require a relay websocket");
+        }
+
+        const { pub, priv } = this.keyPair;
+        const createdAt = Date.now();
+        const clientEventId = options.clientEventId || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        const unsigned = { body, author: pub, createdAt };
+        const signature = await sign(priv, hashObject(unsigned));
+        const payload = { body, author: pub, signature, createdAt, clientEventId };
+        const timeoutMs = options.timeoutMs ?? 10000;
+
+        return new Promise<PublishAck>((resolve, reject) => {
+            let writer: WebSocket | undefined;
+            const timeout = setTimeout(() => {
+                cleanup();
+                reject(new Error("Timeout waiting for transient publish acknowledgement"));
+            }, timeoutMs);
+
+            const ackHandler = (data: PublishAck) => {
+                if (data?.clientEventId === clientEventId) {
+                    cleanup();
+                    resolve(data);
+                }
+            };
+            const errorHandler = (data: any) => {
+                if (data?.clientEventId === clientEventId) {
+                    cleanup();
+                    reject(new Error(data.message || "Transient publish rejected by relay"));
+                }
+            };
+            const writerClosedHandler = () => {
+                cleanup();
+                reject(new Error("Writer relay connection closed before transient publish acknowledgement"));
+            };
+
+            const cleanup = () => {
+                clearTimeout(timeout);
+                this.off("publish_transient_ack", ackHandler);
+                this.off("error_frame", errorHandler);
+                writer?.off?.("close", writerClosedHandler);
+                writer?.off?.("error", writerClosedHandler);
+            };
+
+            this.on("publish_transient_ack", ackHandler);
+            this.on("error_frame", errorHandler);
+
+            writer = this.sendEncodedFrameToWriterSocketWithSocket(encodeCgpFrame("PUBLISH_TRANSIENT", payload, this.wireFormat));
 
             if (!writer) {
                 cleanup();
