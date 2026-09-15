@@ -36,8 +36,8 @@
     "packages/*"
   ],
   "devDependencies": {
+    "@types/node": "^20.0.0",
     "typescript": "^5.0.0",
-    "vitest": "^4.1.4",
-    "@types/node": "^20.0.0"
+    "vitest": "^4.1.11"
   }
 }
