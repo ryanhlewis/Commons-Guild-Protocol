@@ -1,6 +1,6 @@
 # Commons Guild Protocol (CGP)
 
-> **CGP** is a tokenless, forkable, Discord-style chat protocol inspired by Bitcoin’s data structures (hash chains, Merkle trees) but without PoW, mining, or per-message fees.
+> **CGP** is a tokenless, forkable, guild-based community chat protocol inspired by Bitcoin’s data structures (hash chains, Merkle trees) but without PoW, mining, or per-message fees.
 
 CGP’s focus:
 
@@ -15,6 +15,7 @@ This repo contains:
 - `SPEC.md` – the protocol and data model.
 - `packages/core` – TypeScript reference implementation of CGP primitives.
 - `packages/relay` – a Node.js WebSocket relay for guild logs.
+- `packages/relay-cloudflare` – a Cloudflare Workers/Durable Objects relay target.
 - `packages/client` – a browser/Node client library.
 - `packages/tests` – a Vitest-based test suite.
 
@@ -55,6 +56,43 @@ http://<relay-host>/extensions/<clientExtension>/index.js
 
 This hosting is optional; clients may also load extensions from absolute URLs.
 
+The `cgp.static-shards` plugin supports bounded discovery for large game catalogs:
+
+```http
+GET /plugins/cgp.static-shards/catalog?limit=64
+GET /plugins/cgp.static-shards/catalog?limit=64&cursor=<opaque-next-cursor>
+GET /plugins/cgp.static-shards/catalog?id=<exact-game-id>
+GET /plugins/cgp.static-shards/catalog?q=<search-terms>&limit=24
+```
+
+Paged responses use schema version 2 and include `total`, `releases`, and `page` (`count`, `hasMore`, and `nextCursor`). They expose one stable discovery slot and the latest release for each game; historical releases remain in the registry for immutable serving and rollback but do not consume discovery pages or inflate `total`. A repeated upload of identical `game@version` bytes is idempotent, while different bytes for an existing version are rejected; publishers must choose a new version instead of changing content behind a cacheable URL. Page limits are clamped to 1-256 and search results to 1-64. Exact lookup is O(1); search uses the relay's bounded token/prefix index rather than scanning the registry. Cursors are opaque to clients and remain stable when games publish newer releases or new games are appended. Calling `catalog` without paging parameters retains the version-1 full-registry response for compatibility. Registry writes use an append-only NDJSON journal and periodically create an atomic JSON snapshot (`CGP_STATIC_SHARD_REGISTRY_COMPACT_EVERY`, default 4096), so publishing a release does not rewrite the complete catalog.
+
+Public HTTP uploads are self-authenticating. New uploads must include a `cgp/static-shard-publisher/1` proof by default, and the first accepted account public key owns that game ID on the relay. Every later version must be authorized by the same CGP account. A root key can sign directly, or `publisher.deviceAuthorization` can carry a root-authorized device certificate with the `publish` capability; the account key remains the owner in either case. Keep ownership with the publisher's recoverable CGP account rather than generating a new key per release:
+
+```ts
+import { getPublicKey, hashObject, sign } from "@cgp/core";
+import {
+  STATIC_SHARD_PUBLISHER_PROTOCOL,
+  staticShardReleaseSigningPayload,
+} from "@cgp/relay";
+
+const publicKey = getPublicKey(publisherPrivateKey);
+const unsigned = {
+  ...release,
+  publisher: { protocol: STATIC_SHARD_PUBLISHER_PROTOCOL, publicKey },
+};
+const signature = await sign(
+  publisherPrivateKey,
+  hashObject(staticShardReleaseSigningPayload(unsigned)),
+);
+const signedRelease = {
+  ...unsigned,
+  publisher: { ...unsigned.publisher, signature },
+};
+```
+
+`POST /plugins/cgp.static-shards/upload` accepts the signed release plus its manifest/shard bytes without a relay credential. `POST /plugins/cgp.static-shards/ingest` is an operator-only outbound URL fetch and is closed unless `CGP_STATIC_SHARD_INGEST_TOKEN` is configured (Bearer or `X-CGP-Static-Shard-Token`) or the explicitly unsafe compatibility flag `CGP_STATIC_SHARD_ALLOW_UNAUTHENTICATED_INGEST=1` is set. Configured `CGP_STATIC_SHARD_SEED_URLS` remain operator-trusted so existing unsigned mirrors continue to load as `legacy-operator-seed` entries.
+
 ---
 
 ## Status
@@ -82,11 +120,13 @@ We use well-maintained, audited libraries wherever possible:
 
 - **Networking**
   - Relays: Node.js + `ws` for WebSocket server.   
+  - Cloudflare target: Workers + Durable Objects via `@cgp/relay-cloudflare`.
   - Clients: browser WebSocket API + `ws` or Node’s built-in WebSocket client.   
   - P2P/fallback (optional): `js-libp2p` with WebRTC/WebSocket transports for browser-to-browser or browser↔Node connectivity.   
 
 - **Storage**
   - Node: `level` or `better-sqlite3` as a simple KV/DB backend.
+  - Cloudflare: Durable Object SQLite by default, optional D1.
   - Browser: IndexedDB via `idb`.
 
 - **Testing**
@@ -103,6 +143,7 @@ We use well-maintained, audited libraries wherever possible:
 └── packages
     ├── core       # types, crypto, event hashing/validation, log logic
     ├── relay      # Node WebSocket relay implementation
+    ├── relay-cloudflare # Cloudflare Workers/Durable Objects relay target
     ├── client     # browser/Node client SDK
     └── tests      # Vitest test suite
 ```

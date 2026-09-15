@@ -1,6 +1,6 @@
 import { RelayServer } from "@cgp/relay";
 import { CgpClient } from "@cgp/client";
-import { GuildEvent, createInitialState, applyEvent, deserializeState } from "@cgp/core";
+import { GuildEvent, checkpointStateRoot, deserializeState, serializeState } from "@cgp/core";
 import fs from "fs";
 import path from "path";
 import os from "os";
@@ -76,5 +76,18 @@ describe("Checkpoint Tests", () => {
         expect(reconstructedState.name).toBe("Checkpoint Guild");
         expect(reconstructedState.channels.has(channelId)).toBe(true);
         expect(reconstructedState.members.get(checkpointMemberId)?.roles.has("admin")).toBe(true);
+
+		const canonical = serializeState(reconstructedState);
+		const reordered = deserializeState({
+			...canonical,
+			channels: [...canonical.channels].reverse(),
+			members: [...canonical.members].reverse(),
+			roles: [...canonical.roles].reverse(),
+			bans: [...canonical.bans].reverse(),
+			messages: [...(canonical.messages ?? [])].reverse(),
+			appObjects: [...(canonical.appObjects ?? [])].reverse()
+		}, checkpointEvent.seq, checkpointEvent.id, checkpointEvent.createdAt);
+		expect(serializeState(reordered)).toEqual(canonical);
+		expect(checkpointStateRoot(serializeState(reordered))).toBe(checkpointStateRoot(canonical));
     });
 });

@@ -295,7 +295,7 @@ function testIdentityMismatch() {
         id: "server-id-4",
         content: "Hello",
         status: "sent",
-        user: { id: "discord-user-id" }, // Different ID (e.g. is_me check failed)
+        user: { id: "remote-user-id" }, // Different ID (e.g. is_me check failed)
         timestamp: new Date().toISOString(),
         external: { nonce: "something" }
     };

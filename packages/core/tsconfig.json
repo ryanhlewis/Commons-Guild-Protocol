@@ -1,12 +1,14 @@
 {
     "compilerOptions": {
         "target": "ES2019",
-        "module": "CommonJS",
+        "module": "NodeNext",
+        "moduleResolution": "NodeNext",
         "strict": true,
         "esModuleInterop": true,
         "skipLibCheck": true,
         "forceConsistentCasingInFileNames": true,
         "outDir": "./dist",
+        "rootDir": "./src",
         "declaration": true
     },
     "include": [

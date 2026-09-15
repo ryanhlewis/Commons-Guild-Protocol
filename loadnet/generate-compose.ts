@@ -87,6 +87,7 @@ function defaultLoadnetMediaProviders(maxBytes: number) {
             id: "loadnet-meme-ipfs",
             kind: "ipfs",
             label: "Loadnet meme IPFS host",
+            ipfsBackendId: "helia",
             priority: 90,
             maxBytes,
             acceptsMimeTypes: ["image/*", "video/*"],
@@ -100,6 +101,7 @@ function defaultLoadnetMediaProviders(maxBytes: number) {
             id: "loadnet-anime-ipfs",
             kind: "ipfs",
             label: "Loadnet anime art IPFS host",
+            ipfsBackendId: "helia",
             priority: 80,
             maxBytes,
             acceptsMimeTypes: ["image/*", "video/*"],
@@ -113,6 +115,7 @@ function defaultLoadnetMediaProviders(maxBytes: number) {
             id: "loadnet-dog-ipfs",
             kind: "ipfs",
             label: "Loadnet dog photo IPFS host",
+            ipfsBackendId: "helia",
             priority: 75,
             maxBytes,
             acceptsMimeTypes: ["image/*"],
@@ -126,6 +129,7 @@ function defaultLoadnetMediaProviders(maxBytes: number) {
             id: "loadnet-nsfw-opt-in-ipfs",
             kind: "ipfs",
             label: "Loadnet opt-in adult media IPFS host",
+            ipfsBackendId: "helia",
             priority: 70,
             maxBytes,
             acceptsMimeTypes: ["image/*", "video/*"],
@@ -139,6 +143,7 @@ function defaultLoadnetMediaProviders(maxBytes: number) {
             id: "loadnet-general-ipfs",
             kind: "ipfs",
             label: "Loadnet general IPFS host",
+            ipfsBackendId: "helia",
             priority: 50,
             maxBytes,
             acceptsMimeTypes: ["image/*", "video/*", "audio/*", "application/octet-stream"],
@@ -184,6 +189,7 @@ function main() {
     const publisherTimeoutMs = process.env.LOADNET_PUBLISH_TIMEOUT_MS || (disruptiveProfile ? "5000" : "10000");
     const mediaProvidersJson = process.env.CGP_MEDIA_PROVIDERS_JSON || JSON.stringify(defaultLoadnetMediaProviders(profile.fullClientMediaBytes));
     const mediaPolicyEnabled = profile.fullClientMediaEvery > 0 ? "1" : (process.env.CGP_RELAY_MEDIA_POLICY_ENABLED || "0");
+    const heliaEnabled = profile.fullClientMediaUpload || process.env.CGP_IPFS_HELIA_ENABLED === "1";
     const defaultClientRelayWindow = profile.relays > 8 ? 4 : profile.relays;
     const clientRelayWindowInput = Number(process.env.LOADNET_CLIENT_RELAY_WINDOW ?? defaultClientRelayWindow);
     const clientRelayWindow = Math.max(
@@ -265,6 +271,19 @@ function main() {
                 CGP_RELAY_MEDIA_POLICY_ENABLED: mediaPolicyEnabled,
                 CGP_MEDIA_PROVIDERS_JSON: mediaProvidersJson,
                 CGP_MEDIA_MAX_ATTACHMENT_BYTES: String(profile.fullClientMediaBytes),
+                CGP_IPFS_HELIA_ENABLED: heliaEnabled ? "1" : "0",
+                CGP_IPFS_HELIA_ID: "helia",
+                CGP_IPFS_HELIA_STORE_DIR: `/data/relay-${index}-helia`,
+                CGP_IPFS_HELIA_MODE: heliaEnabled ? "network" : "local",
+                CGP_IPFS_HELIA_AUTOSTART: heliaEnabled ? "1" : "0",
+                CGP_IPFS_HELIA_USE_DEFAULT_BOOTSTRAP: "0",
+                CGP_IPFS_HELIA_LISTEN_ADDRS: "/ip4/0.0.0.0/tcp/4001",
+                CGP_IPFS_HELIA_DHT: "0",
+                CGP_IPFS_HELIA_BITSWAP: heliaEnabled ? "1" : "0",
+                CGP_IPFS_HELIA_TRUSTLESS_GATEWAY: "0",
+                CGP_IPFS_HELIA_PROVIDE_ON_ADD: "0",
+                LOADNET_HELIA_CONNECT_PEERS: heliaEnabled ? "1" : "0",
+                LOADNET_HELIA_DIAL_PORT: "4001",
                 CGP_RELAY_CHECKPOINT_INTERVAL_MS: "0",
                 CGP_RELAY_PUBSUB_REPLAY_LIMIT: process.env.CGP_RELAY_PUBSUB_REPLAY_LIMIT || "100000",
                 CGP_RELAY_VERBOSE_LOGS: process.env.CGP_RELAY_VERBOSE_LOGS || "0",
@@ -386,6 +405,8 @@ function main() {
                 LOADNET_FULL_CLIENT_MEDIA_EVERY: String(profile.fullClientMediaEvery),
                 LOADNET_FULL_CLIENT_MEDIA_BYTES: String(profile.fullClientMediaBytes),
                 LOADNET_FULL_CLIENT_MEDIA_TAGS: profile.fullClientMediaTags.join(","),
+                LOADNET_FULL_CLIENT_MEDIA_UPLOAD: profile.fullClientMediaUpload ? "1" : "0",
+                LOADNET_FULL_CLIENT_MEDIA_FETCH_VERIFY: profile.fullClientMediaFetchVerify ? "1" : "0",
                 LOADNET_EXPECTED_READY: String(profile.subscriberWorkers),
                 LOADNET_PUBLISH_TIMEOUT_MS: publisherTimeoutMs,
                 LOADNET_WIRE_FORMAT: wireFormat,

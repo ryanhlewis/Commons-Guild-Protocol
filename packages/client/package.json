@@ -1,14 +1,30 @@
 {
     "name": "@cgp/client",
-    "version": "0.1.0",
-    "main": "src/index.ts",
+    "version": "0.1.4",
+    "type": "module",
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+        ".": {
+            "types": "./dist/index.d.ts",
+            "import": "./dist/index.js",
+            "default": "./dist/index.js"
+        }
+    },
+    "files": [
+        "dist"
+    ],
     "scripts": {
         "build": "tsc"
     },
     "dependencies": {
-        "@cgp/core": "*",
+        "@fails-components/webtransport": "^1.6.7",
+        "@fails-components/webtransport-transport-http3-quiche": "^1.6.7",
         "merkletreejs": "^0.6.0",
-        "ws": "^8.16.0"
+        "ws": "^8.21.1"
+    },
+    "peerDependencies": {
+        "@cgp/core": "0.1.4"
     },
     "devDependencies": {
         "@types/ws": "^8.5.10"

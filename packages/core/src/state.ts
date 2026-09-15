@@ -24,9 +24,11 @@ import {
     SerializableMessageRef,
     AppObjectStateRef,
     SerializableGuildState,
-    Checkpoint
-} from "./types";
-import { hashObject } from "./crypto";
+    Checkpoint,
+    SfuAuthoritySet
+} from "./types.js";
+import { normalizeSfuAuthoritySet } from "./sfu_authority.js";
+import { hashObject } from "./crypto.js";
 
 export interface GuildState {
     guildId: GuildId;
@@ -39,6 +41,7 @@ export interface GuildState {
     bans: Map<UserId, Ban>;
     messages: Map<HashHex, SerializableMessageRef>;
     appObjects: Map<string, AppObjectStateRef>;
+    sfuAuthoritySets: SfuAuthoritySet[];
     createdAt: number;
     headSeq: number;
     headHash: string;
@@ -62,6 +65,7 @@ export function createInitialState(event: GuildEvent): GuildState {
         bans: new Map(),
         messages: new Map(),
         appObjects: new Map(),
+        sfuAuthoritySets: [],
         createdAt: event.createdAt,
         headSeq: event.seq,
         headHash: event.id,
@@ -71,23 +75,34 @@ export function createInitialState(event: GuildEvent): GuildState {
 }
 
 export function serializeState(state: GuildState): SerializableGuildState {
+    const sortedEntries = <T>(entries: Iterable<[string, T]>) =>
+        Array.from(entries).sort(([left], [right]) => left.localeCompare(right));
     return {
         guildId: state.guildId,
         name: state.name,
         description: state.description || "",
         ownerId: state.ownerId,
-        channels: Array.from(state.channels.entries()),
-        members: Array.from(state.members.entries()).map(([id, member]) => [
+        channels: sortedEntries(state.channels.entries()),
+        members: sortedEntries(state.members.entries()).map(([id, member]) => [
             id,
             {
                 ...member,
-                roles: Array.from(member.roles)
+                roles: Array.from(member.roles).sort()
             }
         ]),
-        roles: Array.from(state.roles.entries()),
-        bans: Array.from(state.bans.entries()),
-        messages: Array.from(state.messages.entries()),
-        appObjects: Array.from(state.appObjects.entries()),
+        roles: sortedEntries(state.roles.entries()),
+        bans: sortedEntries(state.bans.entries()),
+        messages: sortedEntries(state.messages.entries()),
+        appObjects: sortedEntries(state.appObjects.entries()),
+        ...(state.sfuAuthoritySets.length > 0
+            ? {
+                sfuAuthoritySets: state.sfuAuthoritySets.map((set) => ({
+                    ...set,
+                    certifier: { ...set.certifier, members: [...set.certifier.members] },
+                    authorities: set.authorities.map((authority) => ({ ...authority }))
+                }))
+            }
+            : {}),
         access: state.access,
         policies: state.policies
     };
@@ -113,6 +128,9 @@ export function deserializeState(serialized: SerializableGuildState, headSeq: nu
         bans: new Map(serialized.bans),
         messages: new Map(serialized.messages ?? []),
         appObjects: new Map(serialized.appObjects ?? []),
+        sfuAuthoritySets: (serialized.sfuAuthoritySets ?? []).map((set) =>
+            normalizeSfuAuthoritySet(set)
+        ),
         headSeq,
         headHash,
         createdAt,
@@ -486,7 +504,25 @@ export function applyEvent(state: GuildState, event: GuildEvent, options: { muta
                     target,
                     value: bodyRecord.value,
                     authorId: event.author,
-                    updatedAt: event.createdAt
+                    updatedAt: event.createdAt,
+                    createOnly: bodyRecord.createOnly === true ? true : undefined,
+                    lease: bodyRecord.lease && typeof bodyRecord.lease === "object"
+                        ? { ...bodyRecord.lease }
+                        : undefined,
+                    deviceAuthorization: event.deviceAuthorization
+                        ? {
+                            ...event.deviceAuthorization,
+                            binding: { ...event.deviceAuthorization.binding },
+                            certificate: {
+                                ...event.deviceAuthorization.certificate,
+                                capabilities: [...event.deviceAuthorization.certificate.capabilities]
+                            },
+                            revocation: {
+                                ...event.deviceAuthorization.revocation,
+                                revokedSerials: [...event.deviceAuthorization.revocation.revokedSerials]
+                            }
+                        }
+                        : undefined
                 });
             }
             break;
@@ -526,6 +562,18 @@ export function applyEvent(state: GuildState, event: GuildEvent, options: { muta
             ensureMembers().set(targetUserId, member);
             break;
         }
+        case "SFU_AUTHORITY_SET": {
+            const next = normalizeSfuAuthoritySet(body, event.createdAt);
+            const retained = state.sfuAuthoritySets
+                .filter((set) => set.epoch >= next.epoch - 1)
+                .map((set) => ({
+                    ...set,
+                    certifier: { ...set.certifier, members: [...set.certifier.members] },
+                    authorities: set.authorities.map((authority) => ({ ...authority }))
+                }));
+            newState.sfuAuthoritySets = [...retained, next].slice(-2);
+            break;
+        }
         case "CHECKPOINT": {
             const b = body as Checkpoint;
             // If we are applying a checkpoint event, it usually means we are verifying it or loading from it.
@@ -547,6 +595,6 @@ export function applyEvent(state: GuildState, event: GuildEvent, options: { muta
     return newState;
 }
 
-function appObjectStateKey(namespace: string, objectType: string, objectId: string) {
+export function appObjectStateKey(namespace: string, objectType: string, objectId: string) {
     return `${namespace}\u0000${objectType}\u0000${objectId}`;
 }

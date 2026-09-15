@@ -44,6 +44,8 @@ export interface LoadnetProfile {
     fullClientMediaEvery: number;
     fullClientMediaBytes: number;
     fullClientMediaTags: string[];
+    fullClientMediaUpload: boolean;
+    fullClientMediaFetchVerify: boolean;
     relayStorageSoftLimitBytes: number;
     relayStorageHardLimitBytes: number;
     relayStorageEstimateIntervalMs: number;
@@ -95,6 +97,8 @@ export const defaultProfile: LoadnetProfile = {
     fullClientMediaEvery: 0,
     fullClientMediaBytes: 256 * 1024,
     fullClientMediaTags: ["meme", "anime", "dog", "art", "photo"],
+    fullClientMediaUpload: false,
+    fullClientMediaFetchVerify: false,
     relayStorageSoftLimitBytes: 0,
     relayStorageHardLimitBytes: 0,
     relayStorageEstimateIntervalMs: 15000
@@ -169,6 +173,8 @@ export function normalizeProfile(input: Partial<LoadnetProfile> = {}): LoadnetPr
         fullClientMediaEvery: Math.max(0, Math.floor(Number(input.fullClientMediaEvery ?? defaultProfile.fullClientMediaEvery))),
         fullClientMediaBytes: Math.max(1, Math.floor(Number(input.fullClientMediaBytes ?? defaultProfile.fullClientMediaBytes))),
         fullClientMediaTags: stringArray(input.fullClientMediaTags, defaultProfile.fullClientMediaTags),
+        fullClientMediaUpload: boolValue(input.fullClientMediaUpload, defaultProfile.fullClientMediaUpload),
+        fullClientMediaFetchVerify: boolValue(input.fullClientMediaFetchVerify, defaultProfile.fullClientMediaFetchVerify),
         relayStorageSoftLimitBytes: Math.max(0, Math.floor(Number(input.relayStorageSoftLimitBytes ?? defaultProfile.relayStorageSoftLimitBytes))),
         relayStorageHardLimitBytes: Math.max(0, Math.floor(Number(input.relayStorageHardLimitBytes ?? defaultProfile.relayStorageHardLimitBytes))),
         relayStorageEstimateIntervalMs: Math.max(1000, Math.floor(Number(input.relayStorageEstimateIntervalMs ?? defaultProfile.relayStorageEstimateIntervalMs)))

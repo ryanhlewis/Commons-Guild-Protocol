@@ -1,4 +1,5 @@
 import { ChannelId, GuildEvent, GuildId, SerializableMember, SerializableMessageRef, UserId } from "@cgp/core";
+import type { RelaySequencerPersistentState } from "./sequencer_consensus";
 
 export interface StoreStorageEstimate {
     bytes: number;
@@ -280,6 +281,10 @@ export interface Store {
     searchMembers?(query: MemberSearchQuery): Promise<MemberPage> | MemberPage;
     getMessageRef?(query: MessageRefQuery): Promise<SerializableMessageRef | null> | SerializableMessageRef | null;
     getMessageRefs?(query: MessageRefsQuery): Promise<Map<string, SerializableMessageRef>> | Map<string, SerializableMessageRef>;
+    getWriteVoteFence?(key: string): Promise<string | undefined> | string | undefined;
+    putWriteVoteFence?(key: string, proposalId: string): Promise<void> | void;
+    getSequencerState?(key: string): Promise<RelaySequencerPersistentState | undefined> | RelaySequencerPersistentState | undefined;
+    putSequencerState?(key: string, state: RelaySequencerPersistentState): Promise<void> | void;
     append(guildId: GuildId, event: GuildEvent): Promise<void> | void;
     appendEvents?(guildId: GuildId, events: GuildEvent[]): Promise<void> | void;
     getLastEvent(guildId: GuildId): Promise<GuildEvent | undefined> | GuildEvent | undefined;
@@ -301,9 +306,28 @@ export class MemoryStore implements Store {
     private memberSearchDocs = new Map<GuildId, Map<UserId, Set<string>>>();
     private messageRefs = new Map<GuildId, Map<string, SerializableMessageRef>>();
     private channelMessageRefs = new Map<GuildId, Map<ChannelId, Set<string>>>();
+    private writeVoteFences = new Map<string, string>();
+    private sequencerStates = new Map<string, RelaySequencerPersistentState>();
 
     getLog(guildId: GuildId): GuildEvent[] {
         return this.logs.get(guildId) || [];
+    }
+
+    getWriteVoteFence(key: string) {
+        return this.writeVoteFences.get(key);
+    }
+
+    putWriteVoteFence(key: string, proposalId: string) {
+        this.writeVoteFences.set(key, proposalId);
+    }
+
+    getSequencerState(key: string) {
+        const state = this.sequencerStates.get(key);
+        return state ? { ...state } : undefined;
+    }
+
+    putSequencerState(key: string, state: RelaySequencerPersistentState) {
+        this.sequencerStates.set(key, { ...state });
     }
 
     *iterateLog(guildId: GuildId): Iterable<GuildEvent> {
@@ -759,7 +783,9 @@ export class MemoryStore implements Store {
                 if (typeof body.channelId !== "string") break;
                 messageRefs.set(messageId, {
                     channelId: body.channelId,
-                    authorId: event.author
+                    authorId: event.author,
+                    eventId: event.id,
+                    seq: event.seq
                 });
                 const channelRefs = channelMessageRefs.get(body.channelId) || new Set<string>();
                 channelRefs.add(messageId);

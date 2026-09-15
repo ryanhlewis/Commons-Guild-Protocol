@@ -1,5 +1,5 @@
-import { hashObject, verify } from "./crypto";
-import { HashHex, RelayHead, RelayHeadUnsigned } from "./types";
+import { hashObject, verify } from "./crypto.js";
+import { HashHex, RelayHead, RelayHeadUnsigned } from "./types.js";
 
 export interface RelayHeadConflict {
     guildId: string;

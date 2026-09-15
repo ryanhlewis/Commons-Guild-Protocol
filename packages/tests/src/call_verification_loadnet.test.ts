@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CgpClient } from "@cgp/client/src/client";
+import { CgpClient } from "@cgp/client";
 import { GuildEvent } from "@cgp/core";
 import { LocalRelayPubSubAdapter, RelayServer } from "@cgp/relay/src/server";
 import { MemoryStore } from "@cgp/relay/src/store";
@@ -16,6 +16,7 @@ interface CallEventBody {
     channelId: string;
     roomId: string;
     payload: Record<string, any>;
+    expiresAt?: number;
 }
 
 function createKeyPair(): TestKeyPair {
@@ -419,6 +420,27 @@ describe("call verification loadnet relay pass", () => {
                 body.payload.kind === "offer" &&
                 body.payload.reconnectProbe === "live-after-reconnect"
             );
+
+            const expiredBody = {
+                ...callEventBody(
+                    voiceGuildId,
+                    voiceChannelId,
+                    voiceRoomId,
+                    aliceKeys.pub,
+                    {
+                        kind: "fallback-audio",
+                        capturedAt: Date.now() - 5000,
+                        sampleRate: 16000,
+                        pcmBase64: Buffer.alloc(640, 5).toString("base64")
+                    }
+                ),
+                expiresAt: Date.now() - 1000
+            };
+            await expect(
+                alice.publishTransientReliable(expiredBody as any, { timeoutMs: 1000 })
+            ).rejects.toThrow(/expired/i);
+            await sleep(100);
+            expect(observed.some((event) => (event.body as any)?.payload?.messageId === expiredBody.payload.messageId)).toBe(false);
         } finally {
             owner.close();
             alice.close();

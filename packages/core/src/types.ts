@@ -5,6 +5,48 @@ export type GuildId = HashHex;      // stable collision-resistant guild identifi
 export type ChannelId = HashHex;    // stable collision-resistant channel identifier
 export type UserId = PublicKeyHex;  // identity == pubkey
 
+export type DeviceCapability = "publish" | "read" | "mls" | "device-link";
+
+export interface DeviceAuthorityBinding {
+    protocol: "cgp/device-authority/1";
+    accountPublicKey: PublicKeyHex;
+    authorityPublicKey: PublicKeyHex;
+    generation: number;
+    activatedAt: number;
+    signature: SignatureHex;
+}
+
+export interface DeviceCertificate {
+    protocol: "cgp/device-certificate/1";
+    accountPublicKey: PublicKeyHex;
+    authorityPublicKey: PublicKeyHex;
+    devicePublicKey: PublicKeyHex;
+    serial: string;
+    label: string;
+    capabilities: DeviceCapability[];
+    issuedAt: number;
+    expiresAt: number;
+    signature: SignatureHex;
+}
+
+export interface DeviceRevocationState {
+    protocol: "cgp/device-revocation/1";
+    accountPublicKey: PublicKeyHex;
+    authorityPublicKey: PublicKeyHex;
+    generation: number;
+    epoch: number;
+    updatedAt: number;
+    revokedSerials: string[];
+    signature: SignatureHex;
+}
+
+export interface DeviceAuthorization {
+    protocol: "cgp/device-authorization/1";
+    binding: DeviceAuthorityBinding;
+    certificate: DeviceCertificate;
+    revocation: DeviceRevocationState;
+}
+
 export interface GuildEventBodyBase {
     type: string;     // e.g. "GUILD_CREATE", "MESSAGE", ...
     guildId: GuildId; // target guild log
@@ -27,9 +69,82 @@ export interface GuildEvent {
     seq: number;                // monotonically increasing integer >= 0
     prevHash: HashHex | null;   // null for seq=0, otherwise hash of previous event
     createdAt: number;          // milliseconds since epoch (informational)
-    author: UserId;             // public key of signer
+    author: UserId;             // stable account public key
     body: EventBody;
-    signature: SignatureHex;    // signature over canonical encoding of {body, author, createdAt}
+    signature: SignatureHex;    // account signature, or certified device signature when deviceAuthorization is present
+    deviceAuthorization?: DeviceAuthorization;
+    /**
+     * Optional relay quorum proof. It is deliberately excluded from the event
+     * id and author signature because it is assembled after relays vote.
+     */
+    writeCertificate?: RelayWriteCertificate;
+}
+
+export interface RelayWriteQuorumPolicy {
+    protocol: "cgp/write-quorum/1";
+    epoch: string;
+    members: PublicKeyHex[];
+    requiredVotes: number;
+}
+
+export interface RelayWriteQuorumVoteUnsigned {
+    protocol: "cgp/write-vote/1";
+    epoch: string;
+    relayPublicKey: PublicKeyHex;
+    guildId: GuildId;
+    headSeq: number;
+    headHash: HashHex | null;
+    proposalId: HashHex;
+    votedAt: number;
+}
+
+export interface RelayWriteQuorumVote extends RelayWriteQuorumVoteUnsigned {
+    signature: SignatureHex;
+}
+
+export interface RelayWriteProposal {
+    guildId: GuildId;
+    headSeq: number;
+    headHash: HashHex | null;
+    body: unknown;
+    author: PublicKeyHex;
+    signature: SignatureHex;
+    deviceAuthorization?: DeviceAuthorization;
+    createdAt: number;
+    clientEventId?: string;
+    /**
+     * In-process relay plugins may request an independently policy-validated
+     * write on every witness. This marker is never accepted from client
+     * publish frames and is deliberately outside the certificate payload.
+     */
+    authorizationMode?: "plugin-policy";
+}
+
+export interface RelayWriteCertificate {
+    protocol: "cgp/write-certificate/1";
+    policy: RelayWriteQuorumPolicy;
+    proposalId: HashHex;
+    clientEventId?: string;
+    votes: RelayWriteQuorumVote[];
+}
+
+export interface SfuAuthorityMember {
+    nodeId: string;
+    clusterId: string;
+    role: "authority" | "forward-only";
+    routeAuthorityPublicKey?: PublicKeyHex;
+}
+
+export interface SfuAuthoritySet {
+    type: "SFU_AUTHORITY_SET";
+    guildId: GuildId;
+    epoch: number;
+    previousEpoch: number | null;
+    notBefore: number;
+    overlapUntil: number;
+    expiresAt: number;
+    certifier: RelayWriteQuorumPolicy;
+    authorities: SfuAuthorityMember[];
 }
 
 export interface GuildCreate {
@@ -52,6 +167,26 @@ export interface GuildPolicies {
      * even when the guild profile itself is public.
      */
     posting?: "public" | "members";
+    /**
+     * App-object classes that must use a bounded proof-backed exclusive lease.
+     * This is useful for scarce one-use resources without making the resource
+     * itself part of the CGP core protocol.
+     */
+    exclusiveAppObjects?: AppObjectLeasePolicy[];
+}
+
+export interface AppObjectLeasePolicy {
+    namespace: string;
+    objectType: string;
+    difficultyBits?: number;
+    maxLeaseMs?: number;
+}
+
+export interface AppObjectLease {
+    protocol: "cgp/app-object-lease/1";
+    expiresAt: number;
+    difficultyBits: number;
+    nonce: string;
 }
 
 export interface GuildUpdate {
@@ -179,6 +314,8 @@ export interface AppObjectUpsert {
     namespace: string;
     objectType: string;
     objectId: string;
+    createOnly?: boolean;
+    lease?: AppObjectLease;
     channelId?: ChannelId;
     target?: AppObjectTarget;
     value?: any;
@@ -326,6 +463,7 @@ export interface SerializableGuildState {
     bans: Array<[UserId, Ban]>;             // Map as array of entries
     messages?: Array<[HashHex, SerializableMessageRef]>;
     appObjects?: Array<[string, AppObjectStateRef]>;
+    sfuAuthoritySets?: SfuAuthoritySet[];
     access: "public" | "private";
     policies?: GuildPolicies;
 }
@@ -348,6 +486,9 @@ export interface AppObjectStateRef {
     value?: any;
     authorId: UserId;
     updatedAt: number;
+    createOnly?: boolean;
+    lease?: AppObjectLease;
+    deviceAuthorization?: DeviceAuthorization;
 }
 
 export interface Checkpoint {
@@ -416,4 +557,5 @@ export type EventBody =
     | MemberKick
     | Checkpoint
     | EphemeralPolicyUpdate
-    | MemberUpdate;
+    | MemberUpdate
+    | SfuAuthoritySet;

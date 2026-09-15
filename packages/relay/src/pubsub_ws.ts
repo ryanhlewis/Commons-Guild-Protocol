@@ -408,6 +408,7 @@ export class WebSocketRelayPubSubAdapter implements RelayPubSubAdapter {
     private reconnectTimer?: NodeJS.Timeout;
     private authToken?: string;
     private wireFormat: CgpWireFormat;
+	private readySince = 0;
 
     constructor(url: string, options: { maxPendingPublishes?: number; authToken?: string; wireFormat?: CgpWireFormat } = {}) {
         this.url = url;
@@ -469,6 +470,10 @@ export class WebSocketRelayPubSubAdapter implements RelayPubSubAdapter {
         };
     }
 
+	isReady() {
+		return this.socket?.readyState === WebSocket.OPEN && Date.now() - this.readySince >= 100;
+	}
+
     async close() {
         this.closed = true;
         if (this.reconnectTimer) {
@@ -492,6 +497,7 @@ export class WebSocketRelayPubSubAdapter implements RelayPubSubAdapter {
 
         socket.on("open", () => {
             configureWebSocketTransport(socket);
+			this.readySince = Date.now();
             for (const [topic, handlers] of this.handlers) {
                 socket.send(pubSubFrame("SUB", this.withAuth({ topic, ...mergeSubscribeOptions(handlers) }), this.wireFormat));
             }
@@ -527,8 +533,14 @@ export class WebSocketRelayPubSubAdapter implements RelayPubSubAdapter {
             }
         });
 
-        socket.on("close", () => this.scheduleReconnect(socket));
-        socket.on("error", () => this.scheduleReconnect(socket));
+		socket.on("close", () => {
+			this.readySince = 0;
+			this.scheduleReconnect(socket);
+		});
+		socket.on("error", () => {
+			this.readySince = 0;
+			this.scheduleReconnect(socket);
+		});
     }
 
     private scheduleReconnect(socket: WebSocket) {
@@ -619,11 +631,59 @@ export class ShardedWebSocketRelayPubSubAdapter implements RelayPubSubAdapter {
         await Promise.allSettled(this.adapters.map((adapter) => adapter.close()));
     }
 
+	isReady() {
+		return this.adapters.every((adapter) => adapter.isReady());
+	}
+
     async drain(timeoutMs = 5000) {
         await Promise.all(this.adapters.map((adapter) => adapter.drain(timeoutMs)));
     }
 
     private adapterForTopic(topic: string) {
         return this.adapters[topicShardIndex(topic, this.adapters.length)];
+    }
+}
+
+export class RedundantWebSocketRelayPubSubAdapter implements RelayPubSubAdapter {
+    private adapters: WebSocketRelayPubSubAdapter[];
+
+    constructor(urls: string[] | string, options: { maxPendingPublishes?: number; authToken?: string; wireFormat?: CgpWireFormat } = {}) {
+        const normalized = normalizeUrlList(urls);
+        if (normalized.length === 0) {
+            throw new Error("RedundantWebSocketRelayPubSubAdapter requires at least one pubsub URL");
+        }
+        this.adapters = normalized.map((url) => new WebSocketRelayPubSubAdapter(url, options));
+    }
+
+    publish(topic: string, envelope: RelayPubSubEnvelope) {
+        for (const adapter of this.adapters) {
+            adapter.publish(topic, envelope);
+        }
+    }
+
+    async subscribe(topic: string, handler: (envelope: RelayPubSubEnvelope) => void, options?: RelayPubSubSubscribeOptions) {
+        const unsubscribers = await Promise.all(
+            this.adapters.map((adapter) => Promise.resolve(adapter.subscribe(topic, handler, options)))
+        );
+        return async () => {
+            await Promise.allSettled(unsubscribers.map((unsubscribe) => Promise.resolve(unsubscribe())));
+        };
+    }
+
+	isReady() {
+		return this.adapters.every((adapter) => adapter.isReady());
+	}
+
+    async close() {
+        await Promise.allSettled(this.adapters.map((adapter) => adapter.close()));
+    }
+
+    async drain(timeoutMs = 5000) {
+        const results = await Promise.allSettled(
+            this.adapters.map((adapter) => adapter.drain(timeoutMs))
+        );
+        if (results.every((result) => result.status === "rejected")) {
+            throw (results[0] as PromiseRejectedResult).reason;
+        }
     }
 }

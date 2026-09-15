@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { createInitialState, applyEvent, GuildState } from "@cgp/core/src/state";
-import { GuildEvent, GuildCreate, ChannelCreate, RoleAssign, BanUser } from "@cgp/core/src/types";
-import { computeEventId } from "@cgp/core/src/log";
+import { createInitialState, applyEvent, GuildState } from "@cgp/core";
+import { GuildEvent, GuildCreate, ChannelCreate, RoleAssign, BanUser } from "@cgp/core";
+import { computeEventId } from "@cgp/core";
 
 function createMockEvent(seq: number, body: any, author: string = "author_pubkey"): GuildEvent {
     const ev: any = {

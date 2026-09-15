@@ -1,0 +1,17 @@
+*
+!package.json
+!package-lock.json
+!packages/
+!packages/**
+!scripts/
+!scripts/**
+!loadnet/
+!loadnet/**
+
+**/node_modules/
+**/dist/
+**/.wrangler/
+**/.svelte-kit/
+loadnet/results/
+loadnet/docker-compose*.yml
+loadnet/*.log

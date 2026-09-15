@@ -196,7 +196,12 @@ interface CompactPublishParts {
 }
 
 function compactPublishParts(record: Record<string, unknown>): CompactPublishParts | undefined {
-    if (record.body === undefined || typeof record.author !== "string" || typeof record.signature !== "string") {
+    if (
+        record.deviceAuthorization !== undefined ||
+        record.body === undefined ||
+        typeof record.author !== "string" ||
+        typeof record.signature !== "string"
+    ) {
         return undefined;
     }
     const bodyBytes = utf8ToBytes(JSON.stringify(record.body ?? null));
