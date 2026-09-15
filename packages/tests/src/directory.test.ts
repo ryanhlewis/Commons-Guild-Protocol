@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach, beforeEach } from "vitest";
 import { DirectoryService, verifyDirectoryLookupProof, verifyDirectoryLookupQuorum } from "@cgp/directory/src/index";
-import { hashObject, generatePrivateKey, getPublicKey, sign } from "@cgp/core";
+import { hashObject, generatePrivateKey, getPublicKey, sign, directoryRegistrationPayload } from "@cgp/core";
 import { MerkleTree } from "merkletreejs";
 import { sha256 } from "@noble/hashes/sha256";
 import fs from "fs";
@@ -30,7 +30,7 @@ describe("Directory Service", () => {
         const relays = ["ws://localhost:8080", "ws://relay.example.com"];
         const timestamp = Date.now();
 
-        const msg = `REGISTER:${handle}:${guildId}:${timestamp}`;
+        const msg = directoryRegistrationPayload(handle, guildId, guildPubkey, timestamp, relays);
         const msgHash = hashObject(msg);
         const signature = await sign(privKey, msgHash);
 
@@ -46,14 +46,14 @@ describe("Directory Service", () => {
         const privKey1 = generatePrivateKey();
         const pub1 = getPublicKey(privKey1);
         const ts1 = Date.now();
-        const msg1 = `REGISTER:g1:id1:${ts1}`;
+        const msg1 = directoryRegistrationPayload("g1", "id1", pub1, ts1);
         const sig1 = await sign(privKey1, hashObject(msg1));
         await service.register("g1", "id1", pub1, sig1, ts1);
 
         const privKey2 = generatePrivateKey();
         const pub2 = getPublicKey(privKey2);
         const ts2 = Date.now();
-        const msg2 = `REGISTER:g2:id2:${ts2}`;
+        const msg2 = directoryRegistrationPayload("g2", "id2", pub2, ts2);
         const sig2 = await sign(privKey2, hashObject(msg2));
         await service.register("g2", "id2", pub2, sig2, ts2);
 
@@ -92,13 +92,13 @@ describe("Directory Service", () => {
         const pub = getPublicKey(privKey);
         const guildId = hashObject({ name: "strict-directory" });
         const timestamp = Date.now();
-        const signature = await sign(privKey, hashObject(`REGISTER:valid:${guildId}:${timestamp}`));
+        const signature = await sign(privKey, hashObject(directoryRegistrationPayload("valid", guildId, pub, timestamp)));
 
         await expect(service.register("valid", guildId, pub, signature, timestamp)).resolves.toBeUndefined();
         await expect(service.register("tampered", guildId, pub, signature, timestamp)).rejects.toThrow(/Invalid signature/);
 
         const staleTimestamp = Date.now() - 10 * 60 * 1000;
-        const staleSignature = await sign(privKey, hashObject(`REGISTER:stale:${guildId}:${staleTimestamp}`));
+        const staleSignature = await sign(privKey, hashObject(directoryRegistrationPayload("stale", guildId, pub, staleTimestamp)));
         await expect(service.register("stale", guildId, pub, staleSignature, staleTimestamp)).rejects.toThrow(/Timestamp/);
     });
 
@@ -112,7 +112,7 @@ describe("Directory Service", () => {
             const privKey = generatePrivateKey();
             const pub = getPublicKey(privKey);
             const timestamp = Date.now();
-            const signature = await sign(privKey, hashObject(`REGISTER:${handle}:${guildId}:${timestamp}`));
+            const signature = await sign(privKey, hashObject(directoryRegistrationPayload(handle, guildId, pub, timestamp)));
 
             await service.register(handle, guildId, pub, signature, timestamp);
             await secondService.register(handle, guildId, pub, signature, timestamp);

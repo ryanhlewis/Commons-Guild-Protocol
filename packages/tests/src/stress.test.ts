@@ -126,7 +126,7 @@ describe("Stress Testing", () => {
 
     it("handles high volume of directory registrations", async () => {
         const { DirectoryService } = await import("@cgp/directory/src/index");
-        const { hashObject, generatePrivateKey, getPublicKey, sign } = await import("@cgp/core");
+        const { hashObject, generatePrivateKey, getPublicKey, sign, directoryRegistrationPayload } = await import("@cgp/core");
         const fs = await import("fs");
 
         const DIR_DB_PATH = "./test-stress-dir-db";
@@ -145,7 +145,7 @@ describe("Stress Testing", () => {
                 const pub = getPublicKey(priv);
                 const guildId = hashObject({ name: handle });
                 const timestamp = Date.now();
-                const msg = `REGISTER:${handle}:${guildId}:${timestamp}`;
+                const msg = directoryRegistrationPayload(handle, guildId, pub, timestamp);
                 const sig = await sign(priv, hashObject(msg));
                 await service.register(handle, guildId, pub, sig, timestamp);
             })();

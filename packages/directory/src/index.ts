@@ -1,7 +1,7 @@
 import express from "express";
 import { MerkleTree } from "merkletreejs";
 import { sha256 } from "@noble/hashes/sha256";
-import { GuildId, PublicKeyHex, hashObject, verify, sign, generatePrivateKey, getPublicKey } from "@cgp/core";
+import { GuildId, PublicKeyHex, hashObject, verify, sign, generatePrivateKey, getPublicKey, directoryRegistrationPayload } from "@cgp/core";
 import { Level } from "level";
 
 export interface DirectoryValue {
@@ -11,6 +11,7 @@ export interface DirectoryValue {
     relays?: string[];
     registeredAt?: number;
     registrationSignature?: string;
+    registrationVersion?: number;
 }
 
 export interface DirectorySnapshot {
@@ -39,6 +40,8 @@ export class DirectoryService {
     private db: Level<string, string>;
     private tree: MerkleTree;
     private ready: Promise<void>;
+    private mutations: Promise<void> = Promise.resolve();
+    private entries = new Map<string, DirectoryValue>();
     private treeSize = 0;
     private operatorPrivateKey: Uint8Array;
     public readonly operatorPubkey: PublicKeyHex;
@@ -53,11 +56,18 @@ export class DirectoryService {
 
     async register(handle: string, guildId: GuildId, guildPubkey: PublicKeyHex, signature: string, timestamp: number, relays?: string[]) {
         await this.ready;
-
-        // Verify signature
-        // Message: "REGISTER:<handle>:<guildId>:<timestamp>"
-        const msg = `REGISTER:${handle}:${guildId}:${timestamp}`;
-        const msgHash = hashObject(msg);
+        if (typeof handle !== 'string' || !/^[a-z0-9][a-z0-9/_-]{0,63}$/.test(handle) ||
+            typeof guildId !== 'string' || !guildId || guildId.length > 192 ||
+            typeof guildPubkey !== 'string' || !/^(02|03)[a-f0-9]{64}$/i.test(guildPubkey) ||
+            !Number.isSafeInteger(timestamp) ||
+            (relays !== undefined && (!Array.isArray(relays) || relays.length > 32 || relays.some(relay => {
+                if (typeof relay !== 'string' || relay.length > 2048) return true;
+                try { const url = new URL(relay); return !['http:', 'https:', 'ws:', 'wss:'].includes(url.protocol) || Boolean(url.username || url.password); }
+                catch { return true; }
+            })))) throw new Error('Invalid directory registration fields');
+        guildPubkey = guildPubkey.toLowerCase();
+        const routes = [...(relays ?? [])];
+        const msgHash = hashObject(directoryRegistrationPayload(handle, guildId, guildPubkey, timestamp, routes));
         if (!verify(guildPubkey, msgHash, signature)) {
             throw new Error("Invalid signature");
         }
@@ -68,25 +78,37 @@ export class DirectoryService {
             throw new Error("Timestamp out of bounds");
         }
 
-        const value: DirectoryValue = { handle, guildId, guildPubkey, relays, registeredAt: timestamp, registrationSignature: signature };
-        await this.db.put(handle, JSON.stringify(value));
-        await this.rebuildTree();
+        const value: DirectoryValue = { handle, guildId, guildPubkey, relays: routes, registeredAt: timestamp, registrationSignature: signature, registrationVersion: 2 };
+        const operation = this.mutations.then(async () => {
+            const previous = this.entries.get(handle);
+            if (previous) {
+                if (previous.guildPubkey.toLowerCase() !== guildPubkey) throw new Error('Handle is owned by another key');
+                if (hashObject(previous) === hashObject(value)) return; // Safe idempotent retry.
+                if (timestamp <= (previous.registeredAt ?? 0)) throw new Error('Registration update must be newer');
+            }
+            const entries = new Map(this.entries);
+            entries.set(handle, value);
+            // Build before persistence: a failed write leaves the published snapshot intact.
+            const tree = this.treeFor(entries);
+            await this.db.put(handle, JSON.stringify(value));
+            // No await between publishing entries and tree; readers see one snapshot.
+            this.entries = entries;
+            this.tree = tree;
+            this.treeSize = entries.size;
+        });
+        this.mutations = operation.catch(() => undefined);
+        await operation;
     }
 
     async getEntry(handle: string): Promise<DirectoryValue | undefined> {
         await this.ready;
-        try {
-            const val = await this.db.get(handle);
-            return JSON.parse(val);
-        } catch (e: any) {
-            if (e.code === 'LEVEL_NOT_FOUND' || e.code === 'KEY_NOT_FOUND' || e.notFound) return undefined;
-            throw e;
-        }
+        const entry = this.entries.get(handle);
+        return entry ? structuredClone(entry) : undefined;
     }
 
     async getProof(handle: string) {
         await this.ready;
-        const entry = await this.getEntry(handle);
+        const entry = this.entries.get(handle);
         if (!entry) return null;
         const leaf = this.hashEntry(entry);
         return this.tree.getHexProof(leaf);
@@ -99,6 +121,10 @@ export class DirectoryService {
 
     async getSnapshot(): Promise<DirectorySnapshot> {
         await this.ready;
+        return this.snapshot();
+    }
+
+    private async snapshot(): Promise<DirectorySnapshot> {
         const root = this.tree.getHexRoot();
         const size = this.treeSize;
         const timestamp = Date.now();
@@ -109,25 +135,30 @@ export class DirectoryService {
 
     async getLookupProof(handle: string): Promise<DirectoryLookupProof | null> {
         await this.ready;
-        const entry = await this.getEntry(handle);
+        const entry = this.entries.get(handle);
         if (!entry) return null;
         return {
-            entry,
+            entry: structuredClone(entry),
             proof: this.tree.getHexProof(this.hashEntry(entry)),
-            snapshot: await this.getSnapshot()
+            snapshot: await this.snapshot()
         };
     }
 
     private async rebuildTree() {
-        const leaves: Buffer[] = [];
+        const entries = new Map<string, DirectoryValue>();
         // Scan all entries
         for await (const [, value] of this.db.iterator()) {
             const entry = JSON.parse(value);
-            leaves.push(this.hashEntry(entry));
+            entries.set(entry.handle, entry);
         }
 
-        this.tree = new MerkleTree(leaves, sha256, { sortPairs: true });
-        this.treeSize = leaves.length;
+        this.entries = entries;
+        this.tree = this.treeFor(entries);
+        this.treeSize = entries.size;
+    }
+
+    private treeFor(entries: Map<string, DirectoryValue>) {
+        return new MerkleTree([...entries].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([, entry]) => this.hashEntry(entry)), sha256, { sortPairs: true });
     }
 
     private hashEntry(entry: DirectoryValue) {
@@ -135,6 +166,8 @@ export class DirectoryService {
     }
 
     async close() {
+        await this.ready;
+        await this.mutations;
         await this.db.close();
     }
 }
