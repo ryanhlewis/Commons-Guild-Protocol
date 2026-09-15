@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { RelayServer } from "@cgp/relay/src/server";
 import { RelayPlugin } from "@cgp/relay/src/plugins";
-import { CgpClient } from "@cgp/client/src/client";
+import { CgpClient } from "@cgp/client";
 
 describe("Client Plugin Discovery", () => {
     let relay: RelayServer;

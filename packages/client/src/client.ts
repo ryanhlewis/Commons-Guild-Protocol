@@ -1,5 +1,4 @@
 import { EventEmitter } from "events";
-import { randomBytes } from "crypto";
 import { WebSocket } from "ws";
 import {
     GuildEvent,
@@ -12,6 +11,7 @@ import {
     deserializeState,
     rebuildStateFromEvents,
     verify,
+    verifyObject,
     hashObject,
     sign,
     EventBody,
@@ -19,6 +19,7 @@ import {
     ChannelCreate,
     Message,
     AppObjectDelete,
+    AppObjectLease,
     AppObjectTarget,
     AppObjectUpsert,
     RoleAssign,
@@ -48,7 +49,11 @@ import {
     encodeCgpFrame,
     encodeCgpWireFrame,
     stringifyCgpFrame,
-    InvalidCgpFrameError
+    InvalidCgpFrameError,
+    DeviceAuthorityRegistry,
+    verifyDeviceAuthorizedObject,
+    type DeviceAuthorization,
+    type DeviceCapability
 } from "@cgp/core";
 
 export type StateIncludeMode = "full" | "partial" | "omitted";
@@ -74,6 +79,8 @@ export interface StateResponse {
     endHash: string;
     checkpointSeq?: number | null;
     checkpointHash?: string | null;
+    /** Relay-signed attestation created from the same rebuilt state snapshot. */
+    head?: RelayHead | null;
     membersPage?: MemberPageMeta;
     stateIncludes?: StateIncludes;
 }
@@ -232,6 +239,11 @@ export interface PublishReliableOptions {
     clientEventId?: string;
 }
 
+export interface PublishTransientUnreliableOptions {
+    clientEventId?: string;
+    maxBufferedBytes?: number;
+}
+
 export interface PublishBatchReliableOptions {
     timeoutMs?: number;
     batchId?: string;
@@ -239,10 +251,17 @@ export interface PublishBatchReliableOptions {
 
 export type ClientWireFormat = CgpWireFormat;
 
+export interface CgpDeviceSigner {
+    privateKey: Uint8Array;
+    authorization: DeviceAuthorization;
+}
+
 export interface AppObjectWriteOptions {
     channelId?: ChannelId;
     target?: AppObjectTarget;
     value?: any;
+    createOnly?: boolean;
+    lease?: AppObjectLease;
 }
 
 const MAX_OWN_PUBLISH_PROOFS = 5000;
@@ -280,7 +299,8 @@ function mergePartialState(current: GuildState | undefined, incoming: GuildState
 }
 
 function randomNonceHex(byteLength = 16) {
-    return randomBytes(byteLength).toString("hex");
+    const bytes = globalThis.crypto.getRandomValues(new Uint8Array(byteLength));
+    return Buffer.from(bytes).toString("hex");
 }
 
 interface TrustedRelayHeadAnchor {
@@ -296,6 +316,8 @@ export class CgpClient extends EventEmitter {
     private sockets: WebSocket[] = [];
     private socketUrls = new Map<WebSocket, string>();
     private keyPair?: { pub: string; priv: Uint8Array };
+    private deviceSigner?: CgpDeviceSigner;
+    private deviceAuthorities = new DeviceAuthorityRegistry();
     private state = new Map<GuildId, GuildState>();
     private desiredSubscriptions = new Set<GuildId>();
     private seenEvents = new Set<string>();
@@ -317,16 +339,89 @@ export class CgpClient extends EventEmitter {
     private wireFormat: ClientWireFormat;
     private connectTimeoutMs: number;
 
-    constructor(config: { relays: string[]; keyPair?: { pub: string; priv: Uint8Array }; debugLogs?: boolean; wireFormat?: ClientWireFormat; connectTimeoutMs?: number; writeRelays?: string[] }) {
+    constructor(config: {
+        relays: string[];
+        keyPair?: { pub: string; priv: Uint8Array };
+        deviceSigner?: CgpDeviceSigner;
+        debugLogs?: boolean;
+        wireFormat?: ClientWireFormat;
+        connectTimeoutMs?: number;
+        writeRelays?: string[];
+    }) {
         super();
         this.relays = config.relays;
         this.writeRelays = Array.isArray(config.writeRelays) && config.writeRelays.length > 0
             ? config.writeRelays
             : config.relays;
         this.keyPair = config.keyPair;
+        this.deviceSigner = config.deviceSigner;
         this.debugLogs = config.debugLogs ?? clientDebugLoggingEnabled();
         this.wireFormat = config.wireFormat ?? clientWireFormatFromEnv();
         this.connectTimeoutMs = config.connectTimeoutMs ?? positiveClientIntegerFromEnv("CGP_CLIENT_CONNECT_TIMEOUT_MS", 5000);
+    }
+
+    private async signAccountPayload(
+        payload: unknown,
+        requiredCapability: DeviceCapability,
+    ) {
+        if (!this.keyPair) {
+            throw new Error("No keypair");
+        }
+        if (!this.deviceSigner) {
+            return {
+                signature: await sign(
+                    this.keyPair.priv,
+                    hashObject(payload),
+                ),
+            };
+        }
+        const { privateKey, authorization } = this.deviceSigner;
+        const signature = await sign(
+            privateKey,
+            hashObject({ payload, deviceAuthorization: authorization }),
+        );
+        const verified = verifyDeviceAuthorizedObject(
+            payload,
+            signature,
+            authorization,
+            {
+                accountPublicKey: this.keyPair.pub,
+                requiredCapability,
+            },
+        );
+        if (!verified.ok) {
+            throw new Error(
+                verified.error ?? "Configured device signer is invalid",
+            );
+        }
+        return { signature, deviceAuthorization: authorization };
+    }
+
+    private async signedPublishPayload(
+        body: EventBody,
+        createdAt: number,
+        clientEventId?: string,
+    ) {
+        if (!this.keyPair) {
+            throw new Error("No keypair");
+        }
+        const unsigned = {
+            body,
+            author: this.keyPair.pub,
+            createdAt,
+        };
+        const signed = await this.signAccountPayload(unsigned, "publish");
+        this.rememberOwnPublishProof(
+            body,
+            this.keyPair.pub,
+            createdAt,
+            signed.signature,
+        );
+        return {
+            ...unsigned,
+            ...signed,
+            ...(clientEventId ? { clientEventId } : {}),
+        };
     }
 
     async connect() {
@@ -356,11 +451,14 @@ export class CgpClient extends EventEmitter {
             return payload;
         }
 
-        const { pub, priv } = this.keyPair;
+        const { pub } = this.keyPair;
         const createdAt = Date.now();
         const unsignedPayload = { ...payload, author: pub, createdAt };
-        const signature = await sign(priv, hashObject({ kind, payload: unsignedPayload }));
-        return { ...unsignedPayload, signature };
+        const signed = await this.signAccountPayload(
+            { kind, payload: unsignedPayload },
+            "read",
+        );
+        return { ...unsignedPayload, ...signed };
     }
 
     private sendEncodedFrame(socket: WebSocket, frame: string | Uint8Array) {
@@ -418,8 +516,19 @@ export class CgpClient extends EventEmitter {
         return writers;
     }
 
+    private peerSockets() {
+        return this.sockets.filter(
+            (socket) => !this.socketUrls.has(socket) && socket.readyState === WebSocket.OPEN
+        );
+    }
+
     private sendEncodedFrameToWriterSocket(frame: string | Uint8Array) {
         return this.sendEncodedFrameToWriterSocketWithSocket(frame) !== undefined;
+    }
+
+    private sendEncodedFrameToWriterSockets(frame: string | Uint8Array) {
+        const writers = this.writerSockets();
+        return writers.filter((writer) => this.sendEncodedFrame(writer, frame));
     }
 
     private sendEncodedFrameToWriterSocketWithSocket(frame: string | Uint8Array) {
@@ -655,7 +764,7 @@ export class CgpClient extends EventEmitter {
         return true;
     }
 
-    private verifiesSignedEventEnvelope(event: GuildEvent) {
+    private verifiesSignedEventEnvelope(event: GuildEvent, historical = false) {
         if (!event || typeof event !== "object") {
             return false;
         }
@@ -680,11 +789,31 @@ export class CgpClient extends EventEmitter {
             return false;
         }
         const unsignedForSig = { body: event.body, author: event.author, createdAt: event.createdAt };
-        const msgHash = hashObject(unsignedForSig);
-        const alreadyProvedByThisClient =
-            event.author === this.keyPair?.pub &&
-            this.consumeOwnPublishProof(event.body, event.author, event.createdAt, event.signature);
-        if (!alreadyProvedByThisClient && !verify(event.author, msgHash, event.signature)) {
+        if (event.author === this.keyPair?.pub) {
+            this.consumeOwnPublishProof(
+                event.body,
+                event.author,
+                event.createdAt,
+                event.signature,
+            );
+        }
+        const pin = this.deviceAuthorities.get(event.author);
+        const validLegacyHistory =
+            historical &&
+            !event.deviceAuthorization &&
+            pin &&
+            event.createdAt < pin.activatedAt &&
+            verifyObject(event.author, unsignedForSig, event.signature);
+        const verified =
+            validLegacyHistory ||
+            this.deviceAuthorities.verify(
+                unsignedForSig,
+                event.signature,
+                event.author,
+                event.deviceAuthorization,
+                "publish",
+            ).ok;
+        if (!verified) {
             if (this.debugLogs) console.log(`Client: Invalid signature for event ${event.id}`);
             return false;
         }
@@ -703,11 +832,23 @@ export class CgpClient extends EventEmitter {
         ) {
             return false;
         }
-        return verify(event.author, hashObject({
-            body: event.body,
-            author: event.author,
-            createdAt: event.createdAt
-        }), event.signature);
+        if (!this.deviceAuthorities.verify(
+            {
+                body: event.body,
+                author: event.author,
+                createdAt: event.createdAt,
+            },
+            event.signature,
+            event.author,
+            event.deviceAuthorization,
+            "publish",
+        ).ok) {
+            return false;
+        }
+        const body = event.body as EventBody & { expiresAt?: unknown };
+        return typeof body.expiresAt !== "number" ||
+            !Number.isFinite(body.expiresAt) ||
+            body.expiresAt > Date.now();
     }
 
     private acceptsSignedEvent(event: GuildEvent) {
@@ -863,8 +1004,8 @@ export class CgpClient extends EventEmitter {
 
                     // Gossip: Forward to all other peers
                     let gossipCount = 0;
-                    this.sockets.forEach(s => {
-                        if (s !== socket && s.readyState === WebSocket.OPEN) {
+                    this.peerSockets().forEach(s => {
+                        if (s !== socket) {
                             if (this.sendRawFrame(s, rawFrame)) {
                                 gossipCount++;
                             }
@@ -885,7 +1026,9 @@ export class CgpClient extends EventEmitter {
                         });
                         return;
                     }
-                    const invalidEvent = events.find((event) => !this.verifiesSignedEventEnvelope(event));
+                    const invalidEvent = events.find(
+                        (event) => !this.verifiesSignedEventEnvelope(event, true),
+                    );
                     if (invalidEvent) {
                         this.emit("error_frame", {
                             subId: p.subId,
@@ -917,13 +1060,29 @@ export class CgpClient extends EventEmitter {
                     events.forEach((e: GuildEvent) => this.emit("event", e));
 
                 } else if (kind === "PUBLISH") {
-                    const p = payload as { body: EventBody; author: string; signature: string; createdAt: number };
-                    const { body, author, signature, createdAt } = p;
+                    const p = payload as {
+                        body: EventBody;
+                        author: string;
+                        signature: string;
+                        deviceAuthorization?: DeviceAuthorization;
+                        createdAt: number;
+                    };
+                    const {
+                        body,
+                        author,
+                        signature,
+                        deviceAuthorization,
+                        createdAt,
+                    } = p;
 
                     const unsignedForSig = { body, author, createdAt };
-                    const msgHash = hashObject(unsignedForSig);
-
-                    if (!verify(author, msgHash, signature)) {
+                    if (!this.deviceAuthorities.verify(
+                        unsignedForSig,
+                        signature,
+                        author,
+                        deviceAuthorization,
+                        "publish",
+                    ).ok) {
                         if (this.debugLogs) console.log(`Client: Invalid signature for PUBLISH from peer`);
                         return;
                     }
@@ -949,7 +1108,8 @@ export class CgpClient extends EventEmitter {
                         createdAt,
                         author,
                         body,
-                        signature
+                        signature,
+                        deviceAuthorization,
                     };
                     event.id = computeEventId(event);
 
@@ -959,11 +1119,9 @@ export class CgpClient extends EventEmitter {
                     // Gossip: Forward as EVENT to all peers
                     const eventFrame = encodeCgpFrame("EVENT", event, this.wireFormat);
                     let gossipCount = 0;
-                    this.sockets.forEach(s => {
-                        if (s.readyState === WebSocket.OPEN) {
-                            if (this.sendEncodedFrame(s, eventFrame)) {
-                                gossipCount++;
-                            }
+                    this.peerSockets().forEach(s => {
+                        if (this.sendEncodedFrame(s, eventFrame)) {
+                            gossipCount++;
                         }
                     });
                     // console.log(`Converted PUBLISH to EVENT and gossiped to ${gossipCount} peers`);
@@ -1001,8 +1159,8 @@ export class CgpClient extends EventEmitter {
                             acceptedCount++;
                         }
                         if (acceptedCount > 0) {
-                            this.sockets.forEach(s => {
-                                if (s !== socket && s.readyState === WebSocket.OPEN) {
+                            this.peerSockets().forEach(s => {
+                                if (s !== socket) {
                                     this.sendRawFrame(s, rawFrame);
                                 }
                             });
@@ -1255,6 +1413,8 @@ export class CgpClient extends EventEmitter {
             namespace,
             objectType,
             objectId,
+            createOnly: options.createOnly,
+            lease: options.lease,
             channelId: options.channelId,
             target: options.target,
             value: options.value
@@ -1618,12 +1778,12 @@ export class CgpClient extends EventEmitter {
 
     async publish(body: EventBody): Promise<string> {
         if (!this.keyPair) throw new Error("No keypair");
-        const { pub, priv } = this.keyPair;
+        const { pub } = this.keyPair;
         const createdAt = Date.now();
 
+        const payload = await this.signedPublishPayload(body, createdAt);
+        const { signature, deviceAuthorization } = payload;
         const unsigned = { body, author: pub, createdAt };
-        const signature = await sign(priv, hashObject(unsigned));
-        this.rememberOwnPublishProof(body, pub, createdAt, signature);
 
         if (this.relays.length === 0) {
             const targetGuildId = body.guildId || (body.type === "GUILD_CREATE" ? computeEventId({ ...unsigned, id: "", seq: 0, prevHash: null, signature } as any) : null);
@@ -1634,7 +1794,14 @@ export class CgpClient extends EventEmitter {
             const prevHash = state ? state.headHash : null;
 
             const event: GuildEvent = {
-                id: "", seq, prevHash, createdAt, author: pub, body, signature
+                id: "",
+                seq,
+                prevHash,
+                createdAt,
+                author: pub,
+                body,
+                signature,
+                deviceAuthorization,
             };
             event.id = computeEventId(event);
 
@@ -1652,8 +1819,7 @@ export class CgpClient extends EventEmitter {
             return event.id;
         }
 
-        const payload = { body, author: pub, signature, createdAt };
-        this.sendFrameToWriterSocket("PUBLISH", payload);
+        this.sendEncodedFrameToWriterSockets(encodeCgpFrame("PUBLISH", payload, this.wireFormat));
 
         return "";
     }
@@ -1671,17 +1837,17 @@ export class CgpClient extends EventEmitter {
             };
         }
 
-        const { pub, priv } = this.keyPair;
         const createdAt = Date.now();
         const clientEventId = options.clientEventId || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-        const unsigned = { body, author: pub, createdAt };
-        const signature = await sign(priv, hashObject(unsigned));
-        this.rememberOwnPublishProof(body, pub, createdAt, signature);
-        const payload = { body, author: pub, signature, createdAt, clientEventId };
+        const payload = await this.signedPublishPayload(
+            body,
+            createdAt,
+            clientEventId,
+        );
         const timeoutMs = options.timeoutMs ?? 10000;
 
         return new Promise<PublishAck>((resolve, reject) => {
-            let writer: WebSocket | undefined;
+            const writers = new Set<WebSocket>();
             const timeout = setTimeout(() => {
                 cleanup();
                 reject(new Error("Timeout waiting for publish acknowledgement"));
@@ -1700,30 +1866,43 @@ export class CgpClient extends EventEmitter {
                 }
             };
             const writerClosedHandler = () => {
-                cleanup();
-                reject(new Error("Writer relay connection closed before publish acknowledgement"));
+                for (const writer of writers) {
+                    if (writer.readyState === WebSocket.CLOSED) {
+                        writers.delete(writer);
+                    }
+                }
+                if (writers.size === 0) {
+                    cleanup();
+                    reject(new Error("Writer relay connections closed before publish acknowledgement"));
+                }
             };
 
             const cleanup = () => {
                 clearTimeout(timeout);
                 this.off("publish_ack", ackHandler);
                 this.off("error_frame", errorHandler);
-                writer?.off?.("close", writerClosedHandler);
-                writer?.off?.("error", writerClosedHandler);
+                for (const writer of writers) {
+                    writer.off?.("close", writerClosedHandler);
+                    writer.off?.("error", writerClosedHandler);
+                }
             };
 
             this.on("publish_ack", ackHandler);
             this.on("error_frame", errorHandler);
 
-            writer = this.sendEncodedFrameToWriterSocketWithSocket(encodeCgpFrame("PUBLISH", payload, this.wireFormat));
-
-            if (!writer) {
+            const sentWriters = this.sendEncodedFrameToWriterSockets(
+                encodeCgpFrame("PUBLISH", payload, this.wireFormat)
+            );
+            for (const writer of sentWriters) {
+                writers.add(writer);
+                writer.once?.("close", writerClosedHandler);
+                writer.once?.("error", writerClosedHandler);
+            }
+            if (writers.size === 0) {
                 cleanup();
                 reject(new Error("No open relay connection"));
                 return;
             }
-            writer.once?.("close", writerClosedHandler);
-            writer.once?.("error", writerClosedHandler);
         });
     }
 
@@ -1733,12 +1912,13 @@ export class CgpClient extends EventEmitter {
             throw new Error("Transient publishes require a relay websocket");
         }
 
-        const { pub, priv } = this.keyPair;
         const createdAt = Date.now();
         const clientEventId = options.clientEventId || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-        const unsigned = { body, author: pub, createdAt };
-        const signature = await sign(priv, hashObject(unsigned));
-        const payload = { body, author: pub, signature, createdAt, clientEventId };
+        const payload = await this.signedPublishPayload(
+            body,
+            createdAt,
+            clientEventId,
+        );
         const timeoutMs = options.timeoutMs ?? 10000;
 
         return new Promise<PublishAck>((resolve, reject) => {
@@ -1788,6 +1968,43 @@ export class CgpClient extends EventEmitter {
         });
     }
 
+    async publishTransientUnreliable(
+        body: EventBody,
+        options: PublishTransientUnreliableOptions = {}
+    ): Promise<boolean> {
+        if (!this.keyPair) throw new Error("No keypair");
+        if (this.relays.length === 0) {
+            throw new Error("Transient publishes require a relay websocket");
+        }
+
+        const writer = this.writerSockets()[0];
+        if (!writer) {
+            return false;
+        }
+        const maxBufferedBytes = Math.max(0, options.maxBufferedBytes ?? 512 * 1024);
+        if (writer.bufferedAmount > maxBufferedBytes) {
+            return false;
+        }
+
+        const createdAt = Date.now();
+        const clientEventId = options.clientEventId || `${createdAt}-${Math.random().toString(36).slice(2)}`;
+        const payload = await this.signedPublishPayload(
+            body,
+            createdAt,
+            clientEventId,
+        );
+        if (writer.readyState !== WebSocket.OPEN || writer.bufferedAmount > maxBufferedBytes) {
+            return false;
+        }
+        return this.sendEncodedFrame(
+            writer,
+            encodeCgpFrame("PUBLISH_TRANSIENT", {
+                ...payload,
+                ackRequested: false
+            }, this.wireFormat)
+        );
+    }
+
     async publishBatchReliable(bodies: EventBody[], options: PublishBatchReliableOptions = {}): Promise<PublishAck[]> {
         if (!this.keyPair) throw new Error("No keypair");
         if (bodies.length === 0) return [];
@@ -1799,16 +2016,16 @@ export class CgpClient extends EventEmitter {
             return results;
         }
 
-        const { pub, priv } = this.keyPair;
         const batchId = options.batchId || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
         const createdAtBase = Date.now();
         const events = await Promise.all(bodies.map(async (body, index) => {
             const createdAt = createdAtBase + index;
             const clientEventId = `${batchId}:${index}`;
-            const unsigned = { body, author: pub, createdAt };
-            const signature = await sign(priv, hashObject(unsigned));
-            this.rememberOwnPublishProof(body, pub, createdAt, signature);
-            return { body, author: pub, signature, createdAt, clientEventId };
+            return await this.signedPublishPayload(
+                body,
+                createdAt,
+                clientEventId,
+            );
         }));
         const payload = { batchId, events };
         const timeoutMs = options.timeoutMs ?? 10000;

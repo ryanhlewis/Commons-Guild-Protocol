@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { CgpClient } from "@cgp/client/src/client";
+import { CgpClient } from "@cgp/client";
 import { generatePrivateKey, getPublicKey, hashObject } from "@cgp/core";
-import { createMediaStoragePolicyPlugin } from "@cgp/relay/src/plugins";
+import { createFauxIpfsBackendPlugin, createHeliaIpfsPlugin, createMediaStoragePolicyPlugin } from "@cgp/relay/src/plugins";
 import { RelayServer } from "@cgp/relay/src/server";
 import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
 function sleep(ms: number) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -88,6 +90,134 @@ describe("media storage policy plugin", () => {
         } finally {
             await relay.close();
             await fs.rm(dbPath, { recursive: true, force: true });
+        }
+    });
+
+    it("uploads accepted media bytes through a registered Helia backend", async () => {
+        const dbPath = `./test-media-upload-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        const heliaDir = await fs.mkdtemp(path.join(os.tmpdir(), "cgp-media-helia-"));
+        const relay = new RelayServer(
+            0,
+            dbPath,
+            [
+                createHeliaIpfsPlugin({ storeDir: heliaDir, exposeHttpRoutes: true }),
+                mediaPlugin(),
+            ],
+            { enableDefaultPlugins: false },
+        );
+        try {
+            const port = await waitForPort(relay);
+            const bytes = Buffer.from("real meme image bytes");
+            const uploadResponse = await fetch(`http://localhost:${port}/plugins/cgp.media.storage/upload`, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                    bytesBase64: bytes.toString("base64"),
+                    name: "meme.webp",
+                    mimeType: "image/webp",
+                    tags: ["meme"],
+                    encrypted: true,
+                    providerId: "meme-ipfs",
+                }),
+            });
+            const uploaded = await uploadResponse.json() as any;
+            expect(uploadResponse.status, JSON.stringify(uploaded)).toBe(201);
+            expect(uploaded.selected.id).toBe("meme-ipfs");
+            expect(uploaded.cid).toMatch(/^baf/);
+            expect(uploaded.attachment).toMatchObject({
+                url: `ipfs://${uploaded.cid}`,
+                scheme: "ipfs",
+                mimeType: "image/webp",
+                size: bytes.byteLength,
+                external: {
+                    storage: {
+                        providerId: "meme-ipfs",
+                        kind: "ipfs",
+                        ipfsBackendId: "helia",
+                    },
+                },
+            });
+
+            const heliaResponse = await fetch(`http://localhost:${port}/plugins/cgp.ipfs.helia/ipfs/${uploaded.cid}`);
+            expect(heliaResponse.status).toBe(200);
+            expect(Buffer.from(await heliaResponse.arrayBuffer()).toString("utf8")).toBe(bytes.toString("utf8"));
+        } finally {
+            await relay.close();
+            await fs.rm(dbPath, { recursive: true, force: true });
+            await fs.rm(heliaDir, { recursive: true, force: true });
+        }
+    }, 15_000);
+
+    it("uploads accepted media bytes through a faux IPFS backend", async () => {
+        const dbPath = `./test-media-faux-upload-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        const fauxDir = await fs.mkdtemp(path.join(os.tmpdir(), "cgp-media-faux-"));
+        const relay = new RelayServer(
+            0,
+            dbPath,
+            [
+                createFauxIpfsBackendPlugin({
+                    id: "faux",
+                    storage: "local",
+                    storeDir: fauxDir,
+                    exposeHttpRoutes: true,
+                }),
+                createMediaStoragePolicyPlugin({
+                    maxAttachmentBytes: 1024 * 1024,
+                    providers: [
+                        {
+                            id: "meme-faux",
+                            kind: "ipfs",
+                            ipfsBackendId: "faux",
+                            priority: 100,
+                            maxBytes: 1024 * 1024,
+                            acceptsMimeTypes: ["image/*"],
+                            acceptsTags: ["meme"],
+                            adult: "deny",
+                            retention: "operator-defined",
+                        },
+                    ],
+                }),
+            ],
+            { enableDefaultPlugins: false },
+        );
+        try {
+            const port = await waitForPort(relay);
+            const bytes = Buffer.from("faux meme image bytes");
+            const uploadResponse = await fetch(`http://localhost:${port}/plugins/cgp.media.storage/upload`, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                    bytesBase64: bytes.toString("base64"),
+                    name: "meme-faux.webp",
+                    mimeType: "image/webp",
+                    tags: ["meme"],
+                    encrypted: true,
+                    providerId: "meme-faux",
+                }),
+            });
+            const uploaded = await uploadResponse.json() as any;
+            expect(uploadResponse.status, JSON.stringify(uploaded)).toBe(201);
+            expect(uploaded.selected.id).toBe("meme-faux");
+            expect(uploaded.attachment).toMatchObject({
+                url: `ipfs://${uploaded.cid}`,
+                scheme: "ipfs",
+                external: {
+                    storage: {
+                        providerId: "meme-faux",
+                        kind: "ipfs",
+                        ipfsBackendId: "faux",
+                    },
+                },
+            });
+
+            const fauxResponse = await fetch(`http://localhost:${port}/plugins/cgp.ipfs.faux/ipfs/${uploaded.cid}`);
+            expect(fauxResponse.status).toBe(200);
+            expect(fauxResponse.headers.get("x-cgp-faux-ipfs")).toBe("1");
+            expect(Buffer.from(await fauxResponse.arrayBuffer()).toString("utf8")).toBe(bytes.toString("utf8"));
+        } finally {
+            await relay.close();
+            await fs.rm(dbPath, { recursive: true, force: true });
+            await fs.rm(fauxDir, { recursive: true, force: true });
         }
     });
 

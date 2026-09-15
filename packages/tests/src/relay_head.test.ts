@@ -152,6 +152,64 @@ describe("signed relay heads", () => {
         ]);
     });
 
+    it("counts only active relay-head conflicts and clears healed evidence", async () => {
+        const relay = new RelayServer(0, new MemoryStore(), [], {
+            enableDefaultPlugins: false
+        });
+        relays.push(relay);
+        const keyA = keyPair();
+        const keyB = keyPair();
+        const guildId = hashObject({ guild: "relay-head-conflict-metric" });
+        const canonicalHash = hashObject({ branch: "canonical" });
+        const left = await fakeHead(keyA.priv, {
+            relayId: "relay-a",
+            guildId,
+            headSeq: 7,
+            headHash: canonicalHash,
+            prevHash: hashObject({ seq: 6 }),
+            checkpointSeq: null,
+            checkpointHash: null
+        });
+        const matching = await fakeHead(keyB.priv, {
+            relayId: "relay-b",
+            guildId,
+            headSeq: 7,
+            headHash: canonicalHash,
+            prevHash: hashObject({ seq: 6 }),
+            checkpointSeq: null,
+            checkpointHash: null
+        });
+        const conflicting = await fakeHead(keyB.priv, {
+            ...matching,
+            headHash: hashObject({ branch: "conflict" }),
+            observedAt: matching.observedAt + 1
+        });
+        const healed = await fakeHead(keyB.priv, {
+            ...matching,
+            observedAt: matching.observedAt + 2
+        });
+        const healedConfirmation = await fakeHead(keyB.priv, {
+            ...matching,
+            observedAt: matching.observedAt + 3
+        });
+        const conflictGauge = () => {
+            const metrics = (relay as any).renderPrometheusMetrics() as string;
+            return Number(
+                /^cgp_relay_head_conflict_guilds ([0-9.]+)$/m.exec(metrics)?.[1]
+            );
+        };
+
+        (relay as any).recordRelayHeadObservation(left);
+        (relay as any).recordRelayHeadObservation(matching);
+        expect(conflictGauge()).toBe(0);
+        (relay as any).recordRelayHeadObservation(conflicting);
+        expect(conflictGauge()).toBe(1);
+        (relay as any).recordRelayHeadObservation(healed);
+        expect(conflictGauge()).toBe(1);
+        (relay as any).recordRelayHeadObservation(healedConfirmation);
+        expect(conflictGauge()).toBe(0);
+    });
+
     it("scopes relay-head quorum to the requested guild and supports freshness policy", async () => {
         const privA = secp.utils.randomPrivateKey();
         const privB = secp.utils.randomPrivateKey();

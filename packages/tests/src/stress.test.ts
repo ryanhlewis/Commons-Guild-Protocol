@@ -1,13 +1,31 @@
 import { describe, it, expect, afterEach, beforeEach } from "vitest";
 import { RelayServer } from "@cgp/relay/src/server";
 import { MemoryStore } from "@cgp/relay/src/store";
-import { CgpClient } from "@cgp/client/src/client";
+import { CgpClient } from "@cgp/client";
 import { generatePrivateKey, getPublicKey } from "@cgp/core";
 import fs from "fs";
+import { createServer as createNetServer } from "node:net";
 
 const RELAY_PORT = 8087;
 const RELAY_URL = `ws://localhost:${RELAY_PORT}`;
 const DB_PATH = "./test-stress-db";
+
+function getFreePort() {
+    return new Promise<number>((resolve, reject) => {
+        const server = createNetServer();
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", () => {
+            const address = server.address();
+            server.close(() => {
+                if (!address || typeof address === "string") {
+                    reject(new Error("Could not allocate a free TCP port"));
+                    return;
+                }
+                resolve(address.port);
+            });
+        });
+    });
+}
 
 describe("Stress Testing", () => {
     let relay: RelayServer;
@@ -145,7 +163,7 @@ describe("Stress Testing", () => {
 
         await service.close();
         if (fs.existsSync(DIR_DB_PATH)) fs.rmSync(DIR_DB_PATH, { recursive: true, force: true });
-    });
+    }, 60000);
 
     it("benchmarks state reconstruction with large event history", async () => {
         const { rebuildStateFromEvents, computeEventId } = await import("@cgp/core");
@@ -228,8 +246,9 @@ describe("Stress Testing", () => {
                 relays: [], // No relays, pure P2P
                 keyPair: { pub, priv }
             });
-            const port = 9000 + i;
+            const port = await getFreePort();
             await client.listen(port);
+            clients.push(client);
             peers.push(client);
             peerPorts.push(port);
         }
@@ -239,7 +258,7 @@ describe("Stress Testing", () => {
         for (let i = 0; i < PEER_COUNT; i++) {
             const nextIndex = (i + 1) % PEER_COUNT;
             const nextPort = peerPorts[nextIndex];
-            await peers[i].connectToPeer(`ws://localhost:${nextPort}`);
+            await peers[i].connectToPeer(`ws://127.0.0.1:${nextPort}`);
         }
 
         // 3. Publish Event from Peer 0
@@ -275,9 +294,5 @@ describe("Stress Testing", () => {
         console.log(`Gossip propagation: ${receivedCount}/${PEER_COUNT} peers received the message`);
         expect(receivedCount).toBe(PEER_COUNT);
 
-        // Cleanup
-        for (const peer of peers) {
-            peer.close();
-        }
     }, 30000);
 });

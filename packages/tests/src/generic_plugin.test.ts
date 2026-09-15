@@ -261,6 +261,36 @@ describe("Generic Plugin System", () => {
         expect(sent.at(-1)?.[1].code).toBe("ABUSE_RATE_LIMITED");
     });
 
+    it("does not count an exact signed publish retry as a duplicate flood", async () => {
+        const plugin = createAbuseControlPolicyPlugin({
+            windowMs: 60_000,
+            duplicateMessagesPerWindow: 1
+        });
+        const sent: any[] = [];
+        const socket = { send: (message: string) => sent.push(JSON.parse(message)) } as unknown as WebSocket;
+        const payload = {
+            author: "user-b",
+            clientEventId: "signed-retry-1",
+            createdAt: 1_785_731_321_903,
+            signature: "signature-a",
+            body: {
+                type: "MESSAGE",
+                guildId: "guild-a",
+                channelId: "general",
+                content: "retry me"
+            }
+        };
+
+        expect(await plugin.onFrame?.({ socket, kind: "PUBLISH", payload }, {} as any)).toBe(false);
+        expect(await plugin.onFrame?.({ socket, kind: "PUBLISH", payload }, {} as any)).toBe(false);
+        expect(await plugin.onFrame?.({
+            socket,
+            kind: "PUBLISH",
+            payload: { ...payload, signature: "signature-b" }
+        }, {} as any)).toBe(true);
+        expect(sent.at(-1)?.[1].code).toBe("ABUSE_RATE_LIMITED");
+    });
+
     it("can require encrypted message envelopes as an optional policy plugin", async () => {
         const plugin = createEncryptionPolicyPlugin({ requireEncryptedMessages: true });
         const sent: any[] = [];
@@ -286,6 +316,49 @@ describe("Generic Plugin System", () => {
                 body: { type: "MESSAGE", guildId: "guild-a", channelId: "general", content: "ciphertext", encrypted: true, iv: "iv" }
             }
         }, {} as any)).toBe(false);
+    });
+
+    it("can require encryption only for dynamically created private guilds", async () => {
+        const plugin = createEncryptionPolicyPlugin({
+            requireEncryptedPrivateGuildMessages: true
+        });
+        const sent: any[] = [];
+        const socket = { send: (message: string) => sent.push(JSON.parse(message)) } as unknown as WebSocket;
+        const context = {
+            getState: async (guildId: string) => ({
+                access: guildId === "private-guild" ? "private" : "public"
+            })
+        } as any;
+        const publishMessage = (guildId: string, body: Record<string, unknown> = {}) => plugin.onFrame?.({
+            socket,
+            kind: "PUBLISH",
+            payload: {
+                author: "user-a",
+                body: {
+                    type: "MESSAGE",
+                    guildId,
+                    channelId: "general",
+                    content: "payload",
+                    ...body
+                }
+            }
+        }, context);
+
+        expect(await publishMessage("public-guild")).toBe(false);
+        expect(await publishMessage("private-guild")).toBe(true);
+        expect(sent.at(-1)?.[1].code).toBe("ENCRYPTION_REQUIRED");
+        expect(await publishMessage("private-guild", {
+            encrypted: true,
+            iv: "nonce"
+        })).toBe(false);
+        expect(await publishMessage("private-guild", {
+            encrypted: true,
+            external: {
+                encryption: {
+                    scheme: "mls-rfc9420-v1"
+                }
+            }
+        })).toBe(false);
     });
 
     it("can require proof-of-work as an optional relay-local anti-Sybil policy", async () => {

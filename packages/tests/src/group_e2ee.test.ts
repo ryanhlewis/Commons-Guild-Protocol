@@ -11,8 +11,8 @@ describe("Group E2EE", () => {
 
     beforeAll(async () => {
         // Start a relay
-        const { RelayServer } = await import("@cgp/relay");
-        relay = new RelayServer(port);
+        const { MemoryStore, RelayServer } = await import("@cgp/relay");
+        relay = new RelayServer(port, new MemoryStore());
         console.log("Relay started");
 
         // Create clients

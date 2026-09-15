@@ -46,6 +46,13 @@ import {
   encodeCgpFrame,
   encodeCgpWireFrame,
   stringifyCgpFrame,
+  createRelayWriteCertificate,
+  verifyRelayWriteCertificate,
+  DeviceAuthorityRegistry,
+  normalizeRelayWriteQuorumPolicy,
+  type RelayWriteProposal,
+  type RelayWriteQuorumPolicy,
+  type DeviceAuthorization,
 } from "@cgp/core";
 import { LevelStore } from "./store_level";
 import {
@@ -56,18 +63,43 @@ import {
   StoreStorageEstimate,
 } from "./store";
 import {
+  CgpIpfsBackend,
   RelayPlugin,
   RelayPluginContext,
   RateLimitPolicy,
   createAbuseControlPolicyPlugin,
   createAppSurfacePolicyPlugin,
   createAppObjectPermissionPlugin,
+  createGitHubRelayMirrorPlugin,
+  createHollowRoomRelayPlugin,
+  createHeliaIpfsPlugin,
+  createExpressionSearchProviderPlugin,
   createMediaStoragePolicyPlugin,
   createRateLimitPolicyPlugin,
   createRelayPushPlugin,
   createSafetyReportPlugin,
+  createStaticShardSeedPlugin,
   createWebhookIngressPlugin,
 } from "./plugins";
+import {
+  CgpWebTransportOptions,
+  CgpWebTransportRelayServer,
+  CgpWebTransportSocket,
+  webTransportOptionsFromEnv,
+} from "./webtransport_realtime";
+import {
+  RelayWriteQuorumCoordinator,
+  relayWriteQuorumConfigFromEnv,
+  type RelayWriteQuorumConfig,
+  type RelayWriteQuorumVote,
+} from "./write_quorum";
+import {
+  RelaySequencerConsensusCoordinator,
+  relaySequencerConsensusConfigFromEnv,
+  type RelaySequencerConsensusConfig,
+  type RelaySequencerMessage,
+  type RelaySequencingToken,
+} from "./sequencer_consensus";
 
 interface Subscription {
   guildId: GuildId;
@@ -81,6 +113,7 @@ interface SignedReadRequest {
   author?: string;
   createdAt?: number;
   signature?: string;
+  deviceAuthorization?: DeviceAuthorization;
 }
 
 interface HistoryRequest extends SignedReadRequest {
@@ -161,6 +194,9 @@ export interface RelayPubSubEnvelope {
   frame?: string;
   liveTopics?: boolean;
   transient?: boolean;
+  writeVote?: RelayWriteQuorumVote;
+  writeProposal?: RelayWriteProposal;
+  sequencerMessage?: RelaySequencerMessage;
 }
 
 export interface RelayPubSubSubscribeOptions {
@@ -183,6 +219,8 @@ export interface RelayPubSubAdapter {
     handler: (envelope: RelayPubSubEnvelope) => void,
     options?: RelayPubSubSubscribeOptions,
   ): Promise<() => Promise<void> | void> | (() => Promise<void> | void);
+	/** True only after the transport can publish and receive subscribed frames. */
+	isReady?(): boolean;
   close?(): Promise<void> | void;
 }
 
@@ -205,6 +243,10 @@ export class LocalRelayPubSubAdapter implements RelayPubSubAdapter {
   private retained = new Map<string, RetainedPubSubTopic>();
 
   constructor(private retainEnvelopesPerTopic = 50000) {}
+
+	isReady() {
+		return true;
+	}
 
   private appendRetained(topic: string, entry: RetainedPubSubEntry) {
     if (this.retainEnvelopesPerTopic <= 0) {
@@ -324,8 +366,10 @@ interface PublishPayload {
   body: EventBody;
   author: string;
   signature: string;
+  deviceAuthorization?: DeviceAuthorization;
   createdAt: number;
   clientEventId?: string;
+  ackRequested?: boolean;
 }
 
 interface PublishAck {
@@ -352,6 +396,13 @@ interface PublishReplayEntry {
   observedAt: number;
 }
 
+interface PublishProofEntry {
+  guildId: GuildId;
+  eventId: string;
+  seq: number;
+  observedAt: number;
+}
+
 interface MembersRequest extends SignedReadRequest {
   subId?: string;
   guildId?: GuildId;
@@ -370,6 +421,11 @@ interface RelayHeadsRequest extends SignedReadRequest {
 }
 
 export interface RelayServerOptions {
+  /**
+   * Optional HTTP/WebSocket bind host. Omit to retain the existing all-interface
+   * behavior; production tunnel origins should normally use 127.0.0.1.
+   */
+  listenHost?: string;
   /**
    * Default plugins are recommended reference relay policy, not mandatory CGP protocol state.
    * Set false when embedding a relay with a custom plugin stack.
@@ -392,6 +448,8 @@ export interface RelayServerOptions {
   instanceId?: string;
   relayPrivateKeyHex?: string;
   pubSubAdapter?: RelayPubSubAdapter;
+  writeQuorum?: RelayWriteQuorumConfig | false;
+  sequencerConsensus?: RelaySequencerConsensusConfig | false;
   peerUrls?: string[];
   peerCatchupIntervalMs?: number;
   peerCatchupMinCanonicalHeads?: number;
@@ -404,6 +462,11 @@ export interface RelayServerOptions {
    * operator prefers a single durable log topic over partitioned live delivery.
    */
   pubSubLiveTopics?: boolean;
+  /**
+   * Optional HTTP/3 WebTransport datagram listener. Set false to disable
+   * environment-based configuration.
+   */
+  webTransport?: CgpWebTransportOptions | false;
   storagePolicy?: Partial<RelayStoragePolicy>;
 }
 
@@ -506,6 +569,20 @@ function objectPayload(payload: unknown): Record<string, any> {
   return payload && typeof payload === "object" && !Array.isArray(payload)
     ? (payload as Record<string, any>)
     : {};
+}
+
+function transientEventExpiresAt(event: GuildEvent) {
+  const body = objectPayload(event.body);
+  const payload = objectPayload(body.payload);
+  const expiresAt = body.expiresAt ?? payload.expiresAt;
+  return typeof expiresAt === "number" && Number.isFinite(expiresAt)
+    ? expiresAt
+    : undefined;
+}
+
+function isExpiredTransientEvent(event: GuildEvent, now = Date.now()) {
+  const expiresAt = transientEventExpiresAt(event);
+  return expiresAt !== undefined && expiresAt <= now;
 }
 
 function isStoreClosedError(error: unknown) {
@@ -846,7 +923,11 @@ function stripReadSignature(payload: unknown) {
     payload && typeof payload === "object"
       ? (payload as Record<string, unknown>)
       : {};
-  const { signature: _signature, ...unsigned } = source;
+  const {
+    signature: _signature,
+    deviceAuthorization: _deviceAuthorization,
+    ...unsigned
+  } = source;
   return unsigned;
 }
 
@@ -930,7 +1011,8 @@ function filterSerializedStateForReader(
     includeAppObjects?: boolean;
   } = {},
 ) {
-  const channels: ReturnType<typeof serializeState>["channels"] = [];
+	const byEntryId = <T>([left]: [string, T], [right]: [string, T]) => left.localeCompare(right);
+	const channels: ReturnType<typeof serializeState>["channels"] = [];
   for (const entry of state.channels) {
     if (canViewChannel(state, author, entry[0])) {
       channels.push(entry);
@@ -950,7 +1032,7 @@ function filterSerializedStateForReader(
         id,
         {
           ...member,
-          roles: Array.from(member.roles),
+				roles: Array.from(member.roles).sort(),
         },
       ]);
     }
@@ -976,17 +1058,22 @@ function filterSerializedStateForReader(
     }
   }
 
-  return {
+	return {
     guildId: state.guildId,
     name: state.name,
     description: state.description || "",
     ownerId: state.ownerId,
-    channels,
-    members,
-    roles: Array.from(state.roles.entries()),
-    bans: Array.from(state.bans.entries()),
-    messages,
-    appObjects,
+		channels: channels.sort(byEntryId),
+		members: members.sort(byEntryId),
+		roles: Array.from(state.roles.entries()).sort(byEntryId),
+		bans: Array.from(state.bans.entries()).sort(byEntryId),
+		messages: messages.sort(byEntryId),
+		appObjects: appObjects.sort(byEntryId),
+    sfuAuthoritySets: state.sfuAuthoritySets.map((set) => ({
+      ...set,
+      certifier: { ...set.certifier, members: [...set.certifier.members] },
+      authorities: set.authorities.map((authority) => ({ ...authority })),
+    })),
     access: state.access,
     policies: state.policies,
   };
@@ -1265,11 +1352,23 @@ function buildSearchResults(
 export class RelayServer {
   private wss: WebSocketServer;
   private httpServer: ReturnType<typeof createServer>;
+  private webTransportOptions?: CgpWebTransportOptions;
+  private webTransportServer?: CgpWebTransportRelayServer;
+  private webTransportReady: Promise<void> = Promise.resolve();
+  private webTransportSockets = new Set<WebSocket>();
   private store: Store;
   private plugins: RelayPlugin[];
   private pluginCtx: RelayPluginContext;
   private pluginsReady: Promise<void>;
   private subscriptions = new Map<WebSocket, Map<string, Subscription>>();
+  private realtimeSubscriptions = new Map<
+    WebSocket,
+    Map<string, Subscription>
+  >();
+  private realtimeGuildSubscriptions = new Map<
+    GuildId,
+    Map<WebSocket, Set<string>>
+  >();
   private guildSubscriptions = new Map<GuildId, Map<WebSocket, Set<string>>>();
   private guildAllChannelSubscriptions = new Map<
     GuildId,
@@ -1293,6 +1392,8 @@ export class RelayServer {
   private pubSubPendingGuilds = new Set<string>();
   private hostedGuilds = new Set<GuildId>();
   private stateCache = new Map<GuildId, GuildState>();
+  private deviceAuthorities = new DeviceAuthorityRegistry();
+  private deviceAuthorityHydrations = new Map<GuildId, Promise<void>>();
   private checkpointCache = new Map<GuildId, GuildEvent | undefined>();
   private observedRelayHeads = new Map<GuildId, Map<string, RelayHead>>();
   private relayHeadConflicts = new Map<GuildId, RelayHeadConflict[]>();
@@ -1317,6 +1418,10 @@ export class RelayServer {
   private pubSubReplayLimit: number;
   private relayInstanceId: string;
   private pubSubAdapter?: RelayPubSubAdapter;
+  private writeQuorumCoordinator?: RelayWriteQuorumCoordinator;
+  private writeQuorumReady: Promise<void> = Promise.resolve();
+  private sequencerConsensusCoordinator?: RelaySequencerConsensusCoordinator;
+  private sequencerConsensusReady: Promise<void> = Promise.resolve();
   private peerUrls: string[];
   private peerCatchupIntervalMs: number;
   private peerCatchupMinCanonicalHeads: number;
@@ -1349,14 +1454,17 @@ export class RelayServer {
   private checkpointTimer?: NodeJS.Timeout;
   private keyPair: { publicKey: string; privateKey: Uint8Array };
   private recentPublishAcks = new Map<string, PublishReplayEntry>();
+  private recentPublishProofs = new Map<string, PublishProofEntry>();
   private recentKnownEventIds = new Map<string, number>();
   private recentDeliveredPubSubEventIds = new Map<string, number>();
+  private recentTransientEventIds = new Map<string, number>();
   private pendingPubSubDeliveryEvents = new Map<
     string,
     { event: GuildEvent; observedAt: number }
   >();
   private recentEventPruneAt = new WeakMap<Map<string, number>, number>();
   private pendingPubSubPruneAt = 0;
+  private ipfsBackends: Map<string, CgpIpfsBackend> = new Map();
 
   constructor(
     port: number,
@@ -1495,7 +1603,14 @@ export class RelayServer {
           createAbuseControlPolicyPlugin(),
           createSafetyReportPlugin(),
           createAppSurfacePolicyPlugin(),
+          createHollowRoomRelayPlugin(),
+          createHeliaIpfsPlugin(),
+          ...(process.env.CGP_EXPRESSION_PROVIDER_ENDPOINT
+            ? [createExpressionSearchProviderPlugin()]
+            : []),
           createMediaStoragePolicyPlugin(),
+          createStaticShardSeedPlugin(),
+          createGitHubRelayMirrorPlugin(),
           createWebhookIngressPlugin(),
           ...(process.env.CGP_RELAY_PUSH_ENABLED === "0"
             ? []
@@ -1538,11 +1653,203 @@ export class RelayServer {
     };
     console.log(`Relay started with public key: ${this.keyPair.publicKey}`);
 
+    const writeQuorumConfig =
+      options.writeQuorum === false
+        ? undefined
+        : options.writeQuorum ?? relayWriteQuorumConfigFromEnv();
+    if (writeQuorumConfig) {
+      if (
+        !this.pubSubAdapter ||
+        !this.store.getWriteVoteFence ||
+        !this.store.putWriteVoteFence
+      ) {
+        throw new Error(
+          "Relay write quorum requires pubsub and durable vote-fence storage",
+        );
+      }
+      const topic = `cgp:write-quorum:${writeQuorumConfig.epoch}`;
+      this.writeQuorumCoordinator = new RelayWriteQuorumCoordinator(
+        writeQuorumConfig,
+        this.keyPair,
+        {
+          getWriteVoteFence: (key) => this.store.getWriteVoteFence!(key),
+          putWriteVoteFence: (key, proposalId) =>
+            this.store.putWriteVoteFence!(key, proposalId),
+        },
+        {
+          publish: (vote) =>
+            this.pubSubAdapter!.publish(topic, {
+              originId: this.relayInstanceId,
+              guildId: vote.guildId,
+              writeVote: vote,
+            }),
+          publishProposal: (proposal) =>
+            this.pubSubAdapter!.publish(topic, {
+              originId: this.relayInstanceId,
+              guildId: proposal.guildId,
+              writeProposal: proposal,
+            }),
+          subscribe: (handler, proposalHandler) =>
+            this.pubSubAdapter!.subscribe(topic, (envelope) => {
+              if (envelope.writeVote) {
+                handler(envelope.writeVote);
+              }
+              if (envelope.writeProposal && proposalHandler) {
+                proposalHandler(envelope.writeProposal);
+              }
+            }),
+        },
+        (proposal) => this.validateWriteQuorumProposal(proposal),
+      );
+      this.writeQuorumReady = this.writeQuorumCoordinator.start();
+    }
+
+    const sequencerConsensusConfig =
+      options.sequencerConsensus === false
+        ? undefined
+        : options.sequencerConsensus ?? relaySequencerConsensusConfigFromEnv();
+    if (sequencerConsensusConfig) {
+      if (
+        !this.writeQuorumCoordinator ||
+        !this.pubSubAdapter ||
+        !this.store.getSequencerState ||
+        !this.store.putSequencerState
+      ) {
+        throw new Error(
+          "Relay sequencer consensus requires write quorum, pubsub, and durable election storage",
+        );
+      }
+      this.sequencerConsensusCoordinator =
+        new RelaySequencerConsensusCoordinator(
+          sequencerConsensusConfig,
+          this.keyPair,
+          {
+            getSequencerState: (key) => this.store.getSequencerState!(key),
+            putSequencerState: (key, state) =>
+              this.store.putSequencerState!(key, state),
+          },
+          {
+            publish: (message) =>
+              this.pubSubAdapter!.publish(
+                `cgp:sequencer:${sequencerConsensusConfig.epoch}`,
+                {
+                  originId: this.relayInstanceId,
+                  guildId: message.guildId,
+                  sequencerMessage: message,
+                },
+              ),
+            subscribe: (handler) =>
+              this.pubSubAdapter!.subscribe(
+                `cgp:sequencer:${sequencerConsensusConfig.epoch}`,
+                (envelope) => {
+                  if (envelope.sequencerMessage) {
+                    handler(envelope.sequencerMessage);
+                  }
+                },
+              ),
+          },
+          async (guildId) => {
+            const head = await this.store.getLastEvent(guildId);
+            return {
+              headSeq: head?.seq ?? -1,
+              headHash: head?.id ?? null,
+            };
+          },
+        );
+      const writeConfig = this.writeQuorumCoordinator.config;
+      const sequencerConfig = this.sequencerConsensusCoordinator.config;
+      if (
+        writeConfig.epoch !== sequencerConfig.epoch ||
+        writeConfig.requiredVotes !== sequencerConfig.requiredVotes ||
+        writeConfig.members.length !== sequencerConfig.members.length ||
+        writeConfig.members.some(
+          (member, index) => member !== sequencerConfig.members[index],
+        )
+      ) {
+        throw new Error(
+          "Relay sequencer consensus and write quorum must use the same epoch, members, and vote threshold",
+        );
+      }
+      this.sequencerConsensusReady =
+        this.sequencerConsensusCoordinator.start();
+    }
+
     this.pluginCtx = {
       relayPublicKey: this.keyPair.publicKey,
+      writeQuorumPolicy: this.writeQuorumCoordinator
+        ? {
+            protocol: "cgp/write-quorum/1",
+            epoch: this.writeQuorumCoordinator.config.epoch,
+            members: [...this.writeQuorumCoordinator.config.members],
+            requiredVotes: this.writeQuorumCoordinator.config.requiredVotes,
+          }
+        : undefined,
       store: this.store,
+      ipfsBackends: this.ipfsBackends,
       publishAsRelay: async (body: EventBody, createdAt?: number) => {
         return this.publishAsRelay(body, createdAt);
+      },
+      publishSignedEvent: async (event) => {
+        let publishError: { code: string; message: string } | undefined;
+        const fullEvent = await this.appendSequencedEvent({
+          body: event.body,
+          author: event.author,
+          signature: event.signature,
+          createdAt: event.createdAt,
+          clientEventId: event.clientEventId,
+        }, undefined, {
+          onError: (code, message) => {
+            publishError = { code, message };
+          },
+        });
+        if (!fullEvent && publishError) {
+          throw new Error(`${publishError.code}: ${publishError.message}`);
+        }
+        if (!fullEvent) {
+          const guildId = event.body?.guildId;
+          if (typeof guildId === "string" && guildId) {
+            const replay = (await this.store.getLog(guildId)).find((candidate) => (
+              candidate.author === event.author &&
+              candidate.signature === event.signature &&
+              candidate.createdAt === event.createdAt &&
+              hashObject(candidate.body) === hashObject(event.body)
+            ));
+            if (replay) return replay;
+          }
+        }
+        if (fullEvent) {
+          await this.runOnEventAppended(fullEvent);
+        }
+        return fullEvent;
+      },
+      publishPolicyAuthorizedEvent: async (event) => {
+        let publishError: { code: string; message: string } | undefined;
+        const fullEvent = await this.appendSequencedEvent({
+          body: event.body,
+          author: event.author,
+          signature: event.signature,
+          createdAt: event.createdAt,
+          clientEventId: event.clientEventId,
+        }, undefined, {
+          policyAuthorized: true,
+          onError: (code, message) => {
+            publishError = { code, message };
+          },
+        });
+        if (!fullEvent && publishError) {
+          throw new Error(`${publishError.code}: ${publishError.message}`);
+        }
+        if (fullEvent) await this.runOnEventAppended(fullEvent);
+        return fullEvent;
+      },
+      appendEventsFromPlugin: async (
+        events: GuildEvent[],
+        options?: { broadcast?: boolean; runHooks?: boolean },
+      ) => {
+        return this.appendEventsFromPlugin(events, options);
+      },
+      activateGuildReplication: async (guildId: GuildId) => {
+        await this.activatePluginGuildReplication(guildId);
       },
       broadcast: (guildId: string, event: GuildEvent) => {
         this.broadcast(guildId, event);
@@ -1556,66 +1863,16 @@ export class RelayServer {
     };
     this.pluginsReady = this.initPlugins();
 
-    this.wss.on("connection", (socket) => {
-      if (this.closing) {
-        socket.close(1001, "Relay shutting down");
-        return;
-      }
-      transportSocket(socket)?.setNoDelay?.(true);
-      this.subscriptions.set(socket, new Map());
-      this.socketWireFormats.set(socket, this.wireFormat);
-      this.messageQueues.set(socket, Promise.resolve());
+    this.wss.on("connection", (socket) => this.attachClientSocket(socket));
 
-      socket.on("message", (data) => {
-        if (this.closing) {
-          return;
-        }
-        const currentQueue =
-          this.messageQueues.get(socket) || Promise.resolve();
-        const nextTask = currentQueue.then(async () => {
-          if (this.closing) {
-            return;
-          }
-          try {
-            if (rawDataByteLength(data) > this.maxFrameBytes) {
-              this.sendFrame(socket, "ERROR", {
-                code: "PAYLOAD_TOO_LARGE",
-                message: `Frame exceeds ${this.maxFrameBytes} byte relay limit`,
-              });
-              return;
-            }
-
-            const { kind, payload } = parseCgpWireData(data, {
-              includeRawFrame: false,
-            });
-            await this.handleMessage(socket, kind, payload);
-          } catch (e: any) {
-            if (this.closing) {
-              return;
-            }
-            if (e instanceof InvalidCgpFrameError) {
-              this.sendFrame(socket, "ERROR", {
-                code: "INVALID_FRAME",
-                message: "Parse error",
-              });
-            } else {
-              console.error("Error handling message", e);
-              this.sendFrame(socket, "ERROR", {
-                code: "INTERNAL_ERROR",
-                message: "Internal relay error",
-              });
-            }
-          }
-        });
-        this.messageQueues.set(socket, nextTask);
-      });
-
-      socket.on("close", () => {
-        this.removeSocketSubscriptions(socket);
-        this.messageQueues.delete(socket);
-        this.clearFanoutQueue(socket);
-      });
-    });
+    const webTransportOptions =
+      options.webTransport === false
+        ? undefined
+        : webTransportOptionsFromEnv(options.webTransport);
+    this.webTransportOptions = webTransportOptions;
+    if (webTransportOptions) {
+      void this.startWebTransport().catch(() => undefined);
+    }
 
     // Run prune every 60 seconds
     this.pruneTimer = setInterval(() => {
@@ -1632,7 +1889,11 @@ export class RelayServer {
             parsedCheckpointInterval >= 0
           ? Math.floor(parsedCheckpointInterval)
           : 60000;
-    if (checkpointIntervalMs > 0) {
+    if (
+      checkpointIntervalMs > 0 &&
+      !this.sequencerConsensusCoordinator &&
+      !this.writeQuorumCoordinator
+    ) {
       this.checkpointTimer = setInterval(() => {
         this.createCheckpoints().catch((err) =>
           console.error("Checkpoint failed:", err),
@@ -1640,8 +1901,14 @@ export class RelayServer {
       }, checkpointIntervalMs);
     }
 
-    this.httpServer.listen(port);
-    console.log(`Relay listening on port ${port}`);
+    const listenHost = options.listenHost?.trim();
+    if (listenHost) {
+      this.httpServer.listen(port, listenHost);
+      console.log(`Relay listening on ${listenHost}:${port}`);
+    } else {
+      this.httpServer.listen(port);
+      console.log(`Relay listening on port ${port}`);
+    }
     void this.bootstrapPubSubHostedGuilds().catch((err) => {
       console.error("Relay pubsub hosted guild bootstrap failed:", err);
     });
@@ -1655,10 +1922,143 @@ export class RelayServer {
     }
   }
 
+  private attachClientSocket(socket: WebSocket) {
+    if (this.closing) {
+      socket.close(1001, "Relay shutting down");
+      return;
+    }
+    transportSocket(socket)?.setNoDelay?.(true);
+    this.subscriptions.set(socket, new Map());
+    this.socketWireFormats.set(socket, this.wireFormat);
+    this.messageQueues.set(socket, Promise.resolve());
+
+    socket.on("message", (data) => {
+      if (this.closing) {
+        return;
+      }
+      const currentQueue = this.messageQueues.get(socket) || Promise.resolve();
+      const nextTask = currentQueue.then(async () => {
+        if (this.closing) {
+          return;
+        }
+        try {
+          if (rawDataByteLength(data) > this.maxFrameBytes) {
+            this.sendFrame(socket, "ERROR", {
+              code: "PAYLOAD_TOO_LARGE",
+              message: `Frame exceeds ${this.maxFrameBytes} byte relay limit`,
+            });
+            return;
+          }
+
+          const { kind, payload } = parseCgpWireData(data, {
+            includeRawFrame: false,
+          });
+          await this.handleMessage(socket, kind, payload);
+        } catch (e: any) {
+          if (this.closing) {
+            return;
+          }
+          if (e instanceof InvalidCgpFrameError) {
+            this.sendFrame(socket, "ERROR", {
+              code: "INVALID_FRAME",
+              message: "Parse error",
+            });
+          } else {
+            console.error("Error handling message", e);
+            this.sendFrame(socket, "ERROR", {
+              code: "INTERNAL_ERROR",
+              message: "Internal relay error",
+            });
+          }
+        }
+      });
+      this.messageQueues.set(socket, nextTask);
+    });
+
+    socket.on("close", () => {
+      this.webTransportSockets.delete(socket);
+      this.removeSocketSubscriptions(socket);
+      this.messageQueues.delete(socket);
+      this.clearFanoutQueue(socket);
+    });
+  }
+
   public getPort(): number {
     const addr = this.wss.address();
     if (!addr || typeof addr === "string") return NaN;
     return addr.port;
+  }
+
+  public isWebTransportReady() {
+    return this.webTransportServer?.isReady() === true;
+  }
+
+  private broadcastWebTransportAdvertisement() {
+    const realtimeTransports =
+      this.webTransportServer?.isReady() === true
+        ? [this.webTransportServer.advertisement]
+        : [];
+    for (const socket of this.subscriptions.keys()) {
+      if (!this.webTransportSockets.has(socket)) {
+        this.sendFrame(socket, "REALTIME_TRANSPORTS", { realtimeTransports });
+      }
+    }
+  }
+
+  public async startWebTransport() {
+    if (this.closing) {
+      throw new Error("Relay is shutting down");
+    }
+    if (!this.webTransportOptions) {
+      throw new Error("WebTransport is not configured for this relay");
+    }
+    if (this.webTransportServer) {
+      await this.webTransportReady;
+      if (this.webTransportServer?.isReady()) {
+        return;
+      }
+    }
+
+    const server = new CgpWebTransportRelayServer(
+      this.webTransportOptions,
+      (socket) => {
+        const relaySocket = socket as unknown as WebSocket;
+        this.webTransportSockets.add(relaySocket);
+        this.attachClientSocket(relaySocket);
+      },
+    );
+    this.webTransportServer = server;
+    const started = server.start();
+    this.webTransportReady = started.then(
+      () => {
+        console.log(
+          `Relay WebTransport listening at ${server.advertisement.url}`,
+        );
+        this.broadcastWebTransportAdvertisement();
+      },
+      (error) => {
+        if (this.webTransportServer === server) {
+          this.webTransportServer = undefined;
+        }
+        console.error("Relay WebTransport failed to start:", error);
+      },
+    );
+    await started;
+  }
+
+  public async stopWebTransport() {
+    await this.webTransportReady;
+    const server = this.webTransportServer;
+    this.webTransportServer = undefined;
+    for (const socket of [...this.webTransportSockets]) {
+      socket.removeAllListeners("message");
+      this.removeSocketSubscriptions(socket);
+      this.clearFanoutQueue(socket);
+      socket.close(1001, "WebTransport listener stopped");
+    }
+    this.webTransportSockets.clear();
+    await server?.close();
+    this.broadcastWebTransportAdvertisement();
   }
 
   private setExtensionHeaders(
@@ -1710,6 +2110,21 @@ export class RelayServer {
   }
 
   private async handleHttp(req: IncomingMessage, res: ServerResponse) {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader(
+      "Access-Control-Allow-Methods",
+      "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
+    );
+    res.setHeader(
+      "Access-Control-Allow-Headers",
+      "Authorization, Content-Type",
+    );
+    res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+    if (req.method === "OPTIONS") {
+      res.statusCode = 204;
+      res.end();
+      return;
+    }
     const rawUrl = req.url || "/";
     const pathname = rawUrl.split("?")[0] || "/";
     await this.pluginsReady;
@@ -1723,6 +2138,10 @@ export class RelayServer {
     }
 
     if (await this.handleExtensionHttp(req, res, pathname)) {
+      return;
+    }
+
+    if (await this.handlePluginHttpFallback(req, res, rawUrl, pathname)) {
       return;
     }
 
@@ -1763,8 +2182,9 @@ export class RelayServer {
     }
 
     const storage = await this.refreshStorageStatus(true);
+	const pubSubReady = !this.pubSubAdapter || this.pubSubAdapter.isReady?.() !== false;
     const ready =
-      !this.closing && this.httpServer.listening && !storage.overSoftLimit;
+      !this.closing && this.httpServer.listening && !storage.overSoftLimit && pubSubReady;
     const payload = {
       ok: pathname === "/healthz" ? true : ready,
       status: pathname === "/healthz" ? "ok" : ready ? "ready" : "not_ready",
@@ -1772,9 +2192,11 @@ export class RelayServer {
       relayPublicKey: this.keyPair.publicKey,
       uptimeMs: Date.now() - this.startedAt,
       websocketClients: this.wss.clients.size,
+      webTransportClients: this.webTransportSockets.size,
       subscriptions: this.countSubscriptions(),
       hostedGuilds: this.hostedGuilds.size,
       pubSubTopics: this.pubSubUnsubscribers.size,
+	  pubSubReady,
       storage,
       closing: this.closing,
     };
@@ -1791,6 +2213,9 @@ export class RelayServer {
   private countSubscriptions() {
     let count = 0;
     for (const subscriptions of this.subscriptions.values()) {
+      count += subscriptions.size;
+    }
+    for (const subscriptions of this.realtimeSubscriptions.values()) {
       count += subscriptions.size;
     }
     return count;
@@ -1933,6 +2358,11 @@ export class RelayServer {
       "Currently connected websocket clients.",
     );
     metric(
+      "cgp_relay_webtransport_clients",
+      this.webTransportSockets.size,
+      "Currently connected WebTransport datagram clients.",
+    );
+    metric(
       "cgp_relay_subscriptions",
       this.countSubscriptions(),
       "Active client subscriptions.",
@@ -2045,9 +2475,9 @@ export class RelayServer {
     relPath = relPath.replace(/^\/+/, "");
     const pathSegments = relPath.split("/").filter(Boolean);
     const pluginName = pathSegments[0] || "";
-    const plugin = this.plugins.find(
-      (candidate) => candidate.name === pluginName,
-    );
+    const plugin = [...this.plugins]
+      .reverse()
+      .find((candidate) => candidate.name === pluginName);
     if (!plugin || !plugin.onHttp) {
       res.statusCode = 404;
       res.end("Plugin route not found");
@@ -2081,6 +2511,57 @@ export class RelayServer {
     }
 
     return true;
+  }
+
+  private async handlePluginHttpFallback(
+    req: IncomingMessage,
+    res: ServerResponse,
+    rawUrl: string,
+    pathname: string,
+  ) {
+    if (pathname.startsWith("/plugins/")) {
+      return false;
+    }
+
+    let relPath = pathname;
+    try {
+      relPath = decodeURIComponent(relPath);
+    } catch {
+      return false;
+    }
+    relPath = relPath.replace(/^\/+/, "");
+    const pathSegments = relPath.split("/").filter(Boolean);
+
+    for (const plugin of this.plugins) {
+      if (!plugin.onHttp) continue;
+      try {
+        const handled = await plugin.onHttp(
+          {
+            req,
+            res,
+            rawUrl,
+            pathname,
+            pathSegments,
+          },
+          this.pluginCtx,
+        );
+        if (handled || res.writableEnded) {
+          return true;
+        }
+      } catch (e: any) {
+        console.error(
+          `Relay plugin ${plugin.name} failed handling HTTP fallback route ${pathname}:`,
+          e,
+        );
+        if (!res.writableEnded) {
+          res.statusCode = 500;
+          res.end("Internal plugin error");
+        }
+        return true;
+      }
+    }
+
+    return false;
   }
 
   private async handleExtensionHttp(
@@ -2200,7 +2681,84 @@ export class RelayServer {
     return fullEvent;
   }
 
+  private async appendEventsFromPlugin(
+    events: GuildEvent[],
+    options: { broadcast?: boolean; runHooks?: boolean } = {},
+  ): Promise<GuildEvent[]> {
+    const shouldBroadcast = options.broadcast !== false;
+    const shouldRunHooks = options.runHooks !== false;
+    const byGuild = new Map<GuildId, GuildEvent[]>();
+    for (const event of events) {
+      const guildId = event?.body?.guildId;
+      if (!guildId) {
+        continue;
+      }
+      const list = byGuild.get(guildId) || [];
+      list.push(event);
+      byGuild.set(guildId, list);
+    }
+
+    const accepted: GuildEvent[] = [];
+    for (const [guildId, guildEvents] of byGuild) {
+      await this.withGuildMutex(guildId, async () => {
+        let lastEvent = await this.store.getLastEvent(guildId);
+        const sequenced = guildEvents.map((event) => {
+          const nextEvent: GuildEvent = {
+            ...event,
+            seq: lastEvent ? lastEvent.seq + 1 : 0,
+            prevHash: lastEvent ? lastEvent.id : null,
+          };
+          nextEvent.id = computeEventId(nextEvent);
+          lastEvent = nextEvent;
+          return nextEvent;
+        });
+
+        const storageGate = await this.checkStorageWriteGate(
+          this.estimatedPublishBytes(sequenced),
+        );
+        if (!storageGate.ok) {
+          throw new Error(
+            storageGate.message ?? "Relay storage hard limit reached",
+          );
+        }
+
+        if (this.store.appendEvents) {
+          await this.store.appendEvents(guildId, sequenced);
+        } else {
+          for (const event of sequenced) {
+            await this.store.append(guildId, event);
+          }
+        }
+        this.storageUnestimatedWrittenBytes += sequenced.reduce(
+          (sum, event) => sum + this.estimatedPublishBytes(event),
+          0,
+        );
+        this.stateCache.delete(guildId);
+        this.checkpointCache.delete(guildId);
+        this.rememberRecentKnownEvents(guildId, sequenced);
+        this.ensurePubSubHostedGuildReplication(guildId);
+        if (shouldBroadcast) {
+          this.scheduleBroadcastBatch(guildId, sequenced);
+        }
+        accepted.push(...sequenced);
+      });
+    }
+
+    if (shouldRunHooks && accepted.length > 0) {
+      await this.runOnEventsAppended(accepted);
+    }
+    return accepted;
+  }
+
   public async createCheckpoints() {
+    // A relay-local checkpoint is a valid cache optimization only for a
+    // single-writer log. In a sequenced quorum guild, two witnesses would
+    // otherwise append different relay-authored events at the same head.
+    // Quorum deployments retain the original event log until checkpoint
+    // proposals themselves are consensus-certified.
+    if (this.sequencerConsensusCoordinator || this.writeQuorumCoordinator) {
+      return;
+    }
     const guilds = await this.store.getGuildIds();
 
     for (const guildId of guilds) {
@@ -2379,11 +2937,16 @@ export class RelayServer {
       if (negotiatedWireFormat) {
         this.socketWireFormats.set(socket, negotiatedWireFormat);
       }
-      const pluginList = this.plugins.map((p) => ({
-        name: p.name,
-        metadata: p.metadata,
-        inputs: p.inputs,
-      }));
+      const pluginList = Array.from(
+        this.plugins.reduce((pluginsByName, p) => {
+          pluginsByName.set(p.name, {
+            name: p.name,
+            metadata: p.metadata,
+            inputs: p.inputs,
+          });
+          return pluginsByName;
+        }, new Map<string, { name: string; metadata?: RelayPlugin["metadata"]; inputs?: RelayPlugin["inputs"] }>()),
+      ).map(([, plugin]) => plugin);
       this.sendFrame(socket, "HELLO_OK", {
         protocol: "cgp/0.1",
         relayName: "Reference Relay",
@@ -2392,10 +2955,16 @@ export class RelayServer {
         plugins: pluginList,
         wireFormat: this.socketWireFormats.get(socket) ?? this.wireFormat,
         supportedWireFormats: ["json", "binary-json", "binary-v1", "binary-v2"],
+        realtimeTransports:
+          this.webTransportServer?.isReady() === true
+            ? [this.webTransportServer.advertisement]
+            : [],
       });
     } else if (kind === "PLUGIN_CONFIG") {
       const p = objectPayload(payload) as { pluginName: string; config: any };
-      const plugin = this.plugins.find((pl) => pl.name === p.pluginName);
+      const plugin = [...this.plugins]
+        .reverse()
+        .find((pl) => pl.name === p.pluginName);
       if (plugin) {
         try {
           await plugin.onConfig?.({ socket, config: p.config }, this.pluginCtx);
@@ -2420,6 +2989,59 @@ export class RelayServer {
           message: `Plugin ${p.pluginName} not found`,
         });
       }
+    } else if (kind === "SUB_TRANSIENT") {
+      const p = objectPayload(payload) as {
+        subId?: string;
+        guildId?: GuildId;
+        channels?: ChannelId[];
+      } & SignedReadRequest;
+      const subId =
+        typeof p.subId === "string" && p.subId.trim()
+          ? p.subId
+          : `transient-${Date.now()}`;
+      const guildId = typeof p.guildId === "string" ? p.guildId : "";
+      const channels = Array.isArray(p.channels)
+        ? p.channels.filter(
+            (channelId): channelId is ChannelId =>
+              typeof channelId === "string" && channelId.trim().length > 0,
+          )
+        : undefined;
+      if (!guildId.trim()) {
+        this.sendRequestError(
+          socket,
+          "VALIDATION_FAILED",
+          "SUB_TRANSIENT requires a guildId",
+          { subId },
+        );
+        return;
+      }
+
+      await this.withGuildMutex(guildId, async () => {
+        const author = await this.readAuthorOrError(
+          socket,
+          "SUB_TRANSIENT",
+          payload,
+          subId,
+          guildId,
+        );
+        if (author === null) return;
+        const rebuilt = await this.rebuildGuildState(guildId);
+        if (rebuilt && !canReadGuild(rebuilt.state, author)) {
+          this.sendRequestError(
+            socket,
+            "FORBIDDEN",
+            "You do not have permission to subscribe to this guild",
+            { subId, guildId },
+          );
+          return;
+        }
+        this.addRealtimeSubscription(socket, subId, {
+          guildId,
+          channels,
+          author,
+        });
+        this.sendFrame(socket, "SUB_TRANSIENT_OK", { subId, guildId });
+      });
     } else if (kind === "SUB") {
       const p = objectPayload(payload) as {
         subId?: string;
@@ -2520,10 +3142,24 @@ export class RelayServer {
       await this.handleSearchRequest(socket, objectPayload(payload));
     } else if (kind === "PUBLISH") {
       const p = objectPayload(payload) as PublishPayload;
-      const { body, author, signature, createdAt, clientEventId } = p;
+      const {
+        body,
+        author,
+        signature,
+        deviceAuthorization,
+        createdAt,
+        clientEventId,
+      } = p;
 
       const fullEvent = await this.appendSequencedEvent(
-        { body, author, signature, createdAt, clientEventId },
+        {
+          body,
+          author,
+          signature,
+          deviceAuthorization,
+          createdAt,
+          clientEventId,
+        },
         socket,
       );
       if (fullEvent) {
@@ -2537,6 +3173,15 @@ export class RelayServer {
         events?: PublishPayload[];
       };
       const batchId = typeof p.batchId === "string" ? p.batchId : undefined;
+      if (this.writeQuorumCoordinator) {
+        this.sendRequestError(
+          socket,
+          "WRITE_QUORUM_REQUIRED",
+          "PUBLISH_BATCH is disabled while relay write quorum is enabled",
+          { batchId },
+        );
+        return;
+      }
       const inputEvents = Array.isArray(p.events) ? p.events : [];
       const eventCount = Math.min(inputEvents.length, this.maxPublishBatchSize);
       if (eventCount === 0) {
@@ -2691,6 +3336,7 @@ export class RelayServer {
 
   private async rebuildGuildState(
     guildId: GuildId,
+    options: { canonical?: boolean } = {},
   ): Promise<{
     state: GuildState;
     endEvent: GuildEvent;
@@ -2706,8 +3352,11 @@ export class RelayServer {
       return null;
     }
 
-    const cachedState = this.stateCache.get(guildId);
-    if (cachedState?.headSeq === endEvent.seq) {
+    const cachedState = options.canonical ? undefined : this.stateCache.get(guildId);
+    if (
+      cachedState?.headSeq === endEvent.seq &&
+      cachedState.headHash === endEvent.id
+    ) {
       if (
         endEvent.body.type === "CHECKPOINT" &&
         isValidCheckpointEvent(endEvent)
@@ -2726,34 +3375,51 @@ export class RelayServer {
       };
     }
 
-    let events = this.store.getReplaySnapshotEvents
-      ? buildReplaySnapshotEvents(
-          guildId,
-          await this.store.getReplaySnapshotEvents({
-            guildId,
-            limit: this.snapshotEventLimit,
-          }),
-        )
-      : await this.store.getLog(guildId);
-    const canReplayFromFirstEvent =
-      events[0]?.seq === 0 ||
-      (events[0]?.body.type === "CHECKPOINT" &&
-        isValidCheckpointEvent(events[0]));
-    if (!canReplayFromFirstEvent) {
-      events = await this.store.getLog(guildId);
-    }
+    const events = await this.readStateReplayEvents(guildId);
     if (events.length === 0) {
       return null;
     }
 
     const { state, checkpointEvent } = rebuildStateFromEvents(events);
-    this.cacheGuildState(guildId, state, checkpointEvent);
+    if (!options.canonical) {
+      this.cacheGuildState(guildId, state, checkpointEvent);
+    }
 
     return {
       state,
       endEvent: events[events.length - 1],
       checkpointEvent,
     };
+  }
+
+  private hydrateDeviceAuthorities(guildId: GuildId) {
+    const existing = this.deviceAuthorityHydrations.get(guildId);
+    if (existing) {
+      return existing;
+    }
+    const hydration = Promise.resolve(this.store.getLog(guildId))
+      .then((events) => {
+        for (const event of [...events].sort((left, right) => left.seq - right.seq)) {
+          if (!event.deviceAuthorization) continue;
+          this.deviceAuthorities.verify(
+            {
+              body: event.body,
+              author: event.author,
+              createdAt: event.createdAt,
+            },
+            event.signature,
+            event.author,
+            event.deviceAuthorization,
+            "publish",
+          );
+        }
+      })
+      .catch((error) => {
+        this.deviceAuthorityHydrations.delete(guildId);
+        throw error;
+      });
+    this.deviceAuthorityHydrations.set(guildId, hydration);
+    return hydration;
   }
 
   private verifyReadRequest(kind: string, payload: unknown) {
@@ -2782,13 +3448,15 @@ export class RelayServer {
     }
 
     const unsignedPayload = stripReadSignature(payload);
-    const ok = verify(
-      author,
-      hashObject({ kind, payload: unsignedPayload }),
+    const verified = this.deviceAuthorities.verify(
+      { kind, payload: unsignedPayload },
       signature,
+      author,
+      p.deviceAuthorization,
+      "read",
     );
-    if (!ok) {
-      throw new Error("Invalid signed read request");
+    if (!verified.ok) {
+      throw new Error(verified.error ?? "Invalid signed read request");
     }
 
     return author;
@@ -2850,7 +3518,11 @@ export class RelayServer {
       heads.push(previous);
     }
     const conflicts = findRelayHeadConflicts(heads);
-    this.relayHeadConflicts.set(guildId, conflicts);
+    if (conflicts.length > 0) {
+      this.relayHeadConflicts.set(guildId, conflicts);
+    } else {
+      this.relayHeadConflicts.delete(guildId);
+    }
     return summarizeRelayHeadQuorum(guildId, heads);
   }
 
@@ -2933,6 +3605,10 @@ export class RelayServer {
 
   private pubSubHeadTopic(guildId: GuildId) {
     return `guild:${guildId}:heads`;
+  }
+
+  private pubSubRealtimeTopic(guildId: GuildId) {
+    return `guild:${guildId}:realtime`;
   }
 
   private pubSubAllChannelsTopic(guildId: GuildId) {
@@ -3539,11 +4215,12 @@ export class RelayServer {
     }
 
     if (envelope.transient) {
+      const deliverable = events.filter((event) => !isExpiredTransientEvent(event));
       this.deliverPubSubEvents(
         envelope.guildId,
-        events,
+        deliverable,
         events.length,
-        envelope.frame,
+        deliverable.length === events.length ? envelope.frame : undefined,
       );
       return;
     }
@@ -3601,11 +4278,39 @@ export class RelayServer {
     }
   }
 
+  private handleRealtimePubSubEnvelope(
+    guildId: GuildId,
+    envelope: RelayPubSubEnvelope,
+  ) {
+    if (
+      envelope.originId === this.relayInstanceId ||
+      envelope.guildId !== guildId ||
+      !envelope.transient
+    ) {
+      return;
+    }
+    const events =
+      Array.isArray(envelope.events) && envelope.events.length > 0
+        ? envelope.events
+        : envelope.event
+          ? [envelope.event]
+          : [];
+    for (const event of events) {
+      if (
+        !isExpiredTransientEvent(event) &&
+        this.rememberTransientEventOnce(guildId, event)
+      ) {
+        this.deliverRealtimeBroadcastFrame(guildId, event, envelope.frame);
+      }
+    }
+  }
+
   private async replicatePubSubEvents(guildId: GuildId, events: GuildEvent[]) {
     if (events.length === 0) {
       return [];
     }
 
+    await this.hydrateDeviceAuthorities(guildId);
     const ordered = [...events].sort((left, right) => left.seq - right.seq);
     return await this.withGuildMutex(guildId, async () => {
       let lastEvent = await this.store.getLastEvent(guildId);
@@ -3652,6 +4357,7 @@ export class RelayServer {
           createdAt: event.createdAt,
           author: event.author,
           body: event.body,
+          deviceAuthorization: event.deviceAuthorization,
         });
         if (expectedId !== event.id) {
           console.warn(
@@ -3660,17 +4366,18 @@ export class RelayServer {
           continue;
         }
 
-        if (
-          !verifyObject(
-            event.author,
-            {
-              body: event.body,
-              author: event.author,
-              createdAt: event.createdAt,
-            },
-            event.signature,
-          )
-        ) {
+        const verifiedAuthorization = this.deviceAuthorities.verify(
+          {
+            body: event.body,
+            author: event.author,
+            createdAt: event.createdAt,
+          },
+          event.signature,
+          event.author,
+          event.deviceAuthorization,
+          "publish",
+        );
+        if (!verifiedAuthorization.ok) {
           console.warn(
             `Skipping pubsub replication with invalid signature for guild ${guildId} seq ${event.seq}`,
           );
@@ -3678,23 +4385,12 @@ export class RelayServer {
         }
 
         if (event.seq > 0) {
-          if (!state || state.headSeq !== event.seq - 1) {
-            let history = this.store.getReplaySnapshotEvents
-              ? buildReplaySnapshotEvents(
-                  guildId,
-                  await this.store.getReplaySnapshotEvents({
-                    guildId,
-                    limit: this.snapshotEventLimit,
-                  }),
-                )
-              : await this.store.getLog(guildId);
-            const canReplayFromFirstEvent =
-              history[0]?.seq === 0 ||
-              (history[0]?.body.type === "CHECKPOINT" &&
-                isValidCheckpointEvent(history[0]));
-            if (!canReplayFromFirstEvent) {
-              history = await this.store.getLog(guildId);
-            }
+          if (
+            !state ||
+            state.headSeq !== event.seq - 1 ||
+            state.headHash !== event.prevHash
+          ) {
+            const history = await this.readStateReplayEvents(guildId);
             if (history.length === 0) {
               break;
             }
@@ -3711,7 +4407,9 @@ export class RelayServer {
                 state,
                 event,
               );
-              validateEvent(validationState, event);
+              if (!(await this.validateReplicatedPolicyAuthorizedEvent(event))) {
+                validateEvent(validationState, event);
+              }
               state = applyEvent(validationState, event, { mutable: true });
             }
             if (
@@ -3852,7 +4550,11 @@ export class RelayServer {
     topic: string,
     guildId: GuildId,
     hasInterest: () => boolean,
-    options: { replicationOnly?: boolean; headOnly?: boolean } = {},
+    options: {
+      replicationOnly?: boolean;
+      headOnly?: boolean;
+      realtimeOnly?: boolean;
+    } = {},
   ) {
     if (
       !this.pubSubAdapter ||
@@ -3877,6 +4579,8 @@ export class RelayServer {
               this.handlePubSubReplicationEnvelope(guildId, envelope);
             } else if (options.headOnly) {
               this.handlePubSubHeadEnvelope(guildId, envelope);
+            } else if (options.realtimeOnly) {
+              this.handleRealtimePubSubEnvelope(guildId, envelope);
             } else {
               void this.handlePubSubEnvelope(guildId, envelope).catch((e) => {
                 console.error(
@@ -3970,6 +4674,30 @@ export class RelayServer {
       { replicationOnly: true },
     );
     this.ensurePubSubHeadSubscription(guildId);
+  }
+
+  private async activatePluginGuildReplication(guildId: GuildId) {
+    this.ensurePubSubHostedGuildReplication(guildId);
+    if (this.pubSubAdapter) {
+      const topics = [
+        this.pubSubLogTopic(guildId),
+        this.pubSubHeadTopic(guildId),
+      ];
+      const deadline = Date.now() + 10_000;
+      while (
+        topics.some((topic) => this.pubSubPendingGuilds.has(topic))
+        && Date.now() < deadline
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      if (topics.some((topic) => !this.pubSubUnsubscribers.has(topic))) {
+        throw new Error(
+          `Relay replication subscriptions are unavailable for guild ${guildId}`,
+        );
+      }
+      await this.requestPubSubLogReplay(guildId);
+    }
+    await this.requestPeerLogCatchup(guildId);
   }
 
   private hasRelayHeadInterest(guildId: GuildId) {
@@ -4157,6 +4885,48 @@ export class RelayServer {
     this.refreshPubSubChannelSubscriptionsForGuild(subscription.guildId);
   }
 
+  private addRealtimeSubscription(
+    socket: WebSocket,
+    subId: string,
+    subscription: Subscription,
+  ) {
+    let subs = this.realtimeSubscriptions.get(socket);
+    if (!subs) {
+      subs = new Map<string, Subscription>();
+      this.realtimeSubscriptions.set(socket, subs);
+    }
+    const existing = subs.get(subId);
+    if (existing) {
+      this.removeRealtimeSubscriptionIndex(socket, subId, existing);
+    }
+    if (
+      Array.isArray(subscription.channels) &&
+      subscription.channels.length > 0
+    ) {
+      subscription.channelSet = new Set(subscription.channels);
+      subscription.channels = Array.from(subscription.channelSet);
+    }
+    subscription.fingerprint = this.subscriptionFingerprint(subscription);
+    subs.set(subId, subscription);
+
+    let guildSockets = this.realtimeGuildSubscriptions.get(
+      subscription.guildId,
+    );
+    if (!guildSockets) {
+      guildSockets = new Map<WebSocket, Set<string>>();
+      this.realtimeGuildSubscriptions.set(subscription.guildId, guildSockets);
+    }
+    const socketSubs = guildSockets.get(socket) ?? new Set<string>();
+    socketSubs.add(subId);
+    guildSockets.set(socket, socketSubs);
+    this.ensurePubSubTopicSubscription(
+      this.pubSubRealtimeTopic(subscription.guildId),
+      subscription.guildId,
+      () => this.realtimeGuildSubscriptions.has(subscription.guildId),
+      { realtimeOnly: true },
+    );
+  }
+
   private subscriptionFingerprint(subscription: Subscription) {
     const channels =
       Array.isArray(subscription.channels) && subscription.channels.length > 0
@@ -4230,6 +5000,38 @@ export class RelayServer {
       }
     }
     this.subscriptions.delete(socket);
+
+    const realtimeSubs = this.realtimeSubscriptions.get(socket);
+    if (realtimeSubs) {
+      for (const [subId, sub] of realtimeSubs) {
+        this.removeRealtimeSubscriptionIndex(socket, subId, sub);
+      }
+    }
+    this.realtimeSubscriptions.delete(socket);
+  }
+
+  private removeRealtimeSubscriptionIndex(
+    socket: WebSocket,
+    subId: string,
+    subscription: Subscription,
+  ) {
+    const guildSockets = this.realtimeGuildSubscriptions.get(
+      subscription.guildId,
+    );
+    const socketSubs = guildSockets?.get(socket);
+    if (guildSockets && socketSubs) {
+      socketSubs.delete(subId);
+      if (socketSubs.size === 0) {
+        guildSockets.delete(socket);
+      }
+      if (guildSockets.size === 0) {
+        this.realtimeGuildSubscriptions.delete(subscription.guildId);
+      }
+    }
+    this.maybeReleasePubSubTopicSubscription(
+      this.pubSubRealtimeTopic(subscription.guildId),
+      () => this.realtimeGuildSubscriptions.has(subscription.guildId),
+    );
   }
 
   private async readAuthorOrError(
@@ -4240,6 +5042,9 @@ export class RelayServer {
     guildId?: string,
   ) {
     try {
+      if (guildId) {
+        await this.hydrateDeviceAuthorities(guildId);
+      }
       return this.verifyReadRequest(kind, payload);
     } catch (e: any) {
       this.sendRequestError(
@@ -4298,6 +5103,7 @@ export class RelayServer {
 
     let verifiedAuthor: string | undefined;
     try {
+      await this.hydrateDeviceAuthorities(guildId);
       verifiedAuthor = this.verifyReadRequest("GET_HEAD", payload);
     } catch (e: any) {
       this.sendRequestError(
@@ -4374,6 +5180,7 @@ export class RelayServer {
 
     let verifiedAuthor: string | undefined;
     try {
+      await this.hydrateDeviceAuthorities(guildId);
       verifiedAuthor = this.verifyReadRequest("GET_HEADS", payload);
     } catch (e: any) {
       this.sendRequestError(
@@ -4497,7 +5304,10 @@ export class RelayServer {
       );
       if (author === null) return;
 
-      const rebuilt = await this.rebuildGuildState(guildId);
+      // A signed state response must be a canonical projection of the durable
+      // log. Validation caches may contain relay-local hydrated indexes or
+      // trimmed message references and therefore cannot be quorum-attested.
+      const rebuilt = await this.rebuildGuildState(guildId, { canonical: true });
       if (!rebuilt) {
         this.sendFrame(socket, "ERROR", {
           code: "NOT_FOUND",
@@ -4553,6 +5363,7 @@ export class RelayServer {
           member,
         ]);
       }
+      const head = await this.signRelayHead(guildId, rebuilt);
       this.sendFrame(socket, "STATE", {
         subId,
         guildId,
@@ -4562,6 +5373,7 @@ export class RelayServer {
         endHash: rebuilt.endEvent.id,
         checkpointSeq: rebuilt.checkpointEvent?.seq ?? null,
         checkpointHash: rebuilt.checkpointEvent?.id ?? null,
+        head,
         membersPage: membersPage
           ? {
               nextCursor: membersPage.nextCursor,
@@ -4617,6 +5429,20 @@ export class RelayServer {
         })
       : await this.store.getLog(guildId);
     return buildReplaySnapshotEvents(guildId, events);
+  }
+
+  private async readStateReplayEvents(guildId: GuildId) {
+    const events = this.store.getReplaySnapshotEvents
+      ? await this.store.getReplaySnapshotEvents({
+          guildId,
+          limit: this.snapshotEventLimit,
+        })
+      : await this.store.getLog(guildId);
+    const canReplayFromFirstEvent =
+      events[0]?.seq === 0 ||
+      (events[0]?.body.type === "CHECKPOINT" &&
+        isValidCheckpointEvent(events[0]));
+    return canReplayFromFirstEvent ? events : this.store.getLog(guildId);
   }
 
   private async handleHistoryRequest(socket: WebSocket, payload: unknown) {
@@ -4738,6 +5564,7 @@ export class RelayServer {
       !state ||
       !headEvent ||
       state.headSeq !== headEvent.seq ||
+      state.headHash !== headEvent.id ||
       !query.channelId ||
       query.includeStructural
     ) {
@@ -5133,13 +5960,33 @@ export class RelayServer {
   }
 
   private publishReplayPayloadHash(
-    item: Pick<PublishPayload, "body" | "author" | "clientEventId">,
+    item: Pick<
+      PublishPayload,
+      "body" | "author" | "deviceAuthorization" | "clientEventId"
+    >,
   ) {
     return hashObject({
       body: item.body,
       author: item.author,
+      deviceAuthorization: item.deviceAuthorization,
       clientEventId: item.clientEventId,
     });
+  }
+
+  private publishProofKey(
+    guildId: GuildId,
+    item: Pick<
+      PublishPayload,
+      "body" | "author" | "createdAt" | "signature" | "deviceAuthorization"
+    >,
+  ) {
+    return `${guildId}\x1f${hashObject({
+      body: item.body,
+      author: item.author,
+      createdAt: item.createdAt,
+      signature: item.signature,
+      deviceAuthorization: item.deviceAuthorization,
+    })}`;
   }
 
   private recentEventKey(guildId: GuildId, eventId: string) {
@@ -5178,8 +6025,27 @@ export class RelayServer {
     const now = Date.now();
     for (const event of events) {
       this.recentKnownEventIds.set(this.recentEventKey(guildId, event.id), now);
+      this.recentPublishProofs.set(this.publishProofKey(guildId, event), {
+        guildId,
+        eventId: event.id,
+        seq: event.seq,
+        observedAt: now,
+      });
     }
     this.pruneRecentEventIds(this.recentKnownEventIds, now);
+    this.pruneRecentPublishProofs(now);
+  }
+
+  private rememberTransientEventOnce(guildId: GuildId, event: GuildEvent) {
+    const now = Date.now();
+    this.pruneRecentEventIds(this.recentTransientEventIds, now);
+    const key = this.recentEventKey(guildId, event.id);
+    if (this.recentTransientEventIds.has(key)) {
+      return false;
+    }
+    this.recentTransientEventIds.set(key, now);
+    this.pruneRecentEventIds(this.recentTransientEventIds, now);
+    return true;
   }
 
   private rememberRecentDeliveredPubSubEvents(
@@ -5296,14 +6162,67 @@ export class RelayServer {
         this.recentPublishAcks.delete(oldest);
       }
     }
+    this.pruneRecentPublishProofs(now);
     this.pruneRecentEventIds(this.recentKnownEventIds, now);
     this.pruneRecentEventIds(this.recentDeliveredPubSubEventIds, now);
     this.prunePendingPubSubDeliveryEvents(now);
   }
 
+  private pruneRecentPublishProofs(now = Date.now()) {
+    if (this.recentPublishProofs.size === 0) {
+      return;
+    }
+    if (this.recentPublishAckTtlMs > 0) {
+      const minObservedAt = now - this.recentPublishAckTtlMs;
+      for (const [key, entry] of this.recentPublishProofs) {
+        if (entry.observedAt >= minObservedAt) {
+          break;
+        }
+        this.recentPublishProofs.delete(key);
+      }
+    }
+    while (this.recentPublishProofs.size > this.maxRecentPublishAcks) {
+      const oldest = this.recentPublishProofs.keys().next().value;
+      if (!oldest) break;
+      this.recentPublishProofs.delete(oldest);
+    }
+  }
+
+  private lookupRecentPublishProofAck(
+    guildId: GuildId,
+    item: Pick<
+      PublishPayload,
+      | "body"
+      | "author"
+      | "createdAt"
+      | "signature"
+      | "deviceAuthorization"
+      | "clientEventId"
+    >,
+  ): PublishAck | undefined {
+    this.pruneRecentPublishProofs();
+    const key = this.publishProofKey(guildId, item);
+    const entry = this.recentPublishProofs.get(key);
+    if (!entry) {
+      return undefined;
+    }
+    entry.observedAt = Date.now();
+    this.recentPublishProofs.delete(key);
+    this.recentPublishProofs.set(key, entry);
+    return {
+      clientEventId: item.clientEventId,
+      guildId: entry.guildId,
+      eventId: entry.eventId,
+      seq: entry.seq,
+    };
+  }
+
   private lookupRecentPublishAck(
     guildId: GuildId,
-    item: Pick<PublishPayload, "body" | "author" | "clientEventId">,
+    item: Pick<
+      PublishPayload,
+      "body" | "author" | "deviceAuthorization" | "clientEventId"
+    >,
   ) {
     const key = this.publishReplayKey(guildId, item.author, item.clientEventId);
     if (!key) {
@@ -5329,7 +6248,10 @@ export class RelayServer {
 
   private rememberRecentPublishAck(
     guildId: GuildId,
-    item: Pick<PublishPayload, "body" | "author" | "clientEventId">,
+    item: Pick<
+      PublishPayload,
+      "body" | "author" | "deviceAuthorization" | "clientEventId"
+    >,
     ack: PublishAck,
   ) {
     const key = this.publishReplayKey(guildId, item.author, item.clientEventId);
@@ -5535,14 +6457,20 @@ export class RelayServer {
         continue;
       }
 
-      if (
-        !verifyObject(
-          item.author,
-          { body, author: item.author, createdAt: item.createdAt },
-          item.signature,
-        )
-      ) {
-        sendError(item, "INVALID_SIGNATURE", "Signature verification failed");
+      await this.hydrateDeviceAuthorities(targetGuildId);
+      const verifiedAuthorization = this.deviceAuthorities.verify(
+        { body, author: item.author, createdAt: item.createdAt },
+        item.signature,
+        item.author,
+        item.deviceAuthorization,
+        "publish",
+      );
+      if (!verifiedAuthorization.ok) {
+        sendError(
+          item,
+          "INVALID_SIGNATURE",
+          verifiedAuthorization.error ?? "Signature verification failed",
+        );
         continue;
       }
 
@@ -5596,23 +6524,12 @@ export class RelayServer {
 
           if (nextSeq > 0) {
             state = this.stateCache.get(targetGuildId);
-            if (!state || state.headSeq !== nextSeq - 1) {
-              let history = this.store.getReplaySnapshotEvents
-                ? buildReplaySnapshotEvents(
-                    targetGuildId,
-                    await this.store.getReplaySnapshotEvents({
-                      guildId: targetGuildId,
-                      limit: this.snapshotEventLimit,
-                    }),
-                  )
-                : await this.store.getLog(targetGuildId);
-              const canReplayFromFirstEvent =
-                history[0]?.seq === 0 ||
-                (history[0]?.body.type === "CHECKPOINT" &&
-                  isValidCheckpointEvent(history[0]));
-              if (!canReplayFromFirstEvent) {
-                history = await this.store.getLog(targetGuildId);
-              }
+            if (
+              !state ||
+              state.headSeq !== nextSeq - 1 ||
+              state.headHash !== prevHash
+            ) {
+              const history = await this.readStateReplayEvents(targetGuildId);
               if (history.length === 0) {
                 for (const item of group) {
                   sendError(
@@ -5636,7 +6553,13 @@ export class RelayServer {
           );
 
           for (const item of group) {
-            const { body, author, signature, createdAt } = item;
+            const {
+              body,
+              author,
+              signature,
+              deviceAuthorization,
+              createdAt,
+            } = item;
             const replay = this.lookupRecentPublishAck(targetGuildId, item);
             if (replay.kind === "mismatch") {
               sendError(
@@ -5650,7 +6573,9 @@ export class RelayServer {
               accepted.push({ index: item.index, ack: replay.ack });
               continue;
             }
-            const duplicateAck = duplicateAcks.get(item.index);
+            const duplicateAck =
+              this.lookupRecentPublishProofAck(targetGuildId, item) ??
+              duplicateAcks.get(item.index);
             if (duplicateAck) {
               this.rememberRecentPublishAck(targetGuildId, item, duplicateAck);
               accepted.push({ index: item.index, ack: duplicateAck });
@@ -5664,12 +6589,19 @@ export class RelayServer {
               author,
               body,
               signature,
+              deviceAuthorization,
             };
             fullEvent.id = computeEventId(fullEvent);
 
             if (
               !item.signatureVerified &&
-              !verifyObject(author, { body, author, createdAt }, signature)
+              !this.deviceAuthorities.verify(
+                { body, author, createdAt },
+                signature,
+                author,
+                deviceAuthorization,
+                "publish",
+              ).ok
             ) {
               console.error(`Invalid signature for event ${fullEvent.id}`);
               sendError(
@@ -5801,7 +6733,14 @@ export class RelayServer {
     p: PublishPayload,
     socket?: WebSocket,
   ): Promise<GuildEvent | undefined> {
-    const { body, author, signature, createdAt, clientEventId } = p;
+    const {
+      body,
+      author,
+      signature,
+      deviceAuthorization,
+      createdAt,
+      clientEventId,
+    } = p;
     const targetGuildId =
       body && typeof body === "object" && !Array.isArray(body)
         ? (body as unknown as Record<string, unknown>).guildId
@@ -5827,13 +6766,37 @@ export class RelayServer {
       sendError("VALIDATION_FAILED", "Transient publish requires author, signature, and createdAt");
       return undefined;
     }
-    if (!verifyObject(author, { body, author, createdAt }, signature)) {
-      sendError("INVALID_SIGNATURE", "Signature verification failed");
+    await this.hydrateDeviceAuthorities(targetGuildId);
+    const verifiedAuthorization = this.deviceAuthorities.verify(
+      { body, author, createdAt },
+      signature,
+      author,
+      deviceAuthorization,
+      "publish",
+    );
+    if (!verifiedAuthorization.ok) {
+      sendError(
+        "INVALID_SIGNATURE",
+        verifiedAuthorization.error ?? "Signature verification failed",
+      );
+      return undefined;
+    }
+    const expiresAt = objectPayload(body).expiresAt;
+    if (
+      typeof expiresAt === "number" &&
+      Number.isFinite(expiresAt) &&
+      expiresAt <= Date.now()
+    ) {
+      sendError("TRANSIENT_EXPIRED", "Transient event expired before relay delivery");
       return undefined;
     }
 
-    const rebuilt = await this.rebuildGuildState(targetGuildId);
-    if (rebuilt && !canReadGuild(rebuilt.state, author)) {
+    const state = (await this.rebuildGuildState(targetGuildId))?.state;
+    if (!state) {
+      sendError("UNKNOWN_GUILD", "Transient event guild is not available on this relay");
+      return undefined;
+    }
+    if (!canReadGuild(state, author)) {
       sendError("FORBIDDEN", "You do not have permission to publish transient events to this guild");
       return undefined;
     }
@@ -5853,10 +6816,11 @@ export class RelayServer {
       author,
       body,
       signature,
+      deviceAuthorization,
       transient: true,
     } as GuildEvent & { transient: true };
 
-    if (socket) {
+    if (socket && p.ackRequested !== false) {
       this.sendFrame(socket, "PUB_TRANSIENT_ACK", {
         clientEventId,
         guildId: targetGuildId,
@@ -5869,17 +6833,198 @@ export class RelayServer {
     return fullEvent;
   }
 
+  private async validateWriteQuorumProposal(proposal: RelayWriteProposal) {
+    const body = proposal?.body as EventBody;
+    const guildId = proposal?.guildId;
+    if (
+      !body ||
+      typeof body !== "object" ||
+      body.type === "CHECKPOINT" ||
+      typeof guildId !== "string" ||
+      !guildId.trim() ||
+      (body as any).guildId !== guildId ||
+      typeof proposal.author !== "string" ||
+      !proposal.author.trim() ||
+      typeof proposal.signature !== "string" ||
+      !proposal.signature.trim() ||
+      typeof proposal.createdAt !== "number" ||
+      !Number.isFinite(proposal.createdAt) ||
+      (proposal.authorizationMode !== undefined &&
+        proposal.authorizationMode !== "plugin-policy")
+    ) {
+      return false;
+    }
+    const configured = this.writeQuorumCoordinator?.config;
+    if (!configured) return false;
+    const voteDeadline = Date.now() + Math.max(100, configured.voteTimeoutMs - 25);
+    // A quorum member must follow every guild it witnesses, including a brand
+    // new guild for which it has no client subscription or local history yet.
+    // This is deliberately only subscription activation: full peer catch-up
+    // can exceed the vote deadline and must not burn an otherwise healthy
+    // sequenced slot.
+    if (!(await this.ensureWriteWitnessGuildReplication(
+      guildId,
+      Math.max(0, voteDeadline - Date.now()),
+    ))) return false;
+    const claimedCertifier = (body as any).certifier;
+    if (body.type === "SFU_AUTHORITY_SET" || claimedCertifier !== undefined) {
+      try {
+        const claimed = normalizeRelayWriteQuorumPolicy(claimedCertifier);
+        const actual = normalizeRelayWriteQuorumPolicy({
+          protocol: "cgp/write-quorum/1",
+          epoch: configured.epoch,
+          members: configured.members,
+          requiredVotes: configured.requiredVotes,
+        });
+        if (hashObject(claimed) !== hashObject(actual)) return false;
+      } catch {
+        return false;
+      }
+    }
+    await this.hydrateDeviceAuthorities(guildId);
+    const verifiedAuthorization = this.deviceAuthorities.verify(
+      {
+        body,
+        author: proposal.author,
+        createdAt: proposal.createdAt,
+      },
+      proposal.signature,
+      proposal.author,
+      proposal.deviceAuthorization,
+      "publish",
+    );
+    if (!verifiedAuthorization.ok) return false;
+
+    const caughtUp = await this.waitForGuildHead(
+      guildId,
+      proposal.headSeq,
+      proposal.headHash,
+      Math.max(0, voteDeadline - Date.now()),
+    );
+    if (!caughtUp) return false;
+    const lastEvent = await this.store.getLastEvent(guildId);
+    const seq = lastEvent ? lastEvent.seq + 1 : 0;
+    const prevHash = lastEvent ? lastEvent.id : null;
+    if (proposal.headSeq !== seq - 1 || proposal.headHash !== prevHash) {
+      return false;
+    }
+    if (seq === 0) return body.type === "GUILD_CREATE";
+    if (proposal.authorizationMode === "plugin-policy") {
+      return claimedCertifier !== undefined &&
+        await this.validatePolicyAuthorizedProposal(proposal);
+    }
+    let state = this.stateCache.get(guildId);
+    if (
+      !state ||
+      state.headSeq !== seq - 1 ||
+      state.headHash !== prevHash
+    ) {
+      const history = await this.readStateReplayEvents(guildId);
+      if (!history.length) return false;
+      const rebuilt = rebuildStateFromEvents(history);
+      state = rebuilt.state;
+      this.cacheGuildState(guildId, state, rebuilt.checkpointEvent);
+    }
+    const fullEvent: GuildEvent = {
+      id: "",
+      seq,
+      prevHash,
+      createdAt: proposal.createdAt,
+      author: proposal.author,
+      body,
+      signature: proposal.signature,
+      deviceAuthorization: proposal.deviceAuthorization,
+    };
+    fullEvent.id = computeEventId(fullEvent);
+    try {
+      if (!this.canFastValidateOpenMessage(state, fullEvent)) {
+        validateEvent(
+          await this.hydrateValidationIndexes(state, fullEvent),
+          fullEvent,
+        );
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async validatePolicyAuthorizedProposal(
+    proposal: RelayWriteProposal,
+    certifiedPolicy?: RelayWriteQuorumPolicy,
+  ) {
+    await this.pluginsReady;
+    const validationContext = certifiedPolicy
+      ? { ...this.pluginCtx, writeQuorumPolicy: certifiedPolicy }
+      : this.pluginCtx;
+    for (const plugin of this.plugins) {
+      if (!plugin.onValidatePolicyAuthorizedEvent) continue;
+      try {
+        if (await plugin.onValidatePolicyAuthorizedEvent(
+          { proposal },
+          validationContext,
+        )) {
+          return true;
+        }
+      } catch (error) {
+        console.error(
+          `Plugin ${plugin.name} policy-authorized validation failed:`,
+          error,
+        );
+      }
+    }
+    return false;
+  }
+
+  private async validateReplicatedPolicyAuthorizedEvent(event: GuildEvent) {
+    const certificate = event.writeCertificate;
+    if (
+      !certificate ||
+      !verifyRelayWriteCertificate(event, {
+        expectedGuildId: event.body.guildId,
+        expectedAuthor: event.author,
+        requireBodyPolicy: true,
+      })
+    ) {
+      return false;
+    }
+    return await this.validatePolicyAuthorizedProposal({
+      guildId: event.body.guildId,
+      headSeq: event.seq - 1,
+      headHash: event.prevHash,
+      body: event.body,
+      author: event.author,
+      signature: event.signature,
+      deviceAuthorization: event.deviceAuthorization,
+      createdAt: event.createdAt,
+      clientEventId: certificate.clientEventId,
+      authorizationMode: "plugin-policy",
+    }, certificate.policy);
+  }
+
   private async appendSequencedEvent(
     p: PublishPayload,
     socket?: WebSocket,
-    options: { suppressAck?: boolean } = {},
+    options: {
+      suppressAck?: boolean;
+      policyAuthorized?: boolean;
+      onError?: (code: string, message: string) => void;
+    } = {},
   ): Promise<GuildEvent | undefined> {
-    const { body, author, signature, createdAt, clientEventId } = p;
+    const {
+      body,
+      author,
+      signature,
+      deviceAuthorization,
+      createdAt,
+      clientEventId,
+    } = p;
     const targetGuildId =
       body && typeof body === "object" && !Array.isArray(body)
         ? (body as unknown as Record<string, unknown>).guildId
         : undefined;
     const sendError = (code: string, message: string) => {
+      options.onError?.(code, message);
       if (socket) {
         this.sendFrame(socket, "ERROR", { code, message, clientEventId });
       }
@@ -5897,6 +7042,20 @@ export class RelayServer {
       );
       return undefined;
     }
+    if (
+      typeof author !== "string" ||
+      !author.trim() ||
+      typeof signature !== "string" ||
+      !signature.trim() ||
+      typeof createdAt !== "number" ||
+      !Number.isFinite(createdAt)
+    ) {
+      sendError(
+        "VALIDATION_FAILED",
+        "Publish requires author, signature, and createdAt",
+      );
+      return undefined;
+    }
 
     const storageGate = await this.checkStorageWriteGate(
       this.estimatedPublishBytes(body),
@@ -5909,23 +7068,135 @@ export class RelayServer {
       return undefined;
     }
 
-    return await this.withGuildMutex(targetGuildId, async () => {
+    await this.hydrateDeviceAuthorities(targetGuildId);
+    const unsignedForSig = { body, author, createdAt };
+    const verifiedAuthorization = this.deviceAuthorities.verify(
+      unsignedForSig,
+      signature,
+      author,
+      deviceAuthorization,
+      "publish",
+    );
+    if (!verifiedAuthorization.ok) {
+      console.error("Invalid signature for sequenced event");
+      sendError(
+        "INVALID_SIGNATURE",
+        verifiedAuthorization.error ?? "Signature verification failed",
+      );
+      return undefined;
+    }
+
+    const claimedCertifier = (
+      body && typeof body === "object" && !Array.isArray(body)
+        ? (body as unknown as Record<string, unknown>).certifier
+        : undefined
+    );
+    if (body.type === "SFU_AUTHORITY_SET" || claimedCertifier !== undefined) {
+      if (!this.writeQuorumCoordinator) {
+        sendError(
+          "WRITE_QUORUM_REQUIRED",
+          "Certified writes require relay write quorum",
+        );
+        return undefined;
+      }
+      try {
+        const claimed = normalizeRelayWriteQuorumPolicy(
+          claimedCertifier,
+        );
+        const configured = this.writeQuorumCoordinator.config;
+        const actual = normalizeRelayWriteQuorumPolicy({
+          protocol: "cgp/write-quorum/1",
+          epoch: configured.epoch,
+          members: configured.members,
+          requiredVotes: configured.requiredVotes,
+        });
+        if (hashObject(claimed) !== hashObject(actual)) {
+          throw new Error("Write certifier does not match this relay epoch");
+        }
+      } catch (error) {
+        sendError(
+          "VALIDATION_FAILED",
+          error instanceof Error
+            ? error.message
+            : "Invalid write certifier policy",
+        );
+        return undefined;
+      }
+    }
+    if (options.policyAuthorized && claimedCertifier === undefined) {
+      sendError(
+        "WRITE_QUORUM_REQUIRED",
+        "Plugin policy events must claim the configured write certifier",
+      );
+      return undefined;
+    }
+
+    let sequencingToken: RelaySequencingToken | undefined;
+    let sequencingFinalized = false;
+    if (this.sequencerConsensusCoordinator) {
+      try {
+        await this.sequencerConsensusReady;
+        sequencingToken = await this.sequencerConsensusCoordinator.sequence({
+          guildId: targetGuildId,
+          body,
+          author,
+          signature,
+          deviceAuthorization,
+          createdAt,
+          clientEventId,
+        });
+      } catch (error) {
+        sendError(
+          "SEQUENCER_UNAVAILABLE",
+          error instanceof Error
+            ? error.message
+            : "Relay sequencer consensus unavailable",
+        );
+        return undefined;
+      }
+    }
+
+    if (sequencingToken) {
+      const caughtUp = await this.waitForGuildHead(
+        targetGuildId,
+        sequencingToken.headSeq,
+        sequencingToken.headHash,
+        this.sequencerConsensusCoordinator?.config.requestTimeoutMs ?? 8_000,
+      );
+      if (!caughtUp) {
+        sendError(
+          "SEQUENCER_STALE",
+          "Local relay did not reach the head selected by the sequencer",
+        );
+        try {
+          await this.sequencerConsensusCoordinator?.complete(sequencingToken, false);
+        } catch (error) {
+          console.error("Relay sequencer completion failed:", error);
+        }
+        return undefined;
+      }
+    }
+
+    try {
+      return await this.withGuildMutex(targetGuildId, async () => {
       const replay = this.lookupRecentPublishAck(targetGuildId, p);
       if (replay.kind === "mismatch") {
+        sequencingFinalized = true;
         sendError("VALIDATION_FAILED", "clientEventId payload mismatch");
         return undefined;
       }
       if (replay.kind === "hit") {
+        sequencingFinalized = true;
         if (!options.suppressAck && socket) {
           this.sendFrame(socket, "PUB_ACK", replay.ack);
         }
         return undefined;
       }
-      const duplicateAck = await this.lookupExistingMessageAck(
-        targetGuildId,
-        p,
-      );
+      const duplicateAck =
+        this.lookupRecentPublishProofAck(targetGuildId, p) ??
+        (await this.lookupExistingMessageAck(targetGuildId, p));
       if (duplicateAck) {
+        sequencingFinalized = true;
         this.rememberRecentPublishAck(targetGuildId, p, duplicateAck);
         if (!options.suppressAck && socket) {
           this.sendFrame(socket, "PUB_ACK", duplicateAck);
@@ -5934,6 +7205,18 @@ export class RelayServer {
       }
 
       const lastEvent = await this.store.getLastEvent(targetGuildId);
+
+      if (
+        sequencingToken &&
+        (sequencingToken.headSeq !== (lastEvent?.seq ?? -1) ||
+          sequencingToken.headHash !== (lastEvent?.id ?? null))
+      ) {
+        sendError(
+          "SEQUENCER_STALE",
+          "Sequenced write no longer matches the selected guild head",
+        );
+        return undefined;
+      }
 
       const seq = lastEvent ? lastEvent.seq + 1 : 0;
       const prevHash = lastEvent ? lastEvent.id : null;
@@ -5946,38 +7229,22 @@ export class RelayServer {
         author,
         body,
         signature,
+        deviceAuthorization,
       };
 
       fullEvent.id = computeEventId(fullEvent);
 
-      const unsignedForSig = { body, author, createdAt };
-
-      if (!verifyObject(author, unsignedForSig, signature)) {
-        console.error(`Invalid signature for event ${fullEvent.id}`);
-        sendError("INVALID_SIGNATURE", "Signature verification failed");
-        return undefined;
-      }
-
+      let validationState: GuildState | undefined;
+      let fastMessage = false;
       if (seq > 0) {
         let state = this.stateCache.get(targetGuildId);
 
-        if (!state || state.headSeq !== seq - 1) {
-          let history = this.store.getReplaySnapshotEvents
-            ? buildReplaySnapshotEvents(
-                targetGuildId,
-                await this.store.getReplaySnapshotEvents({
-                  guildId: targetGuildId,
-                  limit: this.snapshotEventLimit,
-                }),
-              )
-            : await this.store.getLog(targetGuildId);
-          const canReplayFromFirstEvent =
-            history[0]?.seq === 0 ||
-            (history[0]?.body.type === "CHECKPOINT" &&
-              isValidCheckpointEvent(history[0]));
-          if (!canReplayFromFirstEvent) {
-            history = await this.store.getLog(targetGuildId);
-          }
+        if (
+          !state ||
+          state.headSeq !== seq - 1 ||
+          state.headHash !== prevHash
+        ) {
+          const history = await this.readStateReplayEvents(targetGuildId);
           if (history.length === 0) {
             console.error(
               "Validation error: Missing history for non-genesis event",
@@ -5991,25 +7258,15 @@ export class RelayServer {
         }
 
         try {
-          const fastMessage = this.canFastValidateOpenMessage(state, fullEvent);
-          const validationState = fastMessage
+          fastMessage = this.canFastValidateOpenMessage(state, fullEvent);
+          validationState = fastMessage
             ? state
             : await this.hydrateValidationIndexes(state, fullEvent);
-          if (!fastMessage) {
+          if (!fastMessage && !options.policyAuthorized) {
             validateEvent(validationState, fullEvent);
           }
-          // Optimistically apply to cache
-          const newState = fastMessage
-            ? this.applyFastOpenMessage(validationState, fullEvent)
-            : applyEvent(validationState, fullEvent, { mutable: true });
-          this.cacheGuildState(targetGuildId, newState);
-          if (
-            fullEvent.body.type === "CHECKPOINT" &&
-            isValidCheckpointEvent(fullEvent)
-          ) {
-            this.checkpointCache.set(targetGuildId, fullEvent);
-          }
         } catch (e: any) {
+          sequencingFinalized = true;
           console.error(
             `Validation failed for guild ${targetGuildId}: ${e.message}`,
           );
@@ -6020,21 +7277,93 @@ export class RelayServer {
           );
           return undefined;
         }
-      } else {
-        if (body.type !== "GUILD_CREATE") {
-          console.error("Validation failed: First event must be GUILD_CREATE");
-          sendError("VALIDATION_FAILED", "First event must be GUILD_CREATE");
+      } else if (body.type !== "GUILD_CREATE") {
+        sequencingFinalized = true;
+        console.error("Validation failed: First event must be GUILD_CREATE");
+        sendError("VALIDATION_FAILED", "First event must be GUILD_CREATE");
+        return undefined;
+      }
+
+      let writeProposal: RelayWriteProposal | undefined;
+      let writeVotes: RelayWriteQuorumVote[] | undefined;
+      if (this.writeQuorumCoordinator) {
+        try {
+          await this.writeQuorumReady;
+          writeProposal = {
+            guildId: targetGuildId,
+            headSeq: seq - 1,
+            headHash: prevHash,
+            body,
+            author,
+            signature,
+            deviceAuthorization,
+            createdAt,
+            clientEventId,
+            authorizationMode: options.policyAuthorized
+              ? "plugin-policy"
+              : undefined,
+          };
+          if (
+            options.policyAuthorized &&
+            !(await this.validatePolicyAuthorizedProposal(writeProposal))
+          ) {
+            sequencingFinalized = true;
+            sendError(
+              "VALIDATION_FAILED",
+              "No trusted relay plugin authorized this policy event",
+            );
+            return undefined;
+          }
+          writeVotes = await this.writeQuorumCoordinator.authorize(writeProposal);
+        } catch (error) {
+          sendError(
+            "WRITE_QUORUM_UNAVAILABLE",
+            error instanceof Error
+              ? error.message
+              : "Relay write quorum unavailable",
+          );
           return undefined;
         }
-        // Initialize cache for new guild
+      }
+
+      if (
+        claimedCertifier !== undefined &&
+        writeProposal &&
+        writeVotes &&
+        this.writeQuorumCoordinator
+      ) {
+        fullEvent.writeCertificate = createRelayWriteCertificate(
+          this.writeQuorumCoordinator.config,
+          writeProposal,
+          writeVotes,
+        );
+      }
+
+      await this.store.append(targetGuildId, fullEvent);
+      sequencingFinalized = true;
+      this.storageUnestimatedWrittenBytes +=
+        this.estimatedPublishBytes(fullEvent);
+
+      // A cache entry is a materialized view of the durable log. Never move it
+      // ahead of storage: a failed append must not leave a signed state response
+      // describing an event that the relay did not persist.
+      if (seq > 0 && validationState) {
+        const newState = fastMessage
+          ? this.applyFastOpenMessage(validationState, fullEvent)
+          : applyEvent(validationState, fullEvent, { mutable: true });
+        this.cacheGuildState(targetGuildId, newState);
+        if (
+          fullEvent.body.type === "CHECKPOINT" &&
+          isValidCheckpointEvent(fullEvent)
+        ) {
+          this.checkpointCache.set(targetGuildId, fullEvent);
+        }
+      } else {
         const state = createInitialState(fullEvent);
         this.cacheGuildState(targetGuildId, state);
         this.checkpointCache.delete(targetGuildId);
       }
 
-      await this.store.append(targetGuildId, fullEvent);
-      this.storageUnestimatedWrittenBytes +=
-        this.estimatedPublishBytes(fullEvent);
       this.rememberRecentKnownEvents(targetGuildId, [fullEvent]);
       this.ensurePubSubHostedGuildReplication(targetGuildId);
       // console.log(`Relay appended event ${fullEvent.id} type ${body.type} seq ${fullEvent.seq}`);
@@ -6060,7 +7389,19 @@ export class RelayServer {
       }
       this.scheduleBroadcast(targetGuildId, fullEvent);
       return fullEvent;
-    });
+      });
+    } finally {
+      if (sequencingToken) {
+        try {
+          await this.sequencerConsensusCoordinator?.complete(
+            sequencingToken,
+            sequencingFinalized,
+          );
+        } catch (error) {
+          console.error("Relay sequencer completion failed:", error);
+        }
+      }
+    }
   }
 
   private async hydrateValidationIndexes(
@@ -7436,12 +8777,77 @@ export class RelayServer {
 
     const state = this.stateCache.get(guildId);
     const channelId = state ? eventChannelId(state, event) : undefined;
+    publish(this.pubSubRealtimeTopic(guildId));
     if (!channelId) {
       publish(this.pubSubTopic(guildId));
       return;
     }
     publish(this.pubSubAllChannelsTopic(guildId));
     publish(this.pubSubChannelTopic(guildId, channelId));
+  }
+
+  private deliverRealtimeBroadcastFrame(
+    guildId: GuildId,
+    event: GuildEvent,
+    frame?: string,
+  ) {
+    if (this.closing || isExpiredTransientEvent(event)) {
+      return;
+    }
+    const guildSockets = this.realtimeGuildSubscriptions.get(guildId);
+    if (!guildSockets || guildSockets.size === 0) {
+      return;
+    }
+    const state = this.stateCache.get(guildId);
+    const encodedByWireFormat: FanoutFrameCache = {};
+    this.scheduleSocketMapFanout(guildSockets, (socket) => {
+      const subscriptions = this.realtimeSubscriptions.get(socket);
+      const subIds = guildSockets.get(socket);
+      if (!subscriptions || !subIds) {
+        return;
+      }
+      let eligible = false;
+      for (const subId of subIds) {
+        const subscription = subscriptions.get(subId);
+        if (!subscription) {
+          continue;
+        }
+        if (
+          state &&
+          (!eventVisibleToReader(state, event, subscription.author) ||
+            !eventMatchesRequestedChannels(
+              state,
+              event,
+              subscription.channels,
+              subscription.channelSet,
+            ))
+        ) {
+          continue;
+        }
+        eligible = true;
+        break;
+      }
+      if (
+        !eligible ||
+        socket.readyState !== CgpWebTransportSocket.OPEN ||
+        socket.bufferedAmount > this.maxSocketBufferedBytes
+      ) {
+        return;
+      }
+      const wireFormat = this.socketWireFormats.get(socket) ?? this.wireFormat;
+      let outbound = encodedByWireFormat[wireFormat];
+      if (!outbound) {
+        outbound = frame
+          ? this.encodeOutboundFrame(frame, wireFormat)
+          : this.encodeOutboundPayload("EVENT", event, wireFormat);
+        encodedByWireFormat[wireFormat] = outbound;
+      }
+      try {
+        socket.send(outbound);
+      } catch {
+        // Realtime datagrams are disposable under backpressure.
+      }
+    });
   }
 
   private broadcast(guildId: GuildId, event: GuildEvent) {
@@ -7454,11 +8860,18 @@ export class RelayServer {
   }
 
   private broadcastTransient(guildId: GuildId, event: GuildEvent) {
+    if (
+      isExpiredTransientEvent(event) ||
+      !this.rememberTransientEventOnce(guildId, event)
+    ) {
+      return;
+    }
     const frame =
       process.env.CGP_RELAY_PUBSUB_INCLUDE_FRAME === "1"
         ? stringifyCgpFrame("EVENT", event)
         : undefined;
     this.deliverBroadcastFrame(guildId, event, frame);
+    this.deliverRealtimeBroadcastFrame(guildId, event, frame);
     this.publishTransientEventToPubSub(guildId, event, frame);
   }
 
@@ -7516,6 +8929,59 @@ export class RelayServer {
     return await next;
   }
 
+  private async waitForGuildHead(
+    guildId: GuildId,
+    expectedSeq: number,
+    expectedHash: string | null,
+    timeoutMs: number,
+  ) {
+    const deadline = Date.now() + Math.max(0, timeoutMs);
+    do {
+      const lastEvent = await this.store.getLastEvent(guildId);
+      const localSeq = lastEvent?.seq ?? -1;
+      const localHash = lastEvent?.id ?? null;
+      if (localSeq === expectedSeq && localHash === expectedHash) {
+        return true;
+      }
+      // An already-advanced replica must enter the guild mutex so the normal
+      // idempotency checks can ACK a fanout retry. A same-height hash mismatch
+      // is a real divergence and can never be repaired by waiting.
+      if (localSeq > expectedSeq) {
+        return true;
+      }
+      if (localSeq === expectedSeq) {
+        return false;
+      }
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, 10);
+        timer.unref?.();
+      });
+    } while (Date.now() < deadline);
+    return false;
+  }
+
+  private async ensureWriteWitnessGuildReplication(
+    guildId: GuildId,
+    timeoutMs: number,
+  ) {
+    if (!this.pubSubAdapter || this.closing) {
+      return false;
+    }
+    this.ensurePubSubHostedGuildReplication(guildId);
+    const topic = this.pubSubLogTopic(guildId);
+    const deadline = Date.now() + Math.max(0, timeoutMs);
+    while (
+      this.pubSubPendingGuilds.has(topic) &&
+      Date.now() < deadline
+    ) {
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, 5);
+        timer.unref?.();
+      });
+    }
+    return this.pubSubUnsubscribers.has(topic);
+  }
+
   public async close() {
     if (this.closePromise) {
       return this.closePromise;
@@ -7551,6 +9017,8 @@ export class RelayServer {
     this.fanoutDrainPending = [];
     this.fanoutDrainPendingHead = 0;
     this.fanoutQueues.clear();
+
+    await this.stopWebTransport();
 
     for (const socket of this.wss.clients) {
       socket.removeAllListeners("message");
@@ -7626,6 +9094,8 @@ export class RelayServer {
         console.error("Relay pubsub unsubscribe failed during close:", e);
       }
     }
+    await this.sequencerConsensusCoordinator?.close();
+    await this.writeQuorumCoordinator?.close();
     await this.pluginsReady;
     for (const plugin of this.plugins) {
       try {

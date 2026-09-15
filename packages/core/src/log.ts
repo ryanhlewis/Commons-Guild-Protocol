@@ -1,5 +1,5 @@
-import { hashObject } from "./crypto";
-import { GuildEvent, HashHex } from "./types";
+import { hashObject } from "./crypto.js";
+import { GuildEvent, HashHex } from "./types.js";
 
 export function computeEventId(unsigned: Omit<GuildEvent, "id" | "signature"> | GuildEvent): HashHex {
     return hashObject({
@@ -7,7 +7,8 @@ export function computeEventId(unsigned: Omit<GuildEvent, "id" | "signature"> | 
         prevHash: unsigned.prevHash,
         createdAt: unsigned.createdAt,
         author: unsigned.author,
-        body: unsigned.body
+        body: unsigned.body,
+        deviceAuthorization: unsigned.deviceAuthorization,
     });
 }
 
@@ -24,6 +25,7 @@ export function validateChain(events: GuildEvent[]): boolean {
             createdAt: ev.createdAt,
             author: ev.author,
             body: ev.body,
+            deviceAuthorization: ev.deviceAuthorization,
         });
 
         if (expectedId !== ev.id) return false;

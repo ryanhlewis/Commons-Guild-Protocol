@@ -1,11 +1,23 @@
 import fs from "fs";
 import path from "path";
 import { execFileSync } from "child_process";
+import { createHash } from "crypto";
 import WebSocket from "ws";
 import { CgpClient } from "@cgp/client";
 import { encodeCgpFrame, EventBody, generatePrivateKey, getPublicKey, hashObject, parseCgpWireData, sign, summarizeRelayHeadQuorum, verifyRelayHead } from "@cgp/core";
 import type { CgpWireFormat, RelayHead } from "@cgp/core";
-import { createMediaStoragePolicyPlugin, MemoryStore, RelayServer, ShardedWebSocketRelayPubSubAdapter, WebSocketPubSubHub, WebSocketRelayPubSubAdapter } from "@cgp/relay";
+import {
+    createHeliaIpfsPlugin,
+    createMediaStoragePolicyPlugin,
+    loadPlugin,
+    MemoryStore,
+    parsePluginList,
+    RelayServer,
+    ShardedWebSocketRelayPubSubAdapter,
+    WebSocketPubSubHub,
+    WebSocketRelayPubSubAdapter
+} from "@cgp/relay";
+import type { RelayPlugin } from "@cgp/relay";
 import { defaultProfile, normalizeProfile, LoadnetProfile } from "./profile";
 
 interface ScenarioFile {
@@ -130,6 +142,57 @@ async function waitForFile(filePath: string, timeoutMs = 60000) {
         }
         await sleep(250);
     }
+}
+
+function relayHttpBase(relayUrl: string) {
+    const parsed = new URL(relayUrl);
+    parsed.protocol = parsed.protocol === "wss:" ? "https:" : "http:";
+    parsed.pathname = "";
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString().replace(/\/$/, "");
+}
+
+function deterministicBytes(seed: string, size: number) {
+    const output = Buffer.alloc(size);
+    let offset = 0;
+    let counter = 0;
+    while (offset < size) {
+        const chunk = createHash("sha256").update(`${seed}:${counter}`).digest();
+        const copied = Math.min(chunk.byteLength, size - offset);
+        chunk.copy(output, offset, 0, copied);
+        offset += copied;
+        counter += 1;
+    }
+    return output;
+}
+
+async function fetchJsonWithRetry(url: string, init: RequestInit | undefined, timeoutMs: number, retries: number) {
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= retries; attempt += 1) {
+        try {
+            const response = await fetch(url, {
+                ...(init ?? {}),
+                signal: AbortSignal.timeout(timeoutMs)
+            });
+            const text = await response.text();
+            let json: any = {};
+            try {
+                json = text ? JSON.parse(text) : {};
+            } catch {
+                json = { raw: text };
+            }
+            if (!response.ok) {
+                throw new Error(`${url} returned ${response.status}: ${JSON.stringify(json).slice(0, 300)}`);
+            }
+            return json;
+        } catch (error) {
+            lastError = error;
+            if (attempt >= retries) break;
+            await sleep(Math.min(5000, 250 * (attempt + 1)));
+        }
+    }
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 function scenarioTimeoutMs(profile: LoadnetProfile) {
@@ -513,6 +576,54 @@ async function runPubSub() {
     await new Promise(() => undefined);
 }
 
+async function connectLoadnetHeliaPeers(port: number, peerUrls: string[]) {
+    if (process.env.LOADNET_HELIA_CONNECT_PEERS !== "1") return;
+    const dialPort = envNumber("LOADNET_HELIA_DIAL_PORT", 4001);
+    const retries = envNumber("LOADNET_HELIA_CONNECT_RETRIES", 60);
+    const localBase = `http://127.0.0.1:${port}`;
+    for (const peerUrl of peerUrls) {
+        try {
+            const peerBase = relayHttpBase(peerUrl);
+            const peerHost = new URL(peerBase).hostname;
+            let peerId = "";
+            for (let attempt = 0; attempt < retries; attempt += 1) {
+                try {
+                    const status = await fetchJsonWithRetry(
+                        `${peerBase}/plugins/cgp.ipfs.helia/status`,
+                        undefined,
+                        5000,
+                        0
+                    );
+                    peerId = String(status?.backend?.peerId || "");
+                    if (peerId) break;
+                } catch {
+                    // Peer may still be starting.
+                }
+                await sleep(1000);
+            }
+            if (!peerId) continue;
+            const multiaddr = `/dns4/${peerHost}/tcp/${dialPort}/p2p/${peerId}`;
+            await fetchJsonWithRetry(
+                `${localBase}/plugins/cgp.ipfs.helia/peers/connect`,
+                {
+                    method: "POST",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify({ multiaddr })
+                },
+                10000,
+                3
+            );
+            console.log(JSON.stringify({ role: "helia-peer-connect", peerUrl, multiaddr }));
+        } catch (error: any) {
+            console.warn(JSON.stringify({
+                role: "helia-peer-connect-failed",
+                peerUrl,
+                error: error?.message || String(error)
+            }));
+        }
+    }
+}
+
 async function runRelay() {
     await applyNetem();
     const port = envNumber("CGP_RELAY_PORT", 7447);
@@ -529,9 +640,28 @@ async function runRelay() {
         : pubsubUrls.length === 1
             ? new WebSocketRelayPubSubAdapter(pubsubUrls[0], { wireFormat })
             : undefined;
-    const plugins = process.env.CGP_RELAY_MEDIA_POLICY_ENABLED === "1"
-        ? [createMediaStoragePolicyPlugin()]
-        : [];
+    let pluginConfig: Record<string, unknown> = {};
+    if (process.env.CGP_RELAY_PLUGIN_CONFIG) {
+        pluginConfig = JSON.parse(process.env.CGP_RELAY_PLUGIN_CONFIG);
+    }
+    const configuredPlugins = await Promise.all(
+        parsePluginList(process.env.CGP_RELAY_PLUGINS || "").map((name) =>
+            loadPlugin(name, pluginConfig[name])
+        )
+    );
+    const pluginsByName = new Map<string, RelayPlugin>();
+    for (const plugin of configuredPlugins) {
+        pluginsByName.set(plugin.name, plugin);
+    }
+    if (process.env.CGP_IPFS_HELIA_ENABLED === "1") {
+        const plugin = createHeliaIpfsPlugin();
+        pluginsByName.set(plugin.name, plugin);
+    }
+    if (process.env.CGP_RELAY_MEDIA_POLICY_ENABLED === "1") {
+        const plugin = createMediaStoragePolicyPlugin();
+        pluginsByName.set(plugin.name, plugin);
+    }
+    const plugins = [...pluginsByName.values()];
     const relay = new RelayServer(port, store, plugins, {
         pubSubAdapter,
         peerUrls,
@@ -540,6 +670,7 @@ async function runRelay() {
         wireFormat
     });
     console.log(JSON.stringify({ role: "relay", port, dbPath, pubsubUrls, peerUrls: peerUrls.length, plugins: plugins.map((plugin) => plugin.name), wireFormat }));
+    void connectLoadnetHeliaPeers(port, peerUrls);
     process.on("SIGTERM", () => void relay.close().then(() => process.exit(0)));
     await new Promise(() => undefined);
 }
@@ -1232,6 +1363,12 @@ async function runFullClientWorker() {
         .split(",")
         .map((entry) => entry.trim().toLowerCase())
         .filter(Boolean);
+    const uploadMediaBytes =
+        process.env.LOADNET_FULL_CLIENT_MEDIA_UPLOAD === "1" ||
+        profile.fullClientMediaUpload;
+    const verifyUploadedMediaFetch =
+        process.env.LOADNET_FULL_CLIENT_MEDIA_FETCH_VERIFY === "1" ||
+        profile.fullClientMediaFetchVerify;
     const expectedReady = envNumber("LOADNET_EXPECTED_READY", profile.subscriberWorkers);
     const readyTimeoutMs = envNumber("LOADNET_READY_TIMEOUT_MS", Math.max(60_000, profile.durationMs + 60_000));
     const finalBackfill = process.env.LOADNET_FULL_CLIENT_FINAL_BACKFILL !== "0" && profile.fullClientFinalBackfill;
@@ -1273,6 +1410,9 @@ async function runFullClientWorker() {
     let callEvents = 0;
     let relayFallbackCallEvents = 0;
     let mediaAttachmentEvents = 0;
+    let mediaUploadEvents = 0;
+    let mediaUploadBytes = 0;
+    let mediaFetchVerifiedEvents = 0;
 
     const eventChannelSet = (channelId: string) => {
         let set = expectedByChannel.get(channelId);
@@ -1317,6 +1457,71 @@ async function runFullClientWorker() {
         return "loadnet-general-ipfs";
     };
 
+    const verifyUploadedMediaFromRelay = async (relay: string, cid: string, expectedSha256: string) => {
+        const endpoint = `${relayHttpBase(relay)}/plugins/cgp.ipfs.helia/ipfs/${cid}?offline=0&timeoutMs=15000`;
+        let lastError: unknown;
+        for (let attempt = 0; attempt < 8; attempt += 1) {
+            try {
+                const response = await fetch(endpoint, { signal: AbortSignal.timeout(20_000) });
+                const body = Buffer.from(await response.arrayBuffer());
+                if (!response.ok) {
+                    throw new Error(`${endpoint} returned ${response.status}: ${body.toString("utf8").slice(0, 200)}`);
+                }
+                const actualSha256 = createHash("sha256").update(body).digest("hex");
+                if (actualSha256 !== expectedSha256) {
+                    throw new Error(`fetched media hash mismatch: ${actualSha256} != ${expectedSha256}`);
+                }
+                return;
+            } catch (error) {
+                lastError = error;
+                await sleep(500 + attempt * 500);
+            }
+        }
+        throw lastError instanceof Error ? lastError : new Error(String(lastError));
+    };
+
+    const uploadMediaAttachment = async (
+        eventId: string,
+        globalActionIndex: number,
+        tags: string[],
+        mimeType: string,
+        adult: boolean,
+        providerId: string,
+    ) => {
+        const bytes = deterministicBytes(`loadnet-media:${eventId}:${providerId}`, mediaBytes);
+        const sha256 = createHash("sha256").update(bytes).digest("hex");
+        const uploadRelay = writeRelayUrls[globalActionIndex % writeRelayUrls.length] || relayUrl;
+        const uploaded = await fetchJsonWithRetry(
+            `${relayHttpBase(uploadRelay)}/plugins/cgp.media.storage/upload`,
+            {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                    bytesBase64: bytes.toString("base64"),
+                    name: `${eventId}.${mimeType.endsWith("png") ? "png" : "webp"}`,
+                    mimeType,
+                    type: "image",
+                    tags,
+                    encrypted: true,
+                    adult,
+                    providerId,
+                    sha256,
+                    attachmentId: `att-${eventId}`
+                })
+            },
+            30_000,
+            3
+        );
+        mediaUploadEvents += 1;
+        mediaUploadBytes += Number(uploaded.bytes || mediaBytes);
+        if (verifyUploadedMediaFetch && relayUrls.length > 1) {
+            const verifyRelay = relayUrls[(globalActionIndex + 1) % relayUrls.length] || uploadRelay;
+            await verifyUploadedMediaFromRelay(verifyRelay, String(uploaded.cid), sha256);
+            mediaFetchVerifiedEvents += 1;
+        }
+        return uploaded.attachment as Record<string, unknown>;
+    };
+
     const processObservedEvents = (events: any[], target: Set<string>) => {
         for (const event of events) {
             const eventId = eventIdFromBody(event?.body);
@@ -1326,7 +1531,7 @@ async function runFullClientWorker() {
         }
     };
 
-    const buildPlan = (localActionIndex: number): FullClientEventPlan => {
+    const buildPlan = async (localActionIndex: number): Promise<FullClientEventPlan> => {
         const globalActionIndex = workerId * Math.max(1, actions) + localActionIndex;
         const logicalClientIndex = globalActionIndex % virtualClients;
         const authorIndex = logicalClientIndex % signers.length;
@@ -1348,8 +1553,31 @@ async function runFullClientWorker() {
             const tags = Array.from(new Set([primaryTag, primaryTag === "meme" ? "image" : "photo"]));
             const adult = tags.some((tag) => tag === "adult" || tag === "nsfw" || tag === "porn");
             const providerId = providerForMediaTags(tags);
-            const cid = `bafyloadnet${hashObject({ eventId, tags, mediaBytes }).slice(0, 40)}`;
             const mimeType = globalActionIndex % 5 === 0 ? "image/png" : "image/webp";
+            const attachment = uploadMediaBytes
+                ? await uploadMediaAttachment(eventId, globalActionIndex, tags, mimeType, adult, providerId)
+                : {
+                    id: `att-${eventId}`,
+                    url: `ipfs://bafyloadnet${hashObject({ eventId, tags, mediaBytes }).slice(0, 40)}`,
+                    scheme: "ipfs",
+                    type: "image",
+                    mimeType,
+                    size: mediaBytes,
+                    hash: hashObject({ kind: "loadnet-media", eventId, tags, mediaBytes }),
+                    encrypted: true,
+                    adult,
+                    external: {
+                        tags,
+                        storage: {
+                            providerId,
+                            kind: "ipfs",
+                            tags,
+                            encrypted: true,
+                            lossless: mimeType === "image/png",
+                            retention: "operator-defined"
+                        }
+                    }
+                };
             return {
                 eventId,
                 channelId,
@@ -1361,30 +1589,7 @@ async function runFullClientWorker() {
                     channelId,
                     messageId: `media-${eventId}`,
                     content: `[loadnet media:${primaryTag}] ${eventId}`,
-                    attachments: [
-                        {
-                            id: `att-${eventId}`,
-                            url: `ipfs://${cid}`,
-                            scheme: "ipfs",
-                            type: "image",
-                            mimeType,
-                            size: mediaBytes,
-                            hash: hashObject({ kind: "loadnet-media", eventId, cid, mediaBytes }),
-                            encrypted: true,
-                            adult,
-                            external: {
-                                tags,
-                                storage: {
-                                    providerId,
-                                    kind: "ipfs",
-                                    tags,
-                                    encrypted: true,
-                                    lossless: mimeType === "image/png",
-                                    retention: "operator-defined"
-                                }
-                            }
-                        }
-                    ],
+                    attachments: [attachment],
                     external: {
                         loadnetEventId: eventId,
                         kind: "media-attachment",
@@ -1558,7 +1763,10 @@ async function runFullClientWorker() {
         };
     };
 
-    const plans = Array.from({ length: actions }, (_, index) => buildPlan(index));
+    const plans: FullClientEventPlan[] = [];
+    for (let index = 0; index < actions; index += 1) {
+        plans.push(await buildPlan(index));
+    }
     for (const plan of plans) registerExpected(plan);
 
     const connectObserverOnce = async (observerIndex: number) => {
@@ -1843,6 +2051,9 @@ async function runFullClientWorker() {
         callEvents,
         relayFallbackCallEvents,
         mediaAttachmentEvents,
+        mediaUploadEvents,
+        mediaUploadBytes,
+        mediaFetchVerifiedEvents,
         userHostedRelays: relayOperators.length,
         liveObservedEvents: liveObservedEventIds.size,
         backfillVerifiedEvents: backfillVerifiedEventIds.size,
@@ -1866,6 +2077,8 @@ async function runFullClientWorker() {
         verifiedEvents: verifiedEventIds.size,
         relayFallbackCallEvents,
         mediaAttachmentEvents,
+        mediaUploadEvents,
+        mediaFetchVerifiedEvents,
         ms
     }));
 }
@@ -1917,6 +2130,9 @@ async function runCollector() {
                     fullClientLiveObservedEvents: metrics.filter((m) => m.role === "full-client").reduce((sum, m) => sum + (m.liveObservedEvents || 0), 0),
                     fullClientVirtualUsers: metrics.filter((m) => m.role === "full-client").reduce((sum, m) => sum + (m.virtualClients || 0), 0),
                     mediaAttachmentEvents: metrics.filter((m) => m.role === "full-client").reduce((sum, m) => sum + (m.mediaAttachmentEvents || 0), 0),
+                    mediaUploadEvents: metrics.filter((m) => m.role === "full-client").reduce((sum, m) => sum + (m.mediaUploadEvents || 0), 0),
+                    mediaUploadBytes: metrics.filter((m) => m.role === "full-client").reduce((sum, m) => sum + (m.mediaUploadBytes || 0), 0),
+                    mediaFetchVerifiedEvents: metrics.filter((m) => m.role === "full-client").reduce((sum, m) => sum + (m.mediaFetchVerifiedEvents || 0), 0),
                     relayStorageBytes,
                     relayStorageMaxPressure
                 },

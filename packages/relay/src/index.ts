@@ -8,10 +8,46 @@ import type {
   RelayWireFormat,
 } from "./server";
 import {
+  RedundantWebSocketRelayPubSubAdapter,
   ShardedWebSocketRelayPubSubAdapter,
   WebSocketPubSubHub,
   WebSocketRelayPubSubAdapter,
 } from "./pubsub_ws";
+import {
+  CgpWebTransportRelayServer,
+  CgpWebTransportSocket,
+  webTransportOptionsFromEnv,
+} from "./webtransport_realtime";
+import type {
+  CgpWebTransportAdvertisement,
+  CgpWebTransportOptions,
+} from "./webtransport_realtime";
+import {
+  RelayWriteQuorumCoordinator,
+  normalizeRelayWriteQuorumConfig,
+  relayWriteProposalId,
+  relayWriteQuorumConfigFromEnv,
+} from "./write_quorum";
+import {
+  RelaySequencerConsensusCoordinator,
+  normalizeRelaySequencerConsensusConfig,
+  relaySequencerConsensusConfigFromEnv,
+  relaySequencingRequestId,
+} from "./sequencer_consensus";
+import type {
+  RelaySequencerConsensusConfig,
+  RelaySequencerHead,
+  RelaySequencerMessage,
+  RelaySequencerPersistentState,
+  RelaySequencingRequest,
+  RelaySequencingToken,
+} from "./sequencer_consensus";
+import type {
+  RelayWriteProposal,
+  RelayWriteQuorumConfig,
+  RelayWriteQuorumVote,
+  RelayWriteQuorumVoteUnsigned,
+} from "./write_quorum";
 
 import { Store, MemoryStore } from "./store";
 import { LevelStore } from "./store_level";
@@ -20,12 +56,21 @@ import {
   createAppSurfacePolicyPlugin,
   createAppObjectPermissionPlugin,
   createEncryptionPolicyPlugin,
+  createExpressionSearchProviderPlugin,
+  createFauxIpfsBackendPlugin,
+  createGitHubRelayMirrorPlugin,
+  createHollowRoomRelayPlugin,
+  createHeliaIpfsPlugin,
   createMediaStoragePolicyPlugin,
   createProofOfWorkPolicyPlugin,
   createRateLimitPolicyPlugin,
   createRelayPushPlugin,
   createSafetyReportPlugin,
   createSandboxedCommandPlugin,
+  createStaticShardSeedPlugin,
+  staticShardReleaseSigningPayload,
+  verifyStaticShardReleasePublisher,
+  STATIC_SHARD_PUBLISHER_PROTOCOL,
   createWebhookIngressPlugin,
 } from "./plugins";
 import type {
@@ -33,7 +78,22 @@ import type {
   AppObjectPermissionPolicy,
   AppObjectPermissionRule,
   AppSurfacePolicy,
+  CgpIpfsAddFileInput,
+  CgpIpfsAddFileResult,
+  CgpIpfsBackend,
+  CgpIpfsBackendKind,
+  CgpIpfsBackendStatus,
   EncryptionPolicy,
+  ExpressionSearchProviderPolicy,
+  FauxIpfsBackendPolicy,
+  FauxIpfsStorageKind,
+  GitHubRelayMirrorFrequency,
+  GitHubRelayMirrorPolicy,
+  GitHubRelayMirrorScope,
+  GitHubRelayMirrorSource,
+  GitHubRelayMirrorSourceKind,
+  HeliaIpfsPolicy,
+  HollowRoomRelayPolicy,
   MediaStoragePolicy,
   MediaStorageProvider,
   MediaStorageProviderKind,
@@ -48,15 +108,31 @@ import type {
   SafetyReportPolicy,
   SandboxedCommandPluginOptions,
   SandboxedPluginHook,
+  StaticShardSeedKind,
+  StaticShardSeedPolicy,
+  StaticShardSeedSource,
+  StaticShardPublisherProof,
   WebhookIngressPolicy,
 } from "./plugins";
 
 export {
   RelayServer,
   LocalRelayPubSubAdapter,
+  RedundantWebSocketRelayPubSubAdapter,
   ShardedWebSocketRelayPubSubAdapter,
   WebSocketPubSubHub,
   WebSocketRelayPubSubAdapter,
+  CgpWebTransportRelayServer,
+  CgpWebTransportSocket,
+  webTransportOptionsFromEnv,
+  RelayWriteQuorumCoordinator,
+  normalizeRelayWriteQuorumConfig,
+  relayWriteProposalId,
+  relayWriteQuorumConfigFromEnv,
+  RelaySequencerConsensusCoordinator,
+  normalizeRelaySequencerConsensusConfig,
+  relaySequencerConsensusConfigFromEnv,
+  relaySequencingRequestId,
   Store,
   MemoryStore,
   LevelStore,
@@ -64,12 +140,21 @@ export {
   createAppSurfacePolicyPlugin,
   createAppObjectPermissionPlugin,
   createEncryptionPolicyPlugin,
+  createExpressionSearchProviderPlugin,
+  createFauxIpfsBackendPlugin,
+  createGitHubRelayMirrorPlugin,
+  createHollowRoomRelayPlugin,
+  createHeliaIpfsPlugin,
   createMediaStoragePolicyPlugin,
   createProofOfWorkPolicyPlugin,
   createRateLimitPolicyPlugin,
   createRelayPushPlugin,
   createSafetyReportPlugin,
   createSandboxedCommandPlugin,
+  createStaticShardSeedPlugin,
+  staticShardReleaseSigningPayload,
+  verifyStaticShardReleasePublisher,
+  STATIC_SHARD_PUBLISHER_PROTOCOL,
   createWebhookIngressPlugin,
 };
 export type {
@@ -77,7 +162,22 @@ export type {
   AppObjectPermissionPolicy,
   AppObjectPermissionRule,
   AppSurfacePolicy,
+  CgpIpfsAddFileInput,
+  CgpIpfsAddFileResult,
+  CgpIpfsBackend,
+  CgpIpfsBackendKind,
+  CgpIpfsBackendStatus,
   EncryptionPolicy,
+  ExpressionSearchProviderPolicy,
+  FauxIpfsBackendPolicy,
+  FauxIpfsStorageKind,
+  GitHubRelayMirrorFrequency,
+  GitHubRelayMirrorPolicy,
+  GitHubRelayMirrorScope,
+  GitHubRelayMirrorSource,
+  GitHubRelayMirrorSourceKind,
+  HeliaIpfsPolicy,
+  HollowRoomRelayPolicy,
   MediaStoragePolicy,
   MediaStorageProvider,
   MediaStorageProviderKind,
@@ -97,8 +197,24 @@ export type {
   SafetyReportPolicy,
   SandboxedCommandPluginOptions,
   SandboxedPluginHook,
+  StaticShardSeedKind,
+  StaticShardSeedPolicy,
+  StaticShardSeedSource,
+  StaticShardPublisherProof,
   WebhookIngressPolicy,
   RelayServerOptions,
+  CgpWebTransportAdvertisement,
+  CgpWebTransportOptions,
+  RelayWriteProposal,
+  RelayWriteQuorumConfig,
+  RelayWriteQuorumVote,
+  RelayWriteQuorumVoteUnsigned,
+  RelaySequencerConsensusConfig,
+  RelaySequencerHead,
+  RelaySequencerMessage,
+  RelaySequencerPersistentState,
+  RelaySequencingRequest,
+  RelaySequencingToken,
 };
 
 if (require.main === module) {
@@ -164,15 +280,21 @@ if (require.main === module) {
       .filter(Boolean);
     const pubSubAdapter =
       pubSubUrls.length > 1
-        ? new ShardedWebSocketRelayPubSubAdapter(pubSubUrls)
+        ? process.env.CGP_RELAY_PUBSUB_MODE === "redundant"
+          ? new RedundantWebSocketRelayPubSubAdapter(pubSubUrls)
+          : new ShardedWebSocketRelayPubSubAdapter(pubSubUrls)
         : pubSubUrls.length === 1
           ? new WebSocketRelayPubSubAdapter(pubSubUrls[0])
           : undefined;
-    new RelayServer(PORT, DB_PATH, plugins, { pubSubAdapter });
+    new RelayServer(PORT, DB_PATH, plugins, {
+      pubSubAdapter,
+      instanceId: process.env.CGP_RELAY_INSTANCE_ID,
+      listenHost: process.env.CGP_RELAY_HOST,
+    });
   })();
 }
 
-function parsePluginList(spec: string): string[] {
+export function parsePluginList(spec: string): string[] {
   const trimmed = spec.trim();
   if (!trimmed) return [];
 
@@ -195,21 +317,32 @@ function parsePluginList(spec: string): string[] {
     .filter(Boolean);
 }
 
-async function loadPlugin(
+export async function loadPlugin(
   moduleName: string,
   config?: any,
 ): Promise<RelayPlugin> {
+  const builtIn = builtInRelayPluginFactory(moduleName);
+  if (builtIn) {
+    return builtIn(config);
+  }
+
   const mod: any = await import(moduleName);
 
-  const candidate =
-    mod?.default ??
-    mod?.createRelayPlugin ??
-    mod?.createPlugin ??
-    mod?.plugin ??
-    mod;
+  const namespaces = [mod, mod?.default].filter(
+    (entry) => entry && typeof entry === "object",
+  );
+  const functionCandidate = namespaces
+    .flatMap((entry: any) => [
+      entry.default,
+      entry.createRelayPlugin,
+      entry.createPlugin,
+      entry.plugin,
+      entry.createHollowFederatedRelayPlugin,
+    ])
+    .find((entry) => typeof entry === "function");
 
-  if (typeof candidate === "function") {
-    const plugin = candidate(config);
+  if (functionCandidate) {
+    const plugin = functionCandidate(config);
     if (!plugin || typeof plugin.name !== "string") {
       throw new Error(
         `Plugin factory did not return a valid plugin for ${moduleName}`,
@@ -218,13 +351,72 @@ async function loadPlugin(
     return plugin as RelayPlugin;
   }
 
-  if (
-    candidate &&
-    typeof candidate === "object" &&
-    typeof candidate.name === "string"
-  ) {
-    return candidate as RelayPlugin;
+  const objectCandidate = namespaces
+    .flatMap((entry: any) => [entry.plugin, entry.default, entry])
+    .find((entry) => entry && typeof entry === "object" && typeof entry.name === "string");
+
+  if (objectCandidate) {
+    return objectCandidate as RelayPlugin;
   }
 
   throw new Error(`Unsupported plugin module shape for ${moduleName}`);
+}
+
+function builtInRelayPluginFactory(
+  name: string,
+): ((config?: any) => RelayPlugin) | undefined {
+  switch (name.trim()) {
+    case "cgp.ipfs.faux":
+    case "faux-ipfs":
+      return createFauxIpfsBackendPlugin;
+    case "cgp.ipfs.helia":
+    case "helia":
+      return createHeliaIpfsPlugin;
+    case "cgp.media.storage":
+    case "media-storage":
+      return createMediaStoragePolicyPlugin;
+    case "cgp.expression.search":
+    case "expression-search":
+      return createExpressionSearchProviderPlugin;
+    case "cgp.static-shards":
+    case "static-shards":
+      return createStaticShardSeedPlugin;
+    case "cgp.github.mirror":
+    case "github-mirror":
+      return createGitHubRelayMirrorPlugin;
+    case "hollow-relay":
+      return createHollowRoomRelayPlugin;
+    case "cgp.relay.push":
+    case "relay-push":
+      return createRelayPushPlugin;
+    case "cgp.rate-limit":
+    case "rate-limit":
+      return createRateLimitPolicyPlugin;
+    case "cgp.abuse-control":
+    case "abuse-control":
+      return createAbuseControlPolicyPlugin;
+    case "cgp.encryption-policy":
+    case "encryption-policy":
+      return createEncryptionPolicyPlugin;
+    case "cgp.app-surface-policy":
+    case "app-surface-policy":
+      return createAppSurfacePolicyPlugin;
+    case "cgp.app-object-permissions":
+    case "app-object-permissions":
+      return createAppObjectPermissionPlugin;
+    case "cgp.safety-report":
+    case "safety-report":
+      return createSafetyReportPlugin;
+    case "cgp.proof-of-work":
+    case "proof-of-work":
+      return createProofOfWorkPolicyPlugin;
+    case "cgp.webhook-ingress":
+    case "webhook-ingress":
+      return createWebhookIngressPlugin;
+    case "cgp.sandboxed-command":
+    case "sandboxed-command":
+      return createSandboxedCommandPlugin;
+    default:
+      return undefined;
+  }
 }

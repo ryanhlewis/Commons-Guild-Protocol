@@ -8,8 +8,19 @@ import {
   EditMessage,
   GuildEvent,
   Message,
-} from "./types";
-import { checkpointStateRoot, GuildState, serializeState } from "./state";
+} from "./types.js";
+import {
+  appObjectStateKey,
+  checkpointStateRoot,
+  GuildState,
+  serializeState,
+} from "./state.js";
+import { hashObject } from "./crypto.js";
+import { validateSfuAuthorityRotation } from "./sfu_authority.js";
+import {
+  matchingAppObjectLeasePolicy,
+  validateAppObjectLease,
+} from "./app_object_lease.js";
 
 export type PermissionScope =
   | "guild"
@@ -723,7 +734,11 @@ function validateMemberUpdate(
   );
 }
 
-export function validateEvent(state: GuildState, event: GuildEvent) {
+export function validateEvent(
+  state: GuildState,
+  event: GuildEvent,
+  options: { now?: number } = {},
+) {
   const { body, author } = event;
   const bodyRecord = body as any;
 
@@ -964,10 +979,85 @@ export function validateEvent(state: GuildState, event: GuildEvent) {
           );
         }
       }
+      const objectKey = appObjectStateKey(
+        appBody.namespace,
+        appBody.objectType,
+        appBody.objectId,
+      );
+      const existingObject = state.appObjects.get(objectKey);
+      // Game-world commits are immutable and guild-authorized, independently
+      // of a client's createOnly flag or claimed GameSync peer identity.
+      if (appBody.namespace === "app.hollow.game-world" && appBody.objectType === "world-commit") {
+        if (!canModerateScope(state, author, "apps")) {
+          throw new Error("World commits require guild owner or manage-apps permission");
+        }
+        if (appBody.type === "APP_OBJECT_UPSERT") {
+          if (existingObject) throw new Error("World commits are immutable");
+          const value = appBody.value as Record<string, unknown> | null;
+          if (!value || typeof value !== "object" || Array.isArray(value)) {
+            throw new Error("World commit is invalid");
+          }
+          const { commitId, ...unsigned } = value;
+          if (value.protocol !== "hollow-game-world/1" || value.authorId !== author ||
+              commitId !== appBody.objectId || hashObject(unsigned) !== commitId) {
+            throw new Error("World commit identity or content hash is invalid");
+          }
+        }
+      }
+
+      const leasePolicy =
+        appBody.type === "APP_OBJECT_UPSERT"
+          ? matchingAppObjectLeasePolicy(
+              state.policies.exclusiveAppObjects,
+              appBody,
+            )
+          : undefined;
+      if (appBody.type === "APP_OBJECT_UPSERT" && (appBody.lease || leasePolicy)) {
+        validateAppObjectLease(event, leasePolicy, options.now);
+      }
+      if (existingObject?.lease) {
+        const canAdministerLease =
+          author === state.ownerId || canModerateScope(state, author, "apps");
+        if (appBody.type === "APP_OBJECT_DELETE") {
+          if (author !== existingObject.authorId && !canAdministerLease) {
+            throw new Error("Only the lease holder or a guild app administrator can delete an exclusive app object");
+          }
+        } else {
+          const leaseReplacement =
+            appBody.createOnly === true &&
+            Boolean(appBody.lease) &&
+            event.createdAt >= existingObject.lease.expiresAt &&
+            (options.now ?? Date.now()) >= existingObject.lease.expiresAt;
+          if (!leaseReplacement && !canAdministerLease) {
+            throw new Error("Exclusive app object lease is still active");
+          }
+        }
+      }
+      if (
+        appBody.type === "APP_OBJECT_UPSERT" &&
+        appBody.createOnly === true &&
+        existingObject &&
+        !(
+          existingObject.lease &&
+          appBody.lease &&
+          event.createdAt >= existingObject.lease.expiresAt &&
+          (options.now ?? Date.now()) >= existingObject.lease.expiresAt
+        )
+      ) {
+        throw new Error(
+          `App object ${appBody.namespace}/${appBody.objectType}/${appBody.objectId} already exists`,
+        );
+      }
       break;
     }
     case "MEMBER_UPDATE":
       validateMemberUpdate(state, author, bodyRecord);
+      break;
+    case "SFU_AUTHORITY_SET":
+      if (author !== state.ownerId) {
+        throw new Error("Only the guild owner may rotate SFU authorities");
+      }
+      validateSfuAuthorityRotation(body, state.sfuAuthoritySets, event);
       break;
     case "CHECKPOINT": {
       const checkpoint = body as Checkpoint;

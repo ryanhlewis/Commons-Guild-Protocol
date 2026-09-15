@@ -6,7 +6,7 @@ import {
     encodeCgpFrame,
     parseCgpWireData,
     stringifyCgpFrame
-} from "./wire";
+} from "./wire.js";
 
 export type CgpPubSubFrameKind = "PUB" | "SUB" | "UNSUB" | "ACK";
 
@@ -17,7 +17,29 @@ interface CompactPubSubEnvelopeLike {
     events?: unknown[];
     head?: unknown;
     frame?: string;
+    transient?: boolean;
     liveTopics?: boolean;
+}
+
+const COMPACT_ENVELOPE_KEYS = new Set([
+    "originId",
+    "guildId",
+    "event",
+    "events",
+    "head",
+    "frame",
+    "transient",
+    "liveTopics"
+]);
+
+function compactPubFrameCanRepresent(payload: unknown) {
+    const record = payload && typeof payload === "object" && !Array.isArray(payload)
+        ? payload as Record<string, unknown>
+        : {};
+    const envelope = record.envelope && typeof record.envelope === "object" && !Array.isArray(record.envelope)
+        ? record.envelope as Record<string, unknown>
+        : {};
+    return Object.keys(envelope).every((key) => COMPACT_ENVELOPE_KEYS.has(key));
 }
 
 const PUBSUB_MAGIC_0 = 0x43; // C
@@ -32,6 +54,7 @@ const PUBSUB_FLAG_FRAME = 1 << 3;
 const PUBSUB_FLAG_ID = 1 << 4;
 const PUBSUB_FLAG_TOKEN = 1 << 5;
 const PUBSUB_FLAG_LIVE_TOPICS_FALSE = 1 << 6;
+const PUBSUB_FLAG_TRANSIENT = 1 << 7;
 
 const sharedTextEncoder = typeof TextEncoder !== "undefined"
     ? new TextEncoder()
@@ -274,6 +297,9 @@ function encodeCompactPubFrame(payload: unknown) {
         frameBytes = utf8ToBytes(envelope.frame);
         frameLength = frameBytes.byteLength;
     }
+    if (envelope.transient === true) {
+        flags |= PUBSUB_FLAG_TRANSIENT;
+    }
     if (envelope.liveTopics === false) {
         flags |= PUBSUB_FLAG_LIVE_TOPICS_FALSE;
     }
@@ -386,6 +412,9 @@ function parseCompactPubFrame(bytes: Uint8Array, includeRawFrame = false): Parse
     if ((flags & PUBSUB_FLAG_LIVE_TOPICS_FALSE) !== 0) {
         envelope.liveTopics = false;
     }
+    if ((flags & PUBSUB_FLAG_TRANSIENT) !== 0) {
+        envelope.transient = true;
+    }
     if (offset !== bytes.byteLength) {
         throw new InvalidCgpFrameError("Compact pubsub PUB frame has trailing bytes");
     }
@@ -412,6 +441,12 @@ export function encodeCgpPubSubFrame(
         return encodeCgpFrame(kind, payload, wireFormat);
     }
     if (kind === "PUB") {
+        // Consensus, quorum, and future control envelopes carry fields outside
+        // the compact hot-path event schema. Preserve them in a generic binary
+        // frame instead of silently dropping security-critical data.
+        if (!compactPubFrameCanRepresent(payload)) {
+            return encodeCgpFrame(kind, payload, "binary-json");
+        }
         return encodeCompactPubFrame(payload);
     }
 

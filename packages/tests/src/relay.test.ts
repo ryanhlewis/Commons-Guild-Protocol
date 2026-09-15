@@ -2,8 +2,8 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { LocalRelayPubSubAdapter, RelayServer } from "@cgp/relay/src/server"; // Import directly from src to avoid build step in dev
 import { MemoryStore } from "@cgp/relay/src/store";
 import { LevelStore } from "@cgp/relay/src/store_level";
-import { CgpClient } from "@cgp/client/src/client";
-import { GuildEvent, computeEventId, hashObject, sign } from "@cgp/core";
+import { CgpClient } from "@cgp/client";
+import { GuildEvent, computeEventId, hashObject, sign, verifyRelayHead } from "@cgp/core";
 import * as secp from "@noble/secp256k1";
 import fs from "fs/promises";
 import WebSocket from "ws";
@@ -158,6 +158,56 @@ describe("CGP relay basic messaging", () => {
 
         // Wait for propagation (local relay is fast but async)
         await new Promise((res) => setTimeout(res, 200));
+    });
+
+    it("enforces create-only app objects at the relay boundary", async () => {
+        const privateKey = secp.utils.randomPrivateKey();
+        const publicKey = Buffer.from(
+            secp.getPublicKey(privateKey, true),
+        ).toString("hex");
+        const client = new CgpClient({
+            relays: [relayUrl],
+            keyPair: { pub: publicKey, priv: privateKey },
+        });
+        await client.connect();
+        try {
+            const guildId = await client.createGuild("Create-only relay test");
+            await client.upsertAppObject(
+                guildId,
+                "org.example.claims",
+                "claim",
+                "resource-1",
+                { createOnly: true, value: { claimant: "first" } },
+            );
+            await expect(
+                client.upsertAppObject(
+                    guildId,
+                    "org.example.claims",
+                    "claim",
+                    "resource-1",
+                    { createOnly: true, value: { claimant: "second" } },
+                ),
+            ).rejects.toThrow(/already exists/);
+
+            await client.upsertAppObject(
+                guildId,
+                "org.example.settings",
+                "setting",
+                "theme",
+                { value: "dark" },
+            );
+            await expect(
+                client.upsertAppObject(
+                    guildId,
+                    "org.example.settings",
+                    "setting",
+                    "theme",
+                    { value: "light" },
+                ),
+            ).resolves.toBeUndefined();
+        } finally {
+            client.close();
+        }
     });
 
     it("rejects forged live events before dedupe state is poisoned", async () => {
@@ -442,6 +492,109 @@ describe("CGP relay basic messaging", () => {
         } finally {
             bootstrap.close();
             publisher.close();
+            await relayA.close();
+            await relayB.close();
+            pubSub.close();
+        }
+    });
+
+    it("acknowledges a client publish that was replicated before the local copy arrived", async () => {
+        const pubSub = new LocalRelayPubSubAdapter();
+        const storeA = new MemoryStore();
+        const storeB = new MemoryStore();
+        const relayA = new RelayServer(PORT + 180, storeA, [], {
+            instanceId: "relay-proof-race-a",
+            pubSubAdapter: pubSub,
+            enableDefaultPlugins: false
+        });
+        const relayB = new RelayServer(PORT + 181, storeB, [], {
+            instanceId: "relay-proof-race-b",
+            pubSubAdapter: pubSub,
+            enableDefaultPlugins: false
+        });
+        const relayAUrl = `ws://localhost:${PORT + 180}`;
+        const relayBUrl = `ws://localhost:${PORT + 181}`;
+        const ownerPrivKey = secp.utils.randomPrivateKey();
+        const ownerPubKey = Buffer.from(secp.getPublicKey(ownerPrivKey, true)).toString("hex");
+        const bootstrap = new CgpClient({
+            relays: [relayAUrl, relayBUrl],
+            keyPair: { pub: ownerPubKey, priv: ownerPrivKey }
+        });
+
+        const publishTo = async (url: string, payload: Record<string, unknown>) => {
+            const socket = new WebSocket(url);
+            await new Promise<void>((resolve, reject) => {
+                socket.once("open", resolve);
+                socket.once("error", reject);
+            });
+            return await new Promise<any>((resolve, reject) => {
+                const timeout = setTimeout(() => {
+                    socket.close();
+                    reject(new Error(`Timed out waiting for publish acknowledgement from ${url}`));
+                }, 5000);
+                socket.on("message", (raw) => {
+                    const [kind, response] = JSON.parse(raw.toString());
+                    if (response?.clientEventId !== payload.clientEventId) {
+                        return;
+                    }
+                    clearTimeout(timeout);
+                    socket.close();
+                    if (kind === "PUB_ACK") {
+                        resolve(response);
+                    } else {
+                        reject(new Error(response?.message || `Unexpected ${kind}`));
+                    }
+                });
+                socket.send(JSON.stringify(["PUBLISH", payload]));
+            });
+        };
+
+        try {
+            await bootstrap.connect();
+            const guildId = await bootstrap.createGuild("Publish Proof Race Guild");
+            const startedAt = Date.now();
+            while (storeB.getLog(guildId).length < 1 && Date.now() - startedAt < 5000) {
+                await new Promise((resolve) => setTimeout(resolve, 20));
+            }
+            expect(storeB.getLog(guildId)).toHaveLength(1);
+
+            const body = {
+                type: "CHANNEL_CREATE",
+                guildId,
+                channelId: `proof-race-${Date.now()}`,
+                name: "proof-race",
+                kind: "text"
+            };
+            const createdAt = Date.now();
+            const clientEventId = `proof-race-${createdAt}`;
+            const signature = await sign(
+                ownerPrivKey,
+                hashObject({ body, author: ownerPubKey, createdAt })
+            );
+            const payload = {
+                body,
+                author: ownerPubKey,
+                createdAt,
+                signature,
+                clientEventId
+            };
+
+            const primaryAck = await publishTo(relayAUrl, payload);
+            const replicationStartedAt = Date.now();
+            while (
+                storeB.getLastEvent(guildId)?.id !== primaryAck.eventId &&
+                Date.now() - replicationStartedAt < 5000
+            ) {
+                await new Promise((resolve) => setTimeout(resolve, 20));
+            }
+            expect(storeB.getLastEvent(guildId)?.id).toBe(primaryAck.eventId);
+
+            const replicaAck = await publishTo(relayBUrl, payload);
+            expect(replicaAck.eventId).toBe(primaryAck.eventId);
+            expect(replicaAck.seq).toBe(primaryAck.seq);
+            expect(storeB.getLog(guildId)).toHaveLength(2);
+        } finally {
+            bootstrap.close();
             await relayA.close();
             await relayB.close();
             pubSub.close();
@@ -1041,6 +1194,12 @@ describe("CGP relay basic messaging", () => {
         expect(state.guildId).toBe(guildId);
         expect(typeof state.rootHash).toBe("string");
         expect(state.endSeq).toBeGreaterThanOrEqual(5);
+        expect(state.head).toMatchObject({
+            guildId,
+            headSeq: state.endSeq,
+            headHash: state.endHash
+        });
+        expect(verifyRelayHead(state.head)).toBe(true);
         expect(state.state.name).toBe("State Guild");
         expect(state.state.channels.some(([id]: [string, any]) => id === channelId)).toBe(true);
         expect(state.state.messages.some(([id]: [string, any]) => id === messageId)).toBe(true);
@@ -1061,6 +1220,116 @@ describe("CGP relay basic messaging", () => {
 
         ws.close();
         alice.close();
+    });
+
+    it("keeps non-message app objects in canonical DM state", async () => {
+        const ownerPrivKey = secp.utils.randomPrivateKey();
+        const ownerPubKey = Buffer.from(secp.getPublicKey(ownerPrivKey, true)).toString("hex");
+        const alice = new CgpClient({
+            relays: [relayUrl],
+            keyPair: { pub: ownerPubKey, priv: ownerPrivKey }
+        });
+
+        try {
+            await alice.connect();
+            const guildId = await alice.createGuild("DM: account mailbox");
+            const channelId = await alice.createChannel(guildId, "mailbox", "text");
+            const objectId = `device-manifest:${ownerPubKey}`;
+            await alice.publish({
+                type: "APP_OBJECT_UPSERT",
+                guildId,
+                channelId,
+                namespace: "org.hollow.account",
+                objectType: "device-manifest",
+                objectId,
+                value: { accountPublicKey: ownerPubKey, generation: 1 }
+            });
+
+            const state = await alice.getState(guildId, {
+                includeMembers: false,
+                includeMessages: false,
+                includeAppObjects: true
+            });
+
+            expect(state.endSeq).toBe(2);
+            expect(state.head).toMatchObject({
+                guildId,
+                headSeq: 2,
+                headHash: state.endHash
+            });
+            expect(state.state.appObjects).toContainEqual([
+                `org.hollow.account\u0000device-manifest\u0000${objectId}`,
+                expect.objectContaining({
+                    namespace: "org.hollow.account",
+                    objectType: "device-manifest",
+                    objectId,
+                    value: expect.objectContaining({ generation: 1 })
+                })
+            ]);
+        } finally {
+            alice.close();
+        }
+    });
+
+    it("invalidates materialized state when the durable head hash changes at the same sequence", async () => {
+        const store = new MemoryStore();
+        const isolatedRelay = new RelayServer(0, store);
+        const guildId = `guild-cache-head-${Date.now()}`;
+        const author = "cache-head-author";
+        const makeEvent = (seq: number, prevHash: string | null, body: any) => {
+            const event = {
+                id: "",
+                seq,
+                prevHash,
+                createdAt: 1_800_000_000_000 + seq,
+                author,
+                body,
+                signature: `cache-head-signature-${seq}`
+            } as GuildEvent;
+            event.id = computeEventId(event);
+            return event;
+        };
+
+        try {
+            const genesis = makeEvent(0, null, {
+                type: "GUILD_CREATE",
+                guildId,
+                name: "Cache head regression"
+            });
+            const staleHead = makeEvent(1, genesis.id, {
+                type: "APP_OBJECT_UPSERT",
+                guildId,
+                namespace: "org.example.cache",
+                objectType: "branch",
+                objectId: "stale",
+                value: { branch: "stale" }
+            });
+            const canonicalHead = makeEvent(1, genesis.id, {
+                type: "APP_OBJECT_UPSERT",
+                guildId,
+                namespace: "org.example.cache",
+                objectType: "branch",
+                objectId: "canonical",
+                value: { branch: "canonical" }
+            });
+
+            store.appendEvents(guildId, [genesis, staleHead]);
+            const stale = await (isolatedRelay as any).rebuildGuildState(guildId);
+            expect(stale.state.headHash).toBe(staleHead.id);
+            expect([...stale.state.appObjects.values()].map((object: any) => object.objectId)).toEqual(["stale"]);
+
+            // Simulate quorum reconciliation replacing a same-sequence fork in
+            // durable storage while the old materialized view is still cached.
+            (store as any).logs.set(guildId, [genesis, canonicalHead]);
+
+            const canonical = await (isolatedRelay as any).rebuildGuildState(guildId);
+            expect(canonical.state.headHash).toBe(canonicalHead.id);
+            expect([...canonical.state.appObjects.values()].map((object: any) => object.objectId)).toEqual([
+                "canonical"
+            ]);
+        } finally {
+            await isolatedRelay.close();
+        }
     });
 
     it("uses relay checkpoints as compact subscription replay anchors", async () => {

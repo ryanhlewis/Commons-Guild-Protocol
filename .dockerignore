@@ -1,0 +1,14 @@
+*
+!package.json
+!package-lock.json
+!packages/
+!packages/**
+!scripts/
+!scripts/**
+!loadnet/
+!loadnet/**
+
+**/node_modules/
+loadnet/results/
+loadnet/docker-compose*.yml
+loadnet/*.log

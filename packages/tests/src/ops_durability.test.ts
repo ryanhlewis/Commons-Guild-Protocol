@@ -441,6 +441,24 @@ describe("ops durability and failover", () => {
         }
     }, 10000);
 
+    it("can bind its HTTP and WebSocket listener to loopback for tunnel-only origins", async () => {
+        const relay = new RelayServer(0, new LevelStore(path.join(baseDir, `loopback-http-${Date.now()}`)), [], {
+            enableDefaultPlugins: false,
+            instanceId: "loopback-http-relay",
+            listenHost: "127.0.0.1"
+        });
+
+        try {
+            await waitFor(async () => Boolean((relay as any).httpServer.address()));
+            const address = (relay as any).httpServer.address();
+            expect(address).toMatchObject({ address: "127.0.0.1", family: "IPv4" });
+            const health = await fetch(`http://127.0.0.1:${address.port}/healthz`);
+            expect(health.status).toBe(200);
+        } finally {
+            await relay.close().catch(() => undefined);
+        }
+    }, 10000);
+
     it("syncs missing canonical events from another relay in large log ranges", async () => {
         const sourceDb = path.join(baseDir, `sync-source-${Date.now()}`);
         const targetDb = path.join(baseDir, `sync-target-${Date.now()}`);

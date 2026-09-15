@@ -1,0 +1,42 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cgp-relay",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-05-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 0.1
+  },
+  "vars": {
+    "CGP_RELAY_NAME": "Cloudflare CGP Relay",
+    "CGP_RELAY_REQUIRE_SIGNED_READS": "1",
+    "CGP_RELAY_MAX_SNAPSHOT_EVENTS": "5000",
+    "CGP_RELAY_MAX_HISTORY_EVENTS": "500",
+    "CGP_RELAY_MAX_LOG_RANGE_EVENTS": "5000",
+    "CGP_RELAY_MAX_PUBLISH_BATCH_SIZE": "512"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "RELAY",
+        "class_name": "RelayDO"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["RelayDO"]
+    }
+  ]
+  // Optional shared D1 backing store. Durable Object SQLite is the default
+  // because it deploys without any extra Cloudflare resources.
+  // "d1_databases": [
+  //   {
+  //     "binding": "DB",
+  //     "database_name": "cgp-relay-db",
+  //     "database_id": "<database-id-from-wrangler-d1-create>"
+  //   }
+  // ]
+}

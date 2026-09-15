@@ -30,7 +30,9 @@ function argValue(name: string, fallback?: string) {
 }
 
 function hasFlag(name: string) {
-    return process.argv.includes(`--${name}`);
+    const npmConfigName = `npm_config_${name.replace(/-/g, "_")}`;
+    const npmValue = process.env[npmConfigName];
+    return process.argv.includes(`--${name}`) || npmValue === "true" || npmValue === "1";
 }
 
 function safeName(value: string, label: string) {

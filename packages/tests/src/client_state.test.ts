@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { RelayServer } from "@cgp/relay/src/server";
-import { CgpClient } from "@cgp/client/src/client";
+import { CgpClient } from "@cgp/client";
 import * as secp from "@noble/secp256k1";
 
 async function waitFor(predicate: () => boolean, timeoutMs = 5000) {

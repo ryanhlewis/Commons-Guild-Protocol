@@ -172,4 +172,79 @@ describe("core wire helpers", () => {
             }
         });
     });
+
+    it("preserves quorum and sequencer control envelopes in binary-v1 mode", () => {
+        const payload = {
+            id: "control-1",
+            token: "secret",
+            topic: "cgp:sequencer:epoch-1",
+            envelope: {
+                originId: "relay-a",
+                guildId: "guild-alpha",
+                sequencerMessage: {
+                    protocol: "cgp/sequencer/1",
+                    kind: "election-request",
+                    epoch: "epoch-1",
+                    guildId: "guild-alpha",
+                    term: 4
+                },
+                writeVote: {
+                    protocol: "cgp/write-vote/1",
+                    epoch: "epoch-1",
+                    relayPublicKey: "relay-a"
+                }
+            }
+        };
+        const encoded = encodeCgpPubSubFrame("PUB", payload, "binary-v1");
+        const parsed = parseCgpPubSubData(encoded);
+        expect(parsed.kind).toBe("PUB");
+        expect(parsed.payload).toEqual(payload);
+    });
+
+    it("preserves compact binary-v1 transient pubsub envelopes", () => {
+        const event = {
+            id: "transient-id",
+            seq: Number.NaN,
+            prevHash: null,
+            createdAt: 1234,
+            author: "author-key",
+            signature: "signature",
+            transient: true,
+            body: {
+                type: "CALL_EVENT",
+                guildId: "alpha",
+                channelId: "voice",
+                payload: {
+                    kind: "fallback-audio",
+                    messageId: "audio-1",
+                    mediaHash: "abc123",
+                    byteLength: 640
+                }
+            }
+        };
+        const encoded = encodeCgpPubSubFrame(
+            "PUB",
+            {
+                topic: "guild:alpha:channel:voice",
+                envelope: {
+                    originId: "relay-a",
+                    guildId: "alpha",
+                    event,
+                    transient: true,
+                    liveTopics: true
+                }
+            },
+            "binary-v1"
+        );
+        const parsed = parseCgpPubSubData(encoded);
+        expect(parsed.payload).toEqual({
+            topic: "guild:alpha:channel:voice",
+            envelope: {
+                originId: "relay-a",
+                guildId: "alpha",
+                event: { ...event, seq: null },
+                transient: true
+            }
+        });
+    });
 });

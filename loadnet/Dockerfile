@@ -1,4 +1,4 @@
-FROM node:20-bookworm-slim
+FROM node:22-bookworm-slim
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends iproute2 ca-certificates \
@@ -8,10 +8,11 @@ WORKDIR /app
 
 COPY package.json package-lock.json ./
 COPY packages ./packages
-COPY scripts ./scripts
-COPY loadnet ./loadnet
 
 RUN npm ci
 
+COPY scripts ./scripts
+COPY loadnet ./loadnet
+
 ENV NODE_ENV=production
-ENTRYPOINT ["npx", "tsx", "loadnet/node.ts"]
+ENTRYPOINT ["node", "--import", "tsx", "loadnet/node.ts"]

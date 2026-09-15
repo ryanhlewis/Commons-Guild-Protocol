@@ -28,6 +28,104 @@ For very large guilds:
 - keep guild-log replication separate from live fanout topics.
 - use `GET_LOG_RANGE` only for repair/backfill beyond retained envelopes, not for every live event.
 
+## SFU authority operations
+
+Configure relay write quorum and sequencer consensus with the same epoch,
+member keys, and threshold before certifying media nodes. A production guild
+should use at least five relay voters with a 3-of-5 threshold when it needs to
+survive one voter loss while retaining a majority.
+
+The guild owner rotates currently advertised Hollow mediasoup nodes through
+`rotateGuildSfuAuthorities()`. Run the new nodes before publishing the next
+epoch, retain the prior nodes through `overlapUntil`, and remove their route
+private keys only after the overlap ends. Do not shorten the overlap below the
+catalog refresh interval plus expected clock skew.
+
+Monitor failed `SFU_AUTHORITY_SET` publishes as control-plane incidents. A
+2-of-5 partition is intentionally unavailable for rotation; it must never be
+made available by lowering the threshold during the incident.
+
+## Durable Write Quorum
+
+Deployments that accept the same guild writes on multiple relays should enable the
+epoch-bound write quorum. This prevents an isolated relay from silently accepting a
+competing write even when a client bypasses Hollow's configured-relay majority check.
+
+Every relay in an epoch must have:
+
+- a stable `CGP_RELAY_PRIVATE_KEY_HEX` that survives process and host restarts.
+- the exact same `CGP_RELAY_WRITE_QUORUM_CONFIG` membership and epoch.
+- durable storage for the relay log and write-vote fences.
+- connectivity to enough write-quorum members through pubsub.
+
+Example three-relay configuration:
+
+```bash
+CGP_RELAY_WRITE_QUORUM_CONFIG='{"epoch":"prod-2026-07-1","members":["<relay-a-public-key>","<relay-b-public-key>","<relay-c-public-key>"],"requiredVotes":2,"voteTimeoutMs":2000}'
+```
+
+`requiredVotes` is clamped to at least a strict majority. A relay persists at most
+one signed proposal vote per guild head and appends only after collecting the fixed
+number of trusted member signatures. `PUBLISH_BATCH` is disabled while this mode is
+active because an unvoted batch would bypass the fence.
+
+An application event may request a portable durable proof by placing the
+relay's exact `cgp/write-quorum/1` policy in its top-level `certifier` field.
+The relay rejects a mismatched policy or an unavailable quorum and attaches a
+`cgp/write-certificate/1` to the committed event. The certificate binds the
+guild head, complete event body, author signature, epoch, and unique relay
+votes, so an application can verify durability without trusting the HTTP
+frontend that returned it. `SFU_AUTHORITY_SET` continues to require this proof
+implicitly; certified `APP_OBJECT_UPSERT` records such as Hollow's private
+Avera security log opt in explicitly.
+
+The write quorum alone is a split-brain safety fence, not a leader-election
+protocol. Enable the per-guild sequencer coordinator when clients can submit
+competing durable proposals or automatic failover is required:
+
+```bash
+CGP_RELAY_SEQUENCER_CONFIG='{"epoch":"prod-2026-07-1","members":["<relay-a-public-key>","<relay-b-public-key>","<relay-c-public-key>"],"requiredVotes":2,"electionTimeoutMinMs":450,"electionTimeoutMaxMs":900,"heartbeatIntervalMs":100,"requestTimeoutMs":8000}'
+```
+
+The sequencer and write-quorum configurations must have exactly the same epoch,
+ordered member keys, and vote threshold. Terms and votes are persisted in the
+relay store. A signed majority certificate elects one leader per active guild;
+the leader selects one durable request at a time, and the existing write quorum
+still fences the selected append at its current guild head. Followers retain
+unselected requests for failover and discard certified completed slots.
+
+Hollow and other durable clients must send the same signed `PUBLISH` request to
+at least the configured quorum of writer relays. This lets each independent
+relay validate the request and issue its own write vote; relays do not treat a
+single forwarding relay as a quorum.
+
+Sequencer consensus applies only to durable guild-log events. `PUBLISH_TRANSIENT`,
+WebTransport datagrams, WebRTC RTP/RTCP, SFU media, and game packet lanes do not
+wait for this coordinator.
+
+The built-in coordinator assumes authenticated, crash-fault relay members. It
+survives one unavailable member in a 3-member/2-vote deployment, but it is not a
+Byzantine protocol: a modified member that double-votes is outside this trust
+model. Deployments that admit mutually untrusted voting relays need a reviewed
+3f+1/2f+1 BFT consensus engine in front of the same durable append boundary.
+Never weaken or clear persisted terms, votes, or write fences to regain
+availability.
+
+Use mirrored pubsub adapters when write availability must survive one pubsub outage:
+
+```bash
+CGP_RELAY_PUBSUB_URLS='wss://pubsub-a.example,wss://pubsub-b.example'
+CGP_RELAY_PUBSUB_MODE='redundant'
+```
+
+The default multi-URL mode remains sharded. Redundant mode publishes and subscribes
+on every configured hub, deduplicating at the relay event/proposal layer.
+
+Treat a membership change as an explicit epoch migration. Bring up the new stable
+keys and pubsub paths first, then deploy the same new epoch configuration to the
+whole relay set. Never independently edit a member list in place: mismatched epochs
+fail closed and can make the write quorum unavailable.
+
 ## SLO Baseline
 
 The reference dashboard and alert rules live in `ops/`.
@@ -113,6 +211,20 @@ npm run ci:gate
 npm run gate:brutal
 ```
 
+From Hollow's repository, run the browser/process split-brain gate after relay
+membership, storage, or pubsub changes:
+
+```bash
+npm run test:relay-partition
+```
+
+It forms a real asymmetric 2/1 partition, checks Hollow's fixed configured quorum,
+attempts a direct raw-client write against the minority, kills one mirrored pubsub
+hub, and heals the relay. It then races two independent Chromium writers, kills the
+deterministic first sequencer process, requires a replacement leader to commit
+through the surviving quorum, restarts the killed relay on its existing LevelStore,
+and requires exact matching history and head hashes on all three stores.
+
 Run distributed profiles before production rollout:
 
 ```bash
@@ -145,3 +257,8 @@ Worker deployments should preserve the same invariants:
 - avoid full guild scans in hot request paths; use cursor pages and log ranges.
 
 The protocol does not require a specific database vendor. The required property is deterministic ordered reads over guild sequence keys plus durable writes before a relay advertises a signed head.
+
+The maintained Cloudflare target lives in `packages/relay-cloudflare`. It is
+separate from the Node relay so Worker compatibility constraints do not affect
+the normal relay's `ws`/LevelDB/plugin hot path. Use Durable Object SQLite by
+default, or configure D1 when an operator wants a shared SQL backing store.

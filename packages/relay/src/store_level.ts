@@ -18,6 +18,7 @@ import {
     Store,
     StoreStorageEstimate
 } from "./store";
+import type { RelaySequencerPersistentState } from "./sequencer_consensus";
 
 const MIN_SEQ_KEY = "0000000000";
 const MAX_SEQ_KEY = "9999999999";
@@ -28,6 +29,14 @@ function seqKey(seq: number) {
 
 function guildSeqKey(guildId: GuildId, seq: number) {
     return `guild:${guildId}:seq:${seqKey(seq)}`;
+}
+
+function writeVoteFenceKey(key: string) {
+    return `write-vote-fence:${key}`;
+}
+
+function sequencerStateKey(key: string) {
+    return `sequencer-state:${key}`;
 }
 
 function guildChannelSeqKey(guildId: GuildId, channelId: string, seq: number) {
@@ -222,6 +231,39 @@ export class LevelStore implements Store {
 
     async append(guildId: GuildId, event: GuildEvent) {
         await this.appendEvents(guildId, [event]);
+    }
+
+    async getWriteVoteFence(key: string) {
+        try {
+            return await this.db.get(writeVoteFenceKey(key));
+        } catch (error: any) {
+            if (isNotFoundError(error)) {
+                return undefined;
+            }
+            throw error;
+        }
+    }
+
+    async putWriteVoteFence(key: string, proposalId: string) {
+        await this.db.put(writeVoteFenceKey(key), proposalId);
+    }
+
+    async getSequencerState(key: string) {
+        try {
+            const value = await this.db.get(sequencerStateKey(key));
+            return typeof value === "string"
+                ? JSON.parse(value) as RelaySequencerPersistentState
+                : undefined;
+        } catch (error: any) {
+            if (isNotFoundError(error)) {
+                return undefined;
+            }
+            throw error;
+        }
+    }
+
+    async putSequencerState(key: string, state: RelaySequencerPersistentState) {
+        await this.db.put(sequencerStateKey(key), JSON.stringify(state));
     }
 
     async appendEvents(guildId: GuildId, events: GuildEvent[]) {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CgpClient } from "@cgp/client/src/client";
+import { CgpClient } from "@cgp/client";
 import { computeEventId, generatePrivateKey, getPublicKey, hashObject, type GuildEvent } from "@cgp/core";
 import { RelayServer } from "@cgp/relay/src/server";
 import { LevelStore } from "@cgp/relay/src/store_level";

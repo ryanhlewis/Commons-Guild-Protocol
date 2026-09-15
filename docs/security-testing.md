@@ -1,5 +1,13 @@
 # Security and Fuzz Testing
 
+## SFU authority membership
+
+Run `npm run loadnet:sfu-authority` with Docker available. The gate starts five
+actual relay servers and websocket clients, verifies 3-of-5 certificates,
+isolates a 2-node minority from a 3-node majority, heals the partition, kills
+one relay, and rotates again. It also rejects vote/member substitution and
+checks that the old authority epoch expires at the overlap boundary.
+
 CGP security validation currently has six layers:
 
 1. Adversarial protocol tests in `packages/tests/src/security.test.ts` and `packages/tests/src/exploit.test.ts`.
@@ -46,6 +54,8 @@ The adversarial and fuzz tests cover:
 - banned-user publish rejection
 - replayed publish frames
 - concurrent publish sequence races
+- certified per-guild sequencer ordering for competing WebSocket writers
+- sequencer leader process death, majority failover, and persisted-term restart
 - split-brain/history-rewrite simulations
 - canonical event-id recomputation with polluted `id` and `signature` fields
 - randomized hash-chain mutation rejection
@@ -53,6 +63,7 @@ The adversarial and fuzz tests cover:
 - directory Merkle proof tamper rejection
 - LevelDB restart hydration for history, members, and message refs
 - follower-relay backfill after sequencer shutdown
+- asymmetric 2/1 sequencer partitions with minority write rejection
 - follower-relay retained pubsub log replay after restart
 - disk-retained pubsub log replay after pubsub hub restart
 - pubsub publish ACK/retry so relays resend unaccepted log envelopes after hub reconnect

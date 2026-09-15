@@ -1,3 +1,4 @@
 docker-compose.generated.yml
+docker-compose.*.generated.yml
 run-data/
 results/*.json

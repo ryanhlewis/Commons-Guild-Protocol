@@ -4,7 +4,7 @@
 
 **Goals**
 
-- Provide a **tokenless**, **PoW-less** protocol for Discord-style guilds:
+- Provide a **tokenless**, **PoW-less** protocol for guild-based communities:
   - guilds / channels / roles,
   - edits, deletes, ephemeral channels,
   - moderation & bans,
@@ -110,6 +110,43 @@ interface GuildEvent {
   signature: SignatureHex;    // signature over canonical encoding of {body, author, createdAt}
 }
 ```
+
+### SFU authority rotation
+
+Guild owners may publish `SFU_AUTHORITY_SET` to authorize large-room media
+nodes. It contains a monotonically increasing epoch, the previous epoch,
+activation/overlap/expiry timestamps, the active relay write-quorum policy,
+and bounded node membership:
+
+```ts
+interface SfuAuthoritySet {
+  type: "SFU_AUTHORITY_SET";
+  guildId: GuildId;
+  epoch: number;
+  previousEpoch: number | null;
+  notBefore: number;
+  overlapUntil: number;
+  expiresAt: number;
+  certifier: {
+    protocol: "cgp/write-quorum/1";
+    epoch: string;
+    members: PublicKeyHex[];
+    requiredVotes: number;
+  };
+  authorities: Array<{
+    nodeId: string;
+    clusterId: string;
+    role: "authority" | "forward-only";
+    routeAuthorityPublicKey?: PublicKeyHex;
+  }>;
+}
+```
+
+The event is valid only when authored by the guild owner and certified by the
+configured relay write quorum. The relay certificate is transport proof and
+is excluded from the event ID/state root; it signs the exact proposal and
+prior guild head. Clients must not infer trust from a self-declared member
+list without verifying the owner signature and quorum votes.
 
 **Guild invariants (per log):**
 
@@ -561,7 +598,9 @@ type Frame =
   | ["ERROR", ErrorFrame]
   | ["EVENT", GuildEvent]             // server â†’ client: new event
   | ["PUBLISH", PublishFrame]         // client -> server: submit pre-sequenced event
+  | ["PUBLISH_TRANSIENT", PublishFrame & { clientEventId?: string; ackRequested?: boolean }]
   | ["SUB", SubFrame]                 // client â†’ server: subscribe
+  | ["SUB_TRANSIENT", SubFrame]       // client -> server: realtime-only subscription
   | ["UNSUB", UnsubFrame]             // client â†’ server: unsubscribe
   | ["SNAPSHOT", SnapshotFrame]       // server -> client: initial events/history page
   | ["GET_STATE", StateRequestFrame]  // client -> server: canonical state read
@@ -611,8 +650,27 @@ interface HelloOkFrame {
   supportedWireFormats?: ("json" | "binary-json" | "binary-v1" | "binary-v2")[];
   features?: string[]; // e.g. ["ephemeral", "checkpoints", "directory-cache"]
   plugins?: RelayPluginDescriptor[];
+  realtimeTransports?: {
+    kind: "webtransport-datagram";
+    url: string;
+    certificateHash?: string;
+    maxDatagramBytes: number;
+  }[];
 }
 ```
+
+An HTTPS relay MAY advertise WebTransport as an optional realtime lane. Durable publish, snapshots,
+history, search, and state remain on the baseline WebSocket connection. `SUB_TRANSIENT` uses the same
+signed read fields and visibility checks as `SUB`, but MUST NOT return history or a snapshot.
+`PUBLISH_TRANSIENT` events MUST carry an application deadline and MUST NOT be persisted.
+
+MTU-sized frames use unreliable QUIC datagrams. Frames larger than the advertised datagram payload
+budget use one unidirectional QUIC stream per frame; implementations MUST bound frame bytes and reset
+or discard streams that miss the application deadline. Control datagrams such as `HELLO` and
+`SUB_TRANSIENT` are idempotent and SHOULD be retransmitted until acknowledged. Relays MUST apply the
+same signature, membership, channel visibility, expiry, and backpressure policy on both transports.
+`certificateHash` is intended for short-lived local/self-signed certificates; normally trusted
+production certificates SHOULD rely on the platform trust store and omit it.
 
 If protocol version is unsupported, server sends:
 
