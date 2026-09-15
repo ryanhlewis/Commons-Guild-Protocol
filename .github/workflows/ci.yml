@@ -25,6 +25,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - run: npm run build --workspace=@cgp/core && npm run build --workspace=@cgp/client
       - run: npm audit --omit=dev --audit-level=high
       - run: npm run security:scan
       - run: npm test
@@ -41,6 +42,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - run: npm run build --workspace=@cgp/core && npm run build --workspace=@cgp/client
       - run: npm run loadnet:run -- --profile smoke
       - run: npm run loadnet:rtp-audio
       - run: npm run loadnet:websocket-call-media
