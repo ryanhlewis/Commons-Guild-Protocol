@@ -9,7 +9,9 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 COPY packages ./packages
 
-RUN npm ci
+RUN npm ci \
+    && npm run build --workspace=@cgp/core \
+    && npm run build --workspace=@cgp/client
 
 COPY scripts ./scripts
 COPY loadnet ./loadnet

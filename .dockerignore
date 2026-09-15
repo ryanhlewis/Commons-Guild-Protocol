@@ -9,6 +9,9 @@
 !loadnet/**
 
 **/node_modules/
+**/dist/
+**/.wrangler/
+**/.svelte-kit/
 loadnet/results/
 loadnet/docker-compose*.yml
 loadnet/*.log
