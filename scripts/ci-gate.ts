@@ -61,12 +61,11 @@ const wireFormat = wireFormatArg();
 fs.mkdirSync(reportDir, { recursive: true });
 
 for (const args of [
+    ["run", "build:protocol"],
     ["run", "security:scan"],
     ["run", "conformance:relay"],
     ["run", "test:fuzz"],
     ["test", "--", "--run"],
-    ["run", "build", "--workspace=@cgp/core"],
-    ["run", "build", "--workspace=@cgp/client"],
     ["run", "build", "--workspace=@cgp/relay"],
     ["run", "build", "--workspace=@cgp/directory"]
 ]) {

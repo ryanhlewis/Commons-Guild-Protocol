@@ -1,6 +1,8 @@
 import { verifyObject } from "./crypto.js";
 import type {
     DeviceAuthorization,
+    DeviceAuthorityBinding,
+    DeviceAuthorityReplacement,
     DeviceCapability,
     DeviceCertificate,
     DeviceRevocationState,
@@ -93,6 +95,7 @@ function normalizeAuthorization(value: DeviceAuthorization): DeviceAuthorization
             "Authority activation time",
             1,
         ),
+        ...(value.binding?.replacements !== undefined ? { replacements: normalizeAuthorityReplacements(value.binding.replacements) } : {}),
         signature: normalizedHex(
             value.binding?.signature,
             SIGNATURE_PATTERN,
@@ -212,6 +215,45 @@ function normalizeAuthorization(value: DeviceAuthorization): DeviceAuthorization
     };
 }
 
+function normalizeAuthorityReplacements(value: DeviceAuthorityReplacement[]) {
+    if (!Array.isArray(value) || value.length < 1 || value.length > 32) throw new Error("Authority replacement chain is invalid");
+    return value.map(entry => ({ protocol: entry.protocol,
+        accountPublicKey: normalizedHex(entry.accountPublicKey, PUBLIC_KEY_PATTERN, "Replacement account"),
+        previousAuthorityPublicKey: normalizedHex(entry.previousAuthorityPublicKey, PUBLIC_KEY_PATTERN, "Previous authority"),
+        authorityPublicKey: normalizedHex(entry.authorityPublicKey, PUBLIC_KEY_PATTERN, "Replacement authority"),
+        previousGeneration: normalizedInteger(entry.previousGeneration, "Previous generation", 1),
+        generation: normalizedInteger(entry.generation, "Replacement generation", 2),
+        previousRevocationEpoch: normalizedInteger(entry.previousRevocationEpoch, "Previous revocation epoch"),
+        revocationEpoch: normalizedInteger(entry.revocationEpoch, "Replacement revocation epoch", 1),
+        activatedAt: normalizedInteger(entry.activatedAt, "Replacement time", 1),
+        signature: normalizedHex(entry.signature, SIGNATURE_PATTERN, "Previous authority signature") }));
+}
+
+/** The caller must verify the complete signed binding before advancing a pin. */
+export function deviceAuthorityContinues(binding: DeviceAuthorityBinding, pin?: Pick<DeviceAuthorityPin, "authorityPublicKey" | "generation" | "revocationEpoch">) {
+    if (!pin) return true;
+    if (binding.generation === pin.generation) return binding.authorityPublicKey === pin.authorityPublicKey;
+    if (binding.generation < pin.generation) return false;
+    const link = binding.replacements?.find(entry => entry.previousGeneration === pin.generation);
+    return Boolean(link && link.previousAuthorityPublicKey === pin.authorityPublicKey && link.previousRevocationEpoch >= pin.revocationEpoch);
+}
+
+function verifyReplacementChain(binding: DeviceAuthorityBinding) {
+    const chain = binding.replacements ?? [];
+    if (chain.length !== binding.generation - 1 || chain.length > 32) return false;
+    let previous: DeviceAuthorityReplacement | undefined;
+    for (const entry of chain) {
+        if (entry.protocol !== "cgp/device-authority-replacement/1" || entry.accountPublicKey !== binding.accountPublicKey ||
+            entry.previousGeneration !== (previous?.generation ?? 1) || entry.generation !== entry.previousGeneration + 1 ||
+            entry.authorityPublicKey === entry.previousAuthorityPublicKey || entry.revocationEpoch !== entry.previousRevocationEpoch + 1 ||
+            (previous && (entry.previousAuthorityPublicKey !== previous.authorityPublicKey || entry.previousRevocationEpoch < previous.revocationEpoch || entry.activatedAt < previous.activatedAt))) return false;
+        const { signature, ...unsigned } = entry;
+        if (!verifyObject(entry.previousAuthorityPublicKey, unsigned, signature)) return false;
+        previous = entry;
+    }
+    return !previous || (previous.authorityPublicKey === binding.authorityPublicKey && previous.activatedAt === binding.activatedAt);
+}
+
 export function verifyDeviceAuthorizedObject(
     payload: unknown,
     signatureValue: string,
@@ -257,7 +299,7 @@ export function verifyDeviceAuthorizedObject(
         ) {
             throw new Error("Device authorization is expired or not yet valid");
         }
-        if (revocation.epoch < (options.minimumRevocationEpoch ?? 0)) {
+        if (revocation.epoch < Math.max(options.minimumRevocationEpoch ?? 0, binding.replacements?.at(-1)?.revocationEpoch ?? 0)) {
             throw new Error("Device authorization uses a stale revocation epoch");
         }
         if (revocation.revokedSerials.includes(certificate.serial)) {
@@ -278,7 +320,7 @@ export function verifyDeviceAuthorizedObject(
         const { signature: revocationSignature, ...unsignedRevocation } =
             revocation;
         if (
-            !verifyObject(
+            !verifyReplacementChain(binding) || !verifyObject(
                 binding.accountPublicKey,
                 unsignedBinding,
                 bindingSignature,
@@ -328,6 +370,17 @@ export class DeviceAuthorityRegistry {
         return this.pins.get(accountPublicKey.toLowerCase());
     }
 
+    /** Restore only a pin previously verified and committed to the operator's local store. */
+    restoreTrustedPin(pin: DeviceAuthorityPin) {
+        if (!PUBLIC_KEY_PATTERN.test(pin?.accountPublicKey) || !PUBLIC_KEY_PATTERN.test(pin.authorityPublicKey) ||
+            !Number.isSafeInteger(pin.generation) || pin.generation < 1 || !Number.isSafeInteger(pin.revocationEpoch) || pin.revocationEpoch < 0 ||
+            !Number.isSafeInteger(pin.activatedAt) || pin.activatedAt < 1) throw new Error('Stored device authority pin is invalid');
+        const current = this.pins.get(pin.accountPublicKey);
+        if (current && (current.generation > pin.generation || current.revocationEpoch > pin.revocationEpoch)) return;
+        if (current && current.generation === pin.generation && current.authorityPublicKey !== pin.authorityPublicKey) throw new Error('Stored device authority pin conflicts with memory');
+        this.remember({...pin,activatedAt:Math.min(current?.activatedAt ?? pin.activatedAt,pin.activatedAt)});
+    }
+
     verify(
         payload: unknown,
         signature: string,
@@ -360,10 +413,7 @@ export class DeviceAuthorityRegistry {
                 : { ok: false, error: "Account signature verification failed" };
         }
         if (
-            current &&
-            (authorization?.binding?.authorityPublicKey?.toLowerCase() !==
-                current.authorityPublicKey ||
-                authorization?.binding?.generation !== current.generation)
+            current && !deviceAuthorityContinues(authorization.binding, current)
         ) {
             return {
                 ok: false,
@@ -388,7 +438,7 @@ export class DeviceAuthorityRegistry {
             accountPublicKey: account,
             authorityPublicKey: verified.authorityPublicKey,
             generation: authorization.binding.generation,
-            activatedAt: authorization.binding.activatedAt,
+            activatedAt: current?.activatedAt ?? authorization.binding.activatedAt,
             revocationEpoch: verified.revocationEpoch ?? 0,
             observedAt: now,
         });

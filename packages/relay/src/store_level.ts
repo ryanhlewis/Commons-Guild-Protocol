@@ -1,7 +1,7 @@
 ﻿import { Level } from "level";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { GuildEvent, GuildId, SerializableMember, SerializableMessageRef } from "@cgp/core";
+import { GuildEvent, GuildId, SerializableMember, SerializableMessageRef, type DeviceAuthorityPin } from "@cgp/core";
 import {
     eventChannelIds,
     HistoryQuery,
@@ -227,6 +227,15 @@ export class LevelStore implements Store {
     constructor(dbPath: string) {
         this.dbPath = path.resolve(dbPath);
         this.db = new Level(dbPath);
+    }
+
+    async getDeviceAuthorityPin(account: string): Promise<DeviceAuthorityPin | undefined> {
+        try { const value = await this.db.get(`device-authority:${account}`); return value ? JSON.parse(value) : undefined; }
+        catch (error) { if (isNotFoundError(error)) return undefined; throw error; }
+    }
+
+    async putDeviceAuthorityPin(account: string, pin: DeviceAuthorityPin) {
+        await this.db.put(`device-authority:${account}`,JSON.stringify(pin),{sync:true});
     }
 
     async append(guildId: GuildId, event: GuildEvent) {

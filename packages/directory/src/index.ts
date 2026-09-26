@@ -1,7 +1,8 @@
 import express from "express";
 import { MerkleTree } from "merkletreejs";
 import { sha256 } from "@noble/hashes/sha256";
-import { GuildId, PublicKeyHex, hashObject, verify, sign, generatePrivateKey, getPublicKey, directoryRegistrationPayload } from "@cgp/core";
+import { GuildId, PublicKeyHex, hashObject, verify, sign, generatePrivateKey, getPublicKey, directoryRegistrationPayload,
+    DeviceAuthorityRegistry, deviceAuthorityContinues, verifyDeviceAuthorizedObject, type DeviceAuthorization } from "@cgp/core";
 import { Level } from "level";
 
 export interface DirectoryValue {
@@ -12,6 +13,7 @@ export interface DirectoryValue {
     registeredAt?: number;
     registrationSignature?: string;
     registrationVersion?: number;
+    deviceAuthorization?: DeviceAuthorization;
 }
 
 export interface DirectorySnapshot {
@@ -42,6 +44,7 @@ export class DirectoryService {
     private ready: Promise<void>;
     private mutations: Promise<void> = Promise.resolve();
     private entries = new Map<string, DirectoryValue>();
+    private authorities = new DeviceAuthorityRegistry();
     private treeSize = 0;
     private operatorPrivateKey: Uint8Array;
     public readonly operatorPubkey: PublicKeyHex;
@@ -54,7 +57,7 @@ export class DirectoryService {
         this.ready = this.rebuildTree();
     }
 
-    async register(handle: string, guildId: GuildId, guildPubkey: PublicKeyHex, signature: string, timestamp: number, relays?: string[]) {
+    async register(handle: string, guildId: GuildId, guildPubkey: PublicKeyHex, signature: string, timestamp: number, relays?: string[], deviceAuthorization?: DeviceAuthorization) {
         await this.ready;
         if (typeof handle !== 'string' || !/^[a-z0-9][a-z0-9/_-]{0,63}$/.test(handle) ||
             typeof guildId !== 'string' || !guildId || guildId.length > 192 ||
@@ -67,8 +70,8 @@ export class DirectoryService {
             })))) throw new Error('Invalid directory registration fields');
         guildPubkey = guildPubkey.toLowerCase();
         const routes = [...(relays ?? [])];
-        const msgHash = hashObject(directoryRegistrationPayload(handle, guildId, guildPubkey, timestamp, routes));
-        if (!verify(guildPubkey, msgHash, signature)) {
+        const payload = directoryRegistrationPayload(handle, guildId, guildPubkey, timestamp, routes);
+        if (!deviceAuthorization && !verify(guildPubkey, hashObject(payload), signature)) {
             throw new Error("Invalid signature");
         }
 
@@ -78,8 +81,16 @@ export class DirectoryService {
             throw new Error("Timestamp out of bounds");
         }
 
-        const value: DirectoryValue = { handle, guildId, guildPubkey, relays: routes, registeredAt: timestamp, registrationSignature: signature, registrationVersion: 2 };
+        const value: DirectoryValue = { handle, guildId, guildPubkey, relays: routes, registeredAt: timestamp, registrationSignature: signature,
+            registrationVersion: deviceAuthorization ? 3 : 2, ...(deviceAuthorization ? { deviceAuthorization } : {}) };
         const operation = this.mutations.then(async () => {
+            const pin = this.authorities.get(guildPubkey);
+            if (deviceAuthorization) {
+                if (!deviceAuthorityContinues(deviceAuthorization.binding, pin)) throw new Error('Directory authorization conflicts with the pinned authority');
+                const checked = verifyDeviceAuthorizedObject(payload, signature, deviceAuthorization, { accountPublicKey: guildPubkey,
+                    requiredCapability: 'publish', minimumRevocationEpoch: pin?.revocationEpoch, now });
+                if (!checked.ok) throw new Error(checked.error || 'Directory device authorization is invalid');
+            } else if (pin) throw new Error('Direct account registration is disabled after device authority activation');
             const previous = this.entries.get(handle);
             if (previous) {
                 if (previous.guildPubkey.toLowerCase() !== guildPubkey) throw new Error('Handle is owned by another key');
@@ -91,6 +102,7 @@ export class DirectoryService {
             // Build before persistence: a failed write leaves the published snapshot intact.
             const tree = this.treeFor(entries);
             await this.db.put(handle, JSON.stringify(value));
+            if (deviceAuthorization) this.authorities.verify(payload, signature, guildPubkey, deviceAuthorization, 'publish', now);
             // No await between publishing entries and tree; readers see one snapshot.
             this.entries = entries;
             this.tree = tree;
@@ -153,6 +165,13 @@ export class DirectoryService {
         }
 
         this.entries = entries;
+        for (const entry of [...entries.values()].filter(entry => entry.registrationVersion === 3 && entry.deviceAuthorization)
+            .sort((a, b) => a.deviceAuthorization!.binding.generation - b.deviceAuthorization!.binding.generation ||
+                a.deviceAuthorization!.revocation.epoch - b.deviceAuthorization!.revocation.epoch || Number(a.registeredAt) - Number(b.registeredAt))) {
+            const checked = this.authorities.verify(directoryRegistrationPayload(entry.handle, entry.guildId, entry.guildPubkey, entry.registeredAt!, entry.relays),
+                entry.registrationSignature!, entry.guildPubkey, entry.deviceAuthorization, 'publish', entry.registeredAt!);
+            if (!checked.ok) throw new Error('Stored directory device authorization failed verification');
+        }
         this.tree = this.treeFor(entries);
         this.treeSize = entries.size;
     }
@@ -182,6 +201,11 @@ export function verifyDirectoryLookupProof(
     if (options.expectedHandle !== undefined && lookup.entry.handle !== options.expectedHandle) {
         return false;
     }
+    const registration = directoryRegistrationPayload(lookup.entry.handle, lookup.entry.guildId, lookup.entry.guildPubkey, lookup.entry.registeredAt!, lookup.entry.relays);
+    if (lookup.entry.registrationVersion === 3) {
+        if (!lookup.entry.deviceAuthorization || !verifyDeviceAuthorizedObject(registration, lookup.entry.registrationSignature!, lookup.entry.deviceAuthorization,
+            { accountPublicKey: lookup.entry.guildPubkey, requiredCapability: 'publish', now: lookup.entry.registeredAt! }).ok) return false;
+    } else if (lookup.entry.registrationVersion === 2 && !verify(lookup.entry.guildPubkey, hashObject(registration), lookup.entry.registrationSignature!)) return false;
     if (!options.trustedOperatorPubkeys || options.trustedOperatorPubkeys.length === 0) {
         return false;
     }
@@ -250,12 +274,12 @@ if (isMainModule) {
     app.use(express.json());
 
     app.post("/register", async (req, res) => {
-        const { handle, guildId, guildPubkey, signature, timestamp, relays } = req.body;
+        const { handle, guildId, guildPubkey, signature, timestamp, relays, deviceAuthorization } = req.body;
         if (!handle || !guildId || !guildPubkey || !signature || !timestamp) {
             return res.status(400).json({ error: "Missing fields" });
         }
         try {
-            await service.register(handle, guildId, guildPubkey, signature, timestamp, relays);
+            await service.register(handle, guildId, guildPubkey, signature, timestamp, relays, deviceAuthorization);
             res.json({ success: true });
         } catch (e: any) {
             res.status(400).json({ error: e.message });

@@ -13,6 +13,20 @@ export interface DeviceAuthorityBinding {
     authorityPublicKey: PublicKeyHex;
     generation: number;
     activatedAt: number;
+    replacements?: DeviceAuthorityReplacement[];
+    signature: SignatureHex;
+}
+
+export interface DeviceAuthorityReplacement {
+    protocol: "cgp/device-authority-replacement/1";
+    accountPublicKey: PublicKeyHex;
+    previousAuthorityPublicKey: PublicKeyHex;
+    authorityPublicKey: PublicKeyHex;
+    previousGeneration: number;
+    generation: number;
+    previousRevocationEpoch: number;
+    revocationEpoch: number;
+    activatedAt: number;
     signature: SignatureHex;
 }
 

@@ -1393,6 +1393,7 @@ export class RelayServer {
   private hostedGuilds = new Set<GuildId>();
   private stateCache = new Map<GuildId, GuildState>();
   private deviceAuthorities = new DeviceAuthorityRegistry();
+  private deviceAuthorityMutations = new Map<string, Promise<unknown>>();
   private deviceAuthorityHydrations = new Map<GuildId, Promise<void>>();
   private checkpointCache = new Map<GuildId, GuildEvent | undefined>();
   private observedRelayHeads = new Map<GuildId, Map<string, RelayHead>>();
@@ -3398,10 +3399,10 @@ export class RelayServer {
       return existing;
     }
     const hydration = Promise.resolve(this.store.getLog(guildId))
-      .then((events) => {
+      .then(async (events) => {
         for (const event of [...events].sort((left, right) => left.seq - right.seq)) {
           if (!event.deviceAuthorization) continue;
-          this.deviceAuthorities.verify(
+          await this.verifyAccountAuthorization(
             {
               body: event.body,
               author: event.author,
@@ -3411,6 +3412,7 @@ export class RelayServer {
             event.author,
             event.deviceAuthorization,
             "publish",
+            event.createdAt,
           );
         }
       })
@@ -3422,7 +3424,27 @@ export class RelayServer {
     return hydration;
   }
 
-  private verifyReadRequest(kind: string, payload: unknown) {
+  private async verifyAccountAuthorization(...args: Parameters<DeviceAuthorityRegistry['verify']>) {
+    const account = typeof args[2] === 'string' ? args[2].toLowerCase() : '';
+    const previous = this.deviceAuthorityMutations.get(account) ?? Promise.resolve();
+    const operation = previous.catch(() => undefined).then(async () => {
+      const persisted = await this.store.getDeviceAuthorityPin?.(account);
+      if (persisted) this.deviceAuthorities.restoreTrustedPin(persisted);
+      const verified = this.deviceAuthorities.verify(...args);
+      const pin = this.deviceAuthorities.get(account);
+      if (verified.ok && pin && (!persisted || pin.generation > persisted.generation || pin.revocationEpoch > persisted.revocationEpoch)) {
+        // Commit the fence before acknowledging either a read or a publication.
+        // Another guild and a restarted relay must never reintroduce its predecessor.
+        await this.store.putDeviceAuthorityPin?.(account,pin);
+      }
+      return verified;
+    });
+    this.deviceAuthorityMutations.set(account,operation);
+    try { return await operation; }
+    finally { if (this.deviceAuthorityMutations.get(account) === operation) this.deviceAuthorityMutations.delete(account); }
+  }
+
+  private async verifyReadRequest(kind: string, payload: unknown) {
     const p = payload as SignedReadRequest;
     const author =
       typeof p?.author === "string" && p.author.trim() ? p.author : undefined;
@@ -3448,7 +3470,7 @@ export class RelayServer {
     }
 
     const unsignedPayload = stripReadSignature(payload);
-    const verified = this.deviceAuthorities.verify(
+    const verified = await this.verifyAccountAuthorization(
       { kind, payload: unsignedPayload },
       signature,
       author,
@@ -4366,7 +4388,7 @@ export class RelayServer {
           continue;
         }
 
-        const verifiedAuthorization = this.deviceAuthorities.verify(
+        const verifiedAuthorization = await this.verifyAccountAuthorization(
           {
             body: event.body,
             author: event.author,
@@ -5045,7 +5067,7 @@ export class RelayServer {
       if (guildId) {
         await this.hydrateDeviceAuthorities(guildId);
       }
-      return this.verifyReadRequest(kind, payload);
+      return await this.verifyReadRequest(kind, payload);
     } catch (e: any) {
       this.sendRequestError(
         socket,
@@ -5104,7 +5126,7 @@ export class RelayServer {
     let verifiedAuthor: string | undefined;
     try {
       await this.hydrateDeviceAuthorities(guildId);
-      verifiedAuthor = this.verifyReadRequest("GET_HEAD", payload);
+      verifiedAuthor = await this.verifyReadRequest("GET_HEAD", payload);
     } catch (e: any) {
       this.sendRequestError(
         socket,
@@ -5181,7 +5203,7 @@ export class RelayServer {
     let verifiedAuthor: string | undefined;
     try {
       await this.hydrateDeviceAuthorities(guildId);
-      verifiedAuthor = this.verifyReadRequest("GET_HEADS", payload);
+      verifiedAuthor = await this.verifyReadRequest("GET_HEADS", payload);
     } catch (e: any) {
       this.sendRequestError(
         socket,
@@ -6458,7 +6480,7 @@ export class RelayServer {
       }
 
       await this.hydrateDeviceAuthorities(targetGuildId);
-      const verifiedAuthorization = this.deviceAuthorities.verify(
+      const verifiedAuthorization = await this.verifyAccountAuthorization(
         { body, author: item.author, createdAt: item.createdAt },
         item.signature,
         item.author,
@@ -6595,13 +6617,13 @@ export class RelayServer {
 
             if (
               !item.signatureVerified &&
-              !this.deviceAuthorities.verify(
+              !(await this.verifyAccountAuthorization(
                 { body, author, createdAt },
                 signature,
                 author,
                 deviceAuthorization,
                 "publish",
-              ).ok
+              )).ok
             ) {
               console.error(`Invalid signature for event ${fullEvent.id}`);
               sendError(
@@ -6767,7 +6789,7 @@ export class RelayServer {
       return undefined;
     }
     await this.hydrateDeviceAuthorities(targetGuildId);
-    const verifiedAuthorization = this.deviceAuthorities.verify(
+    const verifiedAuthorization = await this.verifyAccountAuthorization(
       { body, author, createdAt },
       signature,
       author,
@@ -6882,7 +6904,7 @@ export class RelayServer {
       }
     }
     await this.hydrateDeviceAuthorities(guildId);
-    const verifiedAuthorization = this.deviceAuthorities.verify(
+    const verifiedAuthorization = await this.verifyAccountAuthorization(
       {
         body,
         author: proposal.author,
@@ -7070,7 +7092,7 @@ export class RelayServer {
 
     await this.hydrateDeviceAuthorities(targetGuildId);
     const unsignedForSig = { body, author, createdAt };
-    const verifiedAuthorization = this.deviceAuthorities.verify(
+    const verifiedAuthorization = await this.verifyAccountAuthorization(
       unsignedForSig,
       signature,
       author,

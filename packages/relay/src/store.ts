@@ -1,4 +1,4 @@
-import { ChannelId, GuildEvent, GuildId, SerializableMember, SerializableMessageRef, UserId } from "@cgp/core";
+import { ChannelId, GuildEvent, GuildId, SerializableMember, SerializableMessageRef, UserId, type DeviceAuthorityPin } from "@cgp/core";
 import type { RelaySequencerPersistentState } from "./sequencer_consensus";
 
 export interface StoreStorageEstimate {
@@ -270,6 +270,8 @@ export function selectReplaySnapshotEvents(log: GuildEvent[], query: ReplaySnaps
 }
 
 export interface Store {
+    getDeviceAuthorityPin?(account: string): Promise<DeviceAuthorityPin | undefined> | DeviceAuthorityPin | undefined;
+    putDeviceAuthorityPin?(account: string, pin: DeviceAuthorityPin): Promise<void> | void;
     getLog(guildId: GuildId): Promise<GuildEvent[]> | GuildEvent[];
     iterateLog?(guildId: GuildId): AsyncIterable<GuildEvent> | Iterable<GuildEvent>;
     getEventRange?(query: EventRangeQuery): Promise<GuildEvent[]> | GuildEvent[];
@@ -297,6 +299,9 @@ export interface Store {
 }
 
 export class MemoryStore implements Store {
+    private deviceAuthorityPins = new Map<string, DeviceAuthorityPin>();
+    getDeviceAuthorityPin(account: string) { const pin = this.deviceAuthorityPins.get(account); return pin ? {...pin} : undefined; }
+    putDeviceAuthorityPin(account: string, pin: DeviceAuthorityPin) { this.deviceAuthorityPins.set(account,{...pin}); }
     private logs = new Map<GuildId, GuildEvent[]>();
     private channelLogs = new Map<GuildId, Map<ChannelId, GuildEvent[]>>();
     private members = new Map<GuildId, Map<UserId, SerializableMember>>();

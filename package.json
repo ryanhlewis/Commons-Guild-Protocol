@@ -4,8 +4,11 @@
   "description": "Commons Guild Protocol monorepo",
   "private": true,
   "scripts": {
-    "test": "vitest run",
-    "test:fuzz": "vitest run packages/tests/src/fuzz.test.ts",
+    "build:protocol": "npm run build --workspace=@cgp/core && npm run build --workspace=@cgp/client",
+    "pretest": "npm run build:protocol",
+    "test": "vitest run --config packages/tests/vitest.config.ts",
+    "pretest:fuzz": "npm run build:protocol",
+    "test:fuzz": "vitest run --config packages/tests/vitest.config.ts packages/tests/src/fuzz.test.ts",
     "security:scan": "tsx scripts/security-scan.ts",
     "conformance:relay": "tsx scripts/conformance.ts",
     "ci:gate": "tsx scripts/ci-gate.ts",

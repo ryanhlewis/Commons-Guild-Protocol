@@ -148,7 +148,10 @@ dist
 /loadnet/results/
 /.github-app/
 /relay-shards
+/relay-ipfs-helia/
+/test-media-upload-*/
 
 # Local frontend/Worker development state
 .wrangler/
 .svelte-kit/
+/output/
