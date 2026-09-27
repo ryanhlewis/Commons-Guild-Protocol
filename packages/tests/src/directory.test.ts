@@ -4,6 +4,8 @@ import { hashObject, generatePrivateKey, getPublicKey, sign, directoryRegistrati
 import { MerkleTree } from "merkletreejs";
 import { sha256 } from "@noble/hashes/sha256";
 import fs from "fs";
+import os from "os";
+import path from "path";
 
 const DB_PATH = "./test-directory-db";
 
@@ -137,6 +139,54 @@ describe("Directory Service", () => {
             await secondService.close();
             await new Promise(resolve => setTimeout(resolve, 100));
             if (fs.existsSync(secondDbPath)) fs.rmSync(secondDbPath, { recursive: true, force: true });
+        }
+    });
+
+    it("keeps directory discovery available when a minority is stale and defaults to a strict majority", async () => {
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cgp-directory-degraded-'));
+        const services = [0, 1, 2].map((index) => new DirectoryService(path.join(root, `db-${index}`)));
+        try {
+            const handle = "degraded";
+            const guildId = hashObject({ name: "canonical-directory-entry" });
+            const divergentGuildId = hashObject({ name: "stale-directory-entry" });
+            const guildKey = generatePrivateKey();
+            const guildPubkey = getPublicKey(guildKey);
+            const timestamp = Date.now();
+            const canonicalSignature = await sign(guildKey, hashObject(directoryRegistrationPayload(handle, guildId, guildPubkey, timestamp)));
+            const divergentSignature = await sign(guildKey, hashObject(directoryRegistrationPayload(handle, divergentGuildId, guildPubkey, timestamp)));
+
+            await services[0].register(handle, guildId, guildPubkey, canonicalSignature, timestamp);
+            await services[1].register(handle, guildId, guildPubkey, canonicalSignature, timestamp);
+            await services[2].register(handle, divergentGuildId, guildPubkey, divergentSignature, timestamp);
+
+            const lookups = await Promise.all(services.map((service) => service.getLookupProof(handle)));
+            const trustedOperatorPubkeys = services.map((service) => service.operatorPubkey);
+            expect(verifyDirectoryLookupQuorum(lookups.filter(Boolean) as any[], {
+                expectedHandle: handle,
+                trustedOperatorPubkeys
+            })).toBe(true);
+            expect(verifyDirectoryLookupQuorum(lookups.slice(0, 1).filter(Boolean) as any[], {
+                expectedHandle: handle,
+                trustedOperatorPubkeys: trustedOperatorPubkeys.slice(0, 2)
+            })).toBe(false);
+            expect(verifyDirectoryLookupQuorum(lookups.slice(0, 1).filter(Boolean) as any[], {
+                expectedHandle: handle,
+                trustedOperatorPubkeys: trustedOperatorPubkeys.slice(0, 1)
+            })).toBe(true);
+
+            const equivocalGuildId = hashObject({ name: "equivocal-directory-entry" });
+            const equivocalTimestamp = timestamp + 1;
+            const equivocalSignature = await sign(guildKey, hashObject(directoryRegistrationPayload(handle, equivocalGuildId, guildPubkey, equivocalTimestamp)));
+            await services[0].register(handle, equivocalGuildId, guildPubkey, equivocalSignature, equivocalTimestamp);
+            const conflictingProof = await services[0].getLookupProof(handle);
+            expect(verifyDirectoryLookupQuorum([...lookups.filter(Boolean), conflictingProof!] as any[], {
+                expectedHandle: handle,
+                trustedOperatorPubkeys
+            })).toBe(false);
+        } finally {
+            await Promise.all(services.map((service) => service.close()));
+            await new Promise(resolve => setTimeout(resolve, 100));
+            fs.rmSync(root, { recursive: true, force: true });
         }
     });
 });

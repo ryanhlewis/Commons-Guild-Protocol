@@ -238,24 +238,34 @@ export function verifyDirectoryLookupQuorum(
     if (!Array.isArray(lookups) || lookups.length === 0) {
         return false;
     }
-    const minOperatorProofs = Math.max(1, Math.floor(options.minOperatorProofs ?? Math.ceil(options.trustedOperatorPubkeys.length / 2)));
-    const accepted = new Map<string, DirectoryLookupProof>();
-    let canonicalEntryHash: string | undefined;
+    const trustedOperatorCount = new Set(options.trustedOperatorPubkeys).size;
+    const minOperatorProofs = Math.max(1, Math.floor(options.minOperatorProofs ?? Math.floor(trustedOperatorCount / 2) + 1));
+    const entriesByOperator = new Map<string, Set<string>>();
 
     for (const lookup of lookups) {
         if (!verifyDirectoryLookupProof(lookup, options)) {
             continue;
         }
         const entryHash = hashObject(lookup.entry);
-        if (canonicalEntryHash === undefined) {
-            canonicalEntryHash = entryHash;
-        } else if (canonicalEntryHash !== entryHash) {
-            return false;
-        }
-        accepted.set(lookup.snapshot.operatorPubkey, lookup);
+        const operator = lookup.snapshot.operatorPubkey;
+        const hashes = entriesByOperator.get(operator) ?? new Set<string>();
+        hashes.add(entryHash);
+        entriesByOperator.set(operator, hashes);
     }
 
-    return accepted.size >= minOperatorProofs;
+    // Count agreement across independent operators, while discarding any
+    // operator that supplied conflicting valid snapshots for this lookup.
+    // One stale or faulty directory must not veto a matching majority.
+    const operatorsByEntry = new Map<string, Set<string>>();
+    for (const [operator, hashes] of entriesByOperator) {
+        if (hashes.size !== 1) continue;
+        const [entryHash] = hashes;
+        const operators = operatorsByEntry.get(entryHash) ?? new Set<string>();
+        operators.add(operator);
+        operatorsByEntry.set(entryHash, operators);
+    }
+
+    return [...operatorsByEntry.values()].some((operators) => operators.size >= minOperatorProofs);
 }
 
 export const app = express();
