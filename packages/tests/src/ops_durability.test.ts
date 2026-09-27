@@ -416,19 +416,33 @@ describe("ops durability and failover", () => {
         try {
             const health = await fetch(`http://localhost:${port}/healthz`);
             expect(health.status).toBe(200);
-            await expect(health.json()).resolves.toMatchObject({
+            const healthPayload = await health.json();
+            expect(healthPayload).toMatchObject({
                 ok: true,
                 status: "ok",
                 relayId: "ops-http-relay"
             });
+            expect(healthPayload.storage).toMatchObject({
+                bytes: expect.any(Number),
+                files: expect.any(Number),
+                softLimitBytes: expect.any(Number),
+                hardLimitBytes: expect.any(Number)
+            });
+            expect(healthPayload.storage).not.toHaveProperty("path");
+            expect(healthPayload.storage).not.toHaveProperty("error");
+            expect(JSON.stringify(healthPayload)).not.toContain(baseDir);
 
             const ready = await fetch(`http://localhost:${port}/readyz`);
             expect(ready.status).toBe(200);
-            await expect(ready.json()).resolves.toMatchObject({
+            const readinessPayload = await ready.json();
+            expect(readinessPayload).toMatchObject({
                 ok: true,
                 status: "ready",
                 relayId: "ops-http-relay"
             });
+            expect(readinessPayload.storage).not.toHaveProperty("path");
+            expect(readinessPayload.storage).not.toHaveProperty("error");
+            expect(JSON.stringify(readinessPayload)).not.toContain(baseDir);
 
             const metrics = await fetch(`http://localhost:${port}/metrics`);
             expect(metrics.status).toBe(200);
@@ -436,6 +450,32 @@ describe("ops durability and failover", () => {
             expect(body).toContain("cgp_relay_uptime_seconds");
             expect(body).toContain("cgp_relay_websocket_clients");
             expect(body).toContain("cgp_relay_event_loop_delay_p99_seconds");
+        } finally {
+            await relay.close().catch(() => undefined);
+        }
+    }, 10000);
+
+    it("redacts storage paths and errors when a public readiness estimate fails", async () => {
+        const privatePath = path.join(baseDir, `ops-http-error-${Date.now()}`);
+        const store = new LevelStore(privatePath);
+        store.estimateStorage = async () => {
+            throw new Error(`storage scan failed for ${privatePath}`);
+        };
+        const relay = new RelayServer(0, store, [], {
+            enableDefaultPlugins: false,
+            instanceId: "ops-http-error-relay"
+        });
+
+        try {
+            await waitFor(async () => Boolean((relay as any).httpServer.address()));
+            const address = (relay as any).httpServer.address();
+            const response = await fetch(`http://127.0.0.1:${address.port}/readyz`);
+            const payload = await response.json();
+
+            expect(payload.storage.unavailable).toBe(true);
+            expect(payload.storage).not.toHaveProperty("path");
+            expect(payload.storage).not.toHaveProperty("error");
+            expect(JSON.stringify(payload)).not.toContain(privatePath);
         } finally {
             await relay.close().catch(() => undefined);
         }

@@ -2183,7 +2183,7 @@ export class RelayServer {
     }
 
     const storage = await this.refreshStorageStatus(true);
-	const pubSubReady = !this.pubSubAdapter || this.pubSubAdapter.isReady?.() !== false;
+    const pubSubReady = !this.pubSubAdapter || this.pubSubAdapter.isReady?.() !== false;
     const ready =
       !this.closing && this.httpServer.listening && !storage.overSoftLimit && pubSubReady;
     const payload = {
@@ -2197,8 +2197,17 @@ export class RelayServer {
       subscriptions: this.countSubscriptions(),
       hostedGuilds: this.hostedGuilds.size,
       pubSubTopics: this.pubSubUnsubscribers.size,
-	  pubSubReady,
-      storage,
+      pubSubReady,
+      storage: {
+        bytes: storage.bytes,
+        files: storage.files,
+        softLimitBytes: storage.softLimitBytes,
+        hardLimitBytes: storage.hardLimitBytes,
+        pressure: storage.pressure,
+        overSoftLimit: storage.overSoftLimit,
+        overHardLimit: storage.overHardLimit,
+        unavailable: storage.unavailable,
+      },
       closing: this.closing,
     };
     res.setHeader("Content-Type", "application/json; charset=utf-8");
