@@ -54,6 +54,11 @@ The `HELLO_OK` frame reports `identityStability` as `configured` or `ephemeral`.
 stable signing key is configured. Readiness verifies configuration shape, not
 key persistence across deployments, so operators should also pin the returned
 relay public key and confirm it survives a redeploy.
+For configured identities, `/readyz` returns the same `relayId` and
+`relayPublicKey` as `HELLO_OK`; it never returns the private signing key. The
+endpoint permits unauthenticated cross-origin `GET` with `Access-Control-Allow-Origin: *`
+so clients can verify operator-pinned relay lists from a browser. It does not
+allow credentialed CORS requests, and readiness responses are marked `no-store`.
 
 ## Storage
 

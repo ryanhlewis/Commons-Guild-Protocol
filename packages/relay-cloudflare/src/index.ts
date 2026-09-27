@@ -86,6 +86,17 @@ function json(data: unknown, init?: ResponseInit) {
   });
 }
 
+function publicReadinessHeaders(): HeadersInit {
+  return {
+    "access-control-allow-origin": "*",
+    "access-control-allow-methods": "GET, OPTIONS",
+    "access-control-allow-headers": "Accept",
+    "access-control-max-age": "600",
+    "cache-control": "no-store",
+    vary: "Access-Control-Request-Method, Access-Control-Request-Headers",
+  };
+}
+
 function positiveInteger(value: unknown, fallback: number, max: number) {
   const parsed = Math.floor(Number(value));
   if (!Number.isFinite(parsed) || parsed <= 0) {
@@ -1009,15 +1020,33 @@ export default {
   async fetch(request: Request, env: Env) {
     const url = new URL(request.url);
     if (url.pathname === "/readyz") {
+      const headers = publicReadinessHeaders();
+      if (request.method === "OPTIONS") {
+        const requestedMethod = request.headers.get("Access-Control-Request-Method");
+        if (requestedMethod && requestedMethod.toUpperCase() !== "GET") {
+          return json({ error: "Only GET is allowed for readiness." }, { status: 405, headers: { ...headers, allow: "GET, OPTIONS" } });
+        }
+        return new Response(null, { status: 204, headers });
+      }
+      if (request.method !== "GET") {
+        return json({ error: "Only GET is allowed for readiness." }, { status: 405, headers: { ...headers, allow: "GET, OPTIONS" } });
+      }
+
       const identityStability = relayIdentityStability(env.CGP_RELAY_PRIVATE_KEY_HEX);
       const ready = identityStability === "configured";
+      const privateKey = ready ? privateKeyFromHex(env.CGP_RELAY_PRIVATE_KEY_HEX) : undefined;
+      const relayPublicKey = privateKey ? getPublicKey(privateKey) : undefined;
+      const relayId = relayPublicKey
+        ? env.CGP_RELAY_ID || `cf-${relayPublicKey.slice(0, 16)}`
+        : undefined;
       return json({
         ok: ready,
         protocol: "cgp/0.1",
         relay: "cloudflare",
         identityStability,
+        ...(ready ? { relayId, relayPublicKey } : {}),
         reasons: ready ? [] : ["A valid CGP_RELAY_PRIVATE_KEY_HEX secret is required for stable relay identity."],
-      }, { status: ready ? 200 : 503 });
+      }, { status: ready ? 200 : 503, headers });
     }
     if (url.pathname === "/" || url.pathname === "/healthz") {
       return json({
