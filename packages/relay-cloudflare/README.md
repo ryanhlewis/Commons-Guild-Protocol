@@ -49,6 +49,11 @@ npx wrangler secret put CGP_RELAY_PRIVATE_KEY_HEX --cwd packages/relay-cloudflar
 Generate the value as 32 random bytes encoded as 64 lowercase hex characters.
 If this secret is omitted, the Worker generates an ephemeral key per Durable
 Object instance, which is fine for local testing but not for production quorum.
+The `HELLO_OK` frame reports `identityStability` as `configured` or `ephemeral`.
+`/healthz` reports Worker liveness; `/readyz` returns HTTP 503 until a valid
+stable signing key is configured. Readiness verifies configuration shape, not
+key persistence across deployments, so operators should also pin the returned
+relay public key and confirm it survives a redeploy.
 
 ## Storage
 

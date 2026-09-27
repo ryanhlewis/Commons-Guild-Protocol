@@ -32,6 +32,7 @@ import {
   type HistoryQuery,
   type WorkerRelayStore,
 } from "./store";
+import { relayIdentityStability, type RelayIdentityStability } from "./identity";
 
 export interface Env {
   RELAY: DurableObjectNamespace;
@@ -112,7 +113,7 @@ function wireFormatFromValue(value: unknown): CgpWireFormat | undefined {
 
 function privateKeyFromHex(value?: string) {
   const trimmed = value?.trim() ?? "";
-  if (/^[a-fA-F0-9]{64}$/.test(trimmed)) {
+  if (relayIdentityStability(trimmed) === "configured") {
     const bytes = new Uint8Array(32);
     for (let index = 0; index < 32; index += 1) {
       bytes[index] = Number.parseInt(trimmed.slice(index * 2, index * 2 + 2), 16);
@@ -252,6 +253,7 @@ export class RelayDO {
   private readonly relayId: string;
   private readonly relayPrivateKey: Uint8Array;
   private readonly relayPublicKey: string;
+  private readonly identityStability: RelayIdentityStability;
   private readonly requireSignedReads: boolean;
   private readonly maxSnapshotEvents: number;
   private readonly maxHistoryEvents: number;
@@ -266,6 +268,7 @@ export class RelayDO {
       ? new D1RelayStore(env.DB)
       : new DurableObjectSqlRelayStore((state.storage as DurableObjectStorage & { sql: SqlStorage }).sql);
     this.relayPrivateKey = privateKeyFromHex(env.CGP_RELAY_PRIVATE_KEY_HEX);
+    this.identityStability = relayIdentityStability(env.CGP_RELAY_PRIVATE_KEY_HEX);
     this.relayPublicKey = getPublicKey(this.relayPrivateKey);
     this.relayId = env.CGP_RELAY_ID || `cf-${this.relayPublicKey.slice(0, 16)}`;
     this.relayName = env.CGP_RELAY_NAME || "Cloudflare CGP Relay";
@@ -363,6 +366,7 @@ export class RelayDO {
       relayName: this.relayName,
       relayId: this.relayId,
       relayPublicKey: this.relayPublicKey,
+      identityStability: this.identityStability,
       wireFormat: attachment.wireFormat,
       supportedWireFormats: SUPPORTED_WIRE_FORMATS,
       deployment: "cloudflare-workers",
@@ -1004,6 +1008,17 @@ export class RelayDO {
 export default {
   async fetch(request: Request, env: Env) {
     const url = new URL(request.url);
+    if (url.pathname === "/readyz") {
+      const identityStability = relayIdentityStability(env.CGP_RELAY_PRIVATE_KEY_HEX);
+      const ready = identityStability === "configured";
+      return json({
+        ok: ready,
+        protocol: "cgp/0.1",
+        relay: "cloudflare",
+        identityStability,
+        reasons: ready ? [] : ["A valid CGP_RELAY_PRIVATE_KEY_HEX secret is required for stable relay identity."],
+      }, { status: ready ? 200 : 503 });
+    }
     if (url.pathname === "/" || url.pathname === "/healthz") {
       return json({
         ok: true,
