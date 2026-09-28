@@ -1,5 +1,6 @@
 ﻿import { Level } from "level";
 import fs from "node:fs/promises";
+import {existsSync} from "node:fs";
 import path from "node:path";
 import { GuildEvent, GuildId, SerializableMember, SerializableMessageRef, type DeviceAuthorityPin } from "@cgp/core";
 import {
@@ -226,6 +227,7 @@ export class LevelStore implements Store {
 
     constructor(dbPath: string) {
         this.dbPath = path.resolve(dbPath);
+        if(existsSync(path.join(this.dbPath,"RESTORE-INCOMPLETE")))throw new Error("Relay store restore is incomplete; preserve target for investigation");
         this.db = new Level(dbPath);
     }
 
@@ -254,7 +256,7 @@ export class LevelStore implements Store {
     }
 
     async putWriteVoteFence(key: string, proposalId: string) {
-        await this.db.put(writeVoteFenceKey(key), proposalId);
+        await this.db.put(writeVoteFenceKey(key), proposalId, {sync:true});
     }
 
     async getSequencerState(key: string) {
@@ -272,7 +274,7 @@ export class LevelStore implements Store {
     }
 
     async putSequencerState(key: string, state: RelaySequencerPersistentState) {
-        await this.db.put(sequencerStateKey(key), JSON.stringify(state));
+        await this.db.put(sequencerStateKey(key), JSON.stringify(state), {sync:true});
     }
 
     async appendEvents(guildId: GuildId, events: GuildEvent[]) {

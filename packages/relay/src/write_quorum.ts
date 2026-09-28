@@ -1,3 +1,4 @@
+import { normalizeRelayVoterMembers } from "./relay_voter_identity";
 import {
   hashObject,
   relayWriteProposalId,
@@ -42,17 +43,12 @@ interface PendingVoteWaiter {
   timer: NodeJS.Timeout;
 }
 
-function uniqueMembers(members: string[]) {
-  return Array.from(
-    new Set(members.map((member) => member.trim().toLowerCase()).filter(Boolean)),
-  );
-}
 
 export function normalizeRelayWriteQuorumConfig(
   config: RelayWriteQuorumConfig,
 ): Required<RelayWriteQuorumConfig> {
   const epoch = config.epoch?.trim();
-  const members = uniqueMembers(config.members ?? []);
+  const members = normalizeRelayVoterMembers(config.members ?? []);
   if (!epoch) {
     throw new Error("Relay write quorum requires an epoch");
   }
@@ -223,7 +219,6 @@ export class RelayWriteQuorumCoordinator {
     }
     const proposalId = relayWriteProposalId(this.config.epoch, proposal);
     if (
-      this.votesByProposal.get(proposalId)?.has(this.identity.publicKey.toLowerCase()) ||
       this.proposalsInFlight.has(proposalId)
     ) {
       return false;

@@ -2695,6 +2695,9 @@ export class RelayServer {
     events: GuildEvent[],
     options: { broadcast?: boolean; runHooks?: boolean } = {},
   ): Promise<GuildEvent[]> {
+    if (this.writeQuorumCoordinator) {
+      throw new Error("Direct plugin bulk append is unavailable with write quorum; use sequenced publishing");
+    }
     const shouldBroadcast = options.broadcast !== false;
     const shouldRunHooks = options.runHooks !== false;
     const byGuild = new Map<GuildId, GuildEvent[]>();
@@ -4350,6 +4353,21 @@ export class RelayServer {
       const accepted: GuildEvent[] = [];
 
       for (const event of ordered) {
+        // Authenticate the durable commit before authority pins or state can change.
+        if (this.writeQuorumCoordinator) {
+          try {
+            const config = this.writeQuorumCoordinator.config;
+            const policy = normalizeRelayWriteQuorumPolicy(event.writeCertificate?.policy);
+            const expected = normalizeRelayWriteQuorumPolicy({
+              protocol: "cgp/write-quorum/1", epoch: config.epoch,
+              members: config.members, requiredVotes: config.requiredVotes,
+            });
+            if (event.body.guildId !== guildId || hashObject(policy) !== hashObject(expected) ||
+                !verifyRelayWriteCertificate(event, { expectedGuildId: guildId })) continue;
+          } catch {
+            continue;
+          }
+        }
         if (lastEvent && event.seq <= lastEvent.seq) {
           continue;
         }
@@ -7358,7 +7376,6 @@ export class RelayServer {
       }
 
       if (
-        claimedCertifier !== undefined &&
         writeProposal &&
         writeVotes &&
         this.writeQuorumCoordinator

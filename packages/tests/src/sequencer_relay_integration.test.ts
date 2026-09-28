@@ -72,6 +72,62 @@ async function waitForConvergence(
 }
 
 describe("relay sequencer integration", () => {
+  it("commits a fresh write after all peers lose quorum and heal with sequencing enabled", async () => {
+    const keys = Array.from({ length: 3 }, () => generatePrivateKey());
+    const members = keys.map(getPublicKey);
+    const stores = keys.map(() => new MemoryStore());
+    const contexts: RelayPluginContext[] = [];
+    const hub = new LocalRelayPubSubAdapter();
+    let isolated = false;
+    const adapters: RelayPubSubAdapter[] = keys.map(() => ({
+      publish(topic, envelope) { if (!isolated) hub.publish(topic, envelope); },
+      subscribe(topic, handler, options) {
+        return hub.subscribe(topic, envelope => { if (!isolated) handler(envelope); }, options);
+      },
+      isReady() { return true; },
+    }));
+    const policy = { epoch: "partition-recovery", members, requiredVotes: 2 };
+    const relays = keys.map((key, index) => new RelayServer(0, stores[index], [{
+      name: `partition-${index}`, onInit(context) { contexts[index] = context; },
+    }], {
+      listenHost: "127.0.0.1", enableDefaultPlugins: false,
+      instanceId: `partition-${index}`, relayPrivateKeyHex: Buffer.from(key).toString("hex"),
+      pubSubAdapter: adapters[index], writeQuorum: { ...policy, voteTimeoutMs: 150 },
+      sequencerConsensus: { ...policy, electionTimeoutMinMs: 80, electionTimeoutMaxMs: 140,
+        heartbeatIntervalMs: 25, requestTimeoutMs: 600 },
+    }));
+    const owner = generatePrivateKey(), author = getPublicKey(owner);
+    const guildId = hashObject({ test: "sequenced-partition", nonce: Date.now() });
+    const signed = async (body: any, clientEventId: string) => {
+      const payload = { body, author, createdAt: Date.now() };
+      return { ...payload, clientEventId, signature: await sign(owner, hashObject(payload)) };
+    };
+    try {
+      await new Promise(resolve => setTimeout(resolve, 50));
+      await contexts[0].publishSignedEvent!(await signed({ type: "GUILD_CREATE", guildId, name: "Partition" }, "create"));
+      await waitForConvergence(stores, guildId, 1);
+      isolated = true;
+      // Let any previous leader lease expire before each distinct attempt.
+      await new Promise(resolve => setTimeout(resolve, 350));
+      const pending = await Promise.all(contexts.map((_, index) => signed({ type: "CHANNEL_CREATE", guildId,
+        channelId: `isolated-${index}`, name: "Unavailable", kind: "text" }, `isolated-${index}`)));
+      const failed = await Promise.allSettled(contexts.map((context, index) => context.publishSignedEvent!(pending[index])));
+      expect(failed.every(result => result.status === "rejected")).toBe(true);
+      expect(stores.map(store => store.getLog(guildId).length)).toEqual([1, 1, 1]);
+      isolated = false;
+      await new Promise(resolve => setTimeout(resolve, 350));
+      const recovered = await signed({ type: "CHANNEL_CREATE", guildId,
+        channelId: "after-heal", name: "Recovered", kind: "text" }, "after-heal");
+      const results = await Promise.allSettled(contexts.map(context => context.publishSignedEvent!(recovered)));
+      expect(results.some(result => result.status === "fulfilled")).toBe(true);
+      const logs = await waitForConvergence(stores, guildId, 2);
+      expect(logs[0][1].body).toMatchObject({ channelId: "after-heal" });
+    } finally {
+      await Promise.all(relays.map(relay => relay.close()));
+      hub.close();
+    }
+  });
+
   it("retries the same selected proposal after witness catch-up misses one quorum deadline", async () => {
     const relayKeys = Array.from({ length: 2 }, () => generatePrivateKey());
     const members = relayKeys.map((key) => getPublicKey(key));
