@@ -43,11 +43,30 @@ The new-guild fixture passed with five real loopback WebSocket RelayServers and 
 
 The legacy kernel and live migration files independently passed **5 tests** on 2026-09-28; after adding wire-level operator authorization assertions, the live file passed again. Its three loopback RelayServers use separate LevelDB stores and a shared local pubsub adapter. Setup imports a synthetic, cryptographically certified genesis through the real legacy replication validator; it does not claim a normal legacy composer publication. The test persists three distinct minority fences, restarts, freezes every voter, imports the bridge, and continues with a real WebSocket v2 client at application sequence 1. One node uses the exported typed client `freezeLegacy(request, expectedVoter)` and `importHistory(history)` over actual WebSocket frames, after explicitly fetching an empty v2 history; the bootstrap bridge requires separately pinned legacy trust. Raw signed requests from unauthorized operators are rejected. Restarting without v2 configuration still rejects a late legacy vote and a synthetically valid late certificate, preserves the original fence and retirement record, and leaves the log unchanged. The fixture closes servers/clients and removes only its owned temporary stores in `finally`. This is a local regression result, not a multi-PC deployment receipt.
 
+## Three-PC public transport pilot
+
+The bounded network pilot passed six assertions against product revision `37fddeaa14b31561db028d6ff4cad03e7d1e0922`, completing at 2026-09-29 00:36:01 UTC (September 28 locally). The [sanitized receipt](evidence/consensus-network-pilot-2026-09-28.json) records the bundled worker hash, topology, assertions and cleanup. Four synthetic voter keys used three owned Windows PCs: A and replacement D on CORTOP1, B on ECHO, C on CORTOP3. Both ABC and BCD span three PCs; this replaces a voter key, not an independent administrator.
+
+The test used public WSS through temporary Cloudflare quick tunnels, verified TLS and authenticated RPC identities, committed a private genesis and rejected an outsider's signed read. A and B accepted an event without committing it; both processes and tunnels then restarted over their original LevelDB stores and keys. C's competing request recovered the exact earlier accepted event and correctly reported that its own request was not committed. An administrator-authorized ABC-to-BCD transition gathered old-policy commitment and new-policy readiness, rejected retired A, and accepted a new D write. A fixture partition isolated B and C's consensus RPC paths: D could not commit alone under the unchanged 2-of-3 threshold. Healing restored convergence and the same refused request then committed.
+
+Reproduce only on the existing owned test hosts with their prerequisites:
+
+```powershell
+node scripts/build-consensus-network-package.cjs
+npx tsx scripts/consensus-network-pilot.ts
+```
+
+The build reuses the Windows native dependency archive from `build-remote-continuity-package.cjs`. The controller uses strict existing SSH routes and foreground workers, loopback listeners, disposable quick tunnels and a 30-minute worker deadline. It installs no service, scheduled task, startup entry or named tunnel. New quick-tunnel DNS names initially produced reachability failures; the bounded retry and exact-host fixture DNS fallback retained the original hostname, SNI and TLS verification. Original DNS observations and failures remain in the ignored run directory.
+
+All four final workers reported shutdown. A separate root-agent audit then confirmed all **12 historical worker/tunnel PIDs and six listener ports absent** across the three PCs, including pre-restart instances. The initial controller-only attempt failed on a local variable naming error before starting a worker; its failure receipt was retained. Original instance metadata accidentally overwrote the routing-host field with the listener address; the original evidence is preserved, and future controller output uses a separate `routeHost` field. Public receipt routing comes from the recorded machine/role, not that overwritten field.
+
+This is a synthetic Node-client/protocol pilot. It does not establish browser integration, physical microphone/camera support, Byzantine safety, independent operators, public legacy-guild migration, sustained-load behavior or persistent deployment. The shared tunnel provider remains a correlated dependency. Earlier restrictions on persistent provisioning remain untouched.
+
 ## Remaining acceptance boundaries
 
 - Extend legacy migration qualification to deployed operator topology, real nonempty historical guilds/device-authority transitions and failure during full-store recovery. Kernel tests cover an in-flight vote, conflicting partial fences, required exact majority-fenced payload and missing old voters; the local live test covers certified-prefix retirement/restart. A safe refusal remains preferable to an uncertified bridge.
 - Migrate actual browser/native client flows explicitly, then repeat recovery, encrypted-room rejoin/history, media and call acceptance against the new path. The Node client alone does not establish those outcomes.
-- Run bounded real transport/operator fault tests with the exact candidate and retain sanitized receipts. Separately qualify sustained load, resource limits, partitions, packet loss and long-running operational recovery.
+- Extend the bounded public transport result to independently administered operators. Separately qualify sustained load, resource limits, network-level packet loss and long-running operational recovery; the pilot partition is an explicit fixture RPC gate, not packet-level fault injection.
 - Obtain external security review and independently administered operators. Multiple machines managed by the same account are not independent operators; internal agent review is not an external audit.
 - Record trust-root distribution, signed release/update procedures, retention obligations and operator handoff. A quorum commit is not a media retention SLA or assurance that users can recover lost encryption keys.
 
