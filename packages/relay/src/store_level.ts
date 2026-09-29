@@ -1,5 +1,7 @@
 ﻿import { Level } from "level";
 import fs from "node:fs/promises";
+import type { ConsensusPersistentState } from "./consensus_v2";
+import type { LegacyConsensusFreezeRecord } from "@cgp/core";
 import {existsSync} from "node:fs";
 import path from "node:path";
 import { GuildEvent, GuildId, SerializableMember, SerializableMessageRef, type DeviceAuthorityPin } from "@cgp/core";
@@ -257,6 +259,22 @@ export class LevelStore implements Store {
 
     async putWriteVoteFence(key: string, proposalId: string) {
         await this.db.put(writeVoteFenceKey(key), proposalId, {sync:true});
+    }
+
+    async getConsensusState(guildId: string): Promise<ConsensusPersistentState | undefined> {
+        try { const raw = await this.db.get(`consensus:v2:${guildId}`); return typeof raw === 'string' ? JSON.parse(raw) : undefined; }
+        catch (error: any) { if (isNotFoundError(error)) return undefined; throw error; }
+    }
+    async getLegacyConsensusFreeze(guildId: string): Promise<LegacyConsensusFreezeRecord | undefined> {
+        try { const raw = await this.db.get(`consensus:legacy-freeze:${guildId}`); return typeof raw === 'string' ? JSON.parse(raw) : undefined; }
+        catch (error: any) { if (isNotFoundError(error)) return undefined; throw error; }
+    }
+    async putLegacyConsensusFreeze(guildId: string, record: LegacyConsensusFreezeRecord) {
+        await this.db.put(`consensus:legacy-freeze:${guildId}`, JSON.stringify(record), { sync: true });
+    }
+
+    async putConsensusState(guildId: string, state: ConsensusPersistentState) {
+        await this.db.put(`consensus:v2:${guildId}`, JSON.stringify(state), { sync: true });
     }
 
     async getSequencerState(key: string) {
