@@ -1,4 +1,5 @@
 import { sha256 } from "@noble/hashes/sha256";
+import { bytesToHex, hexToBytes } from "@noble/hashes/utils";
 import { hmac } from "@noble/hashes/hmac";
 import * as secp from "@noble/secp256k1";
 import stringify from "safe-stable-stringify";
@@ -14,7 +15,7 @@ if (!secp.etc.hmacSha256Sync) {
 export function hashObject(obj: unknown): HashHex {
     const bytes = textEncoder.encode(stringify(obj));
     const h = sha256(bytes);
-    return Buffer.from(h).toString("hex");
+    return bytesToHex(h);
 }
 
 export async function sign(
@@ -50,7 +51,7 @@ export function verifyObject(
 }
 
 export function getPublicKey(privKey: Uint8Array): PublicKeyHex {
-    return Buffer.from(secp.getPublicKey(privKey, true)).toString("hex");
+    return bytesToHex(secp.getPublicKey(privKey, true));
 }
 
 export function generatePrivateKey(): Uint8Array {
@@ -84,8 +85,8 @@ export async function encrypt(
     );
 
     return {
-        ciphertext: Buffer.from(encrypted).toString("base64"),
-        iv: Buffer.from(iv).toString("hex")
+        ciphertext: btoa(Array.from(new Uint8Array(encrypted), byte => String.fromCharCode(byte)).join("")),
+        iv: bytesToHex(iv)
     };
 }
 
@@ -102,8 +103,8 @@ export async function decrypt(
         ["decrypt"]
     );
 
-    const iv = Buffer.from(ivHex, "hex");
-    const encrypted = Buffer.from(ciphertextBase64, "base64");
+    const iv = new Uint8Array(hexToBytes(ivHex));
+    const encrypted = Uint8Array.from(atob(ciphertextBase64), character => character.charCodeAt(0));
 
     const decrypted = await globalThis.crypto.subtle.decrypt(
         { name: "AES-GCM", iv },
@@ -116,5 +117,6 @@ export async function decrypt(
 
 export function generateSymmetricKey(): string {
     const key = globalThis.crypto.getRandomValues(new Uint8Array(32));
-    return Buffer.from(key).toString("hex");
+    return bytesToHex(key);
 }
+
