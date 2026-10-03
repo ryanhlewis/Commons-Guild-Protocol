@@ -1,5 +1,8 @@
 ﻿import { Level } from "level";
 import fs from "node:fs/promises";
+import type { ConsensusPersistentState } from "./consensus_v2";
+import type { LegacyConsensusFreezeRecord } from "@cgp/core";
+import {existsSync} from "node:fs";
 import path from "node:path";
 import { GuildEvent, GuildId, SerializableMember, SerializableMessageRef, type DeviceAuthorityPin } from "@cgp/core";
 import {
@@ -161,6 +164,8 @@ function needsDerivedRebuildAfterBatch(events: GuildEvent[]) {
 function batchMemberIndexUserId(event: GuildEvent): string | null {
     const body = event.body as Record<string, any>;
     switch (body.type) {
+        case "MEMBER_JOIN":
+            return event.author;
         case "MEMBER_UPDATE":
         case "BAN_USER":
         case "BAN_ADD":
@@ -226,6 +231,7 @@ export class LevelStore implements Store {
 
     constructor(dbPath: string) {
         this.dbPath = path.resolve(dbPath);
+        if(existsSync(path.join(this.dbPath,"RESTORE-INCOMPLETE")))throw new Error("Relay store restore is incomplete; preserve target for investigation");
         this.db = new Level(dbPath);
     }
 
@@ -254,7 +260,23 @@ export class LevelStore implements Store {
     }
 
     async putWriteVoteFence(key: string, proposalId: string) {
-        await this.db.put(writeVoteFenceKey(key), proposalId);
+        await this.db.put(writeVoteFenceKey(key), proposalId, {sync:true});
+    }
+
+    async getConsensusState(guildId: string): Promise<ConsensusPersistentState | undefined> {
+        try { const raw = await this.db.get(`consensus:v2:${guildId}`); return typeof raw === 'string' ? JSON.parse(raw) : undefined; }
+        catch (error: any) { if (isNotFoundError(error)) return undefined; throw error; }
+    }
+    async getLegacyConsensusFreeze(guildId: string): Promise<LegacyConsensusFreezeRecord | undefined> {
+        try { const raw = await this.db.get(`consensus:legacy-freeze:${guildId}`); return typeof raw === 'string' ? JSON.parse(raw) : undefined; }
+        catch (error: any) { if (isNotFoundError(error)) return undefined; throw error; }
+    }
+    async putLegacyConsensusFreeze(guildId: string, record: LegacyConsensusFreezeRecord) {
+        await this.db.put(`consensus:legacy-freeze:${guildId}`, JSON.stringify(record), { sync: true });
+    }
+
+    async putConsensusState(guildId: string, state: ConsensusPersistentState) {
+        await this.db.put(`consensus:v2:${guildId}`, JSON.stringify(state), { sync: true });
     }
 
     async getSequencerState(key: string) {
@@ -272,7 +294,7 @@ export class LevelStore implements Store {
     }
 
     async putSequencerState(key: string, state: RelaySequencerPersistentState) {
-        await this.db.put(sequencerStateKey(key), JSON.stringify(state));
+        await this.db.put(sequencerStateKey(key), JSON.stringify(state), {sync:true});
     }
 
     async appendEvents(guildId: GuildId, events: GuildEvent[]) {
@@ -1123,6 +1145,19 @@ export class LevelStore implements Store {
                 }, memberSnapshots);
                 break;
             }
+            case "MEMBER_JOIN": {
+                const userId = event.author;
+                const snapshot = memberSnapshots?.get(userId);
+                const current = snapshot?.member || await this.readMember(guildId, userId);
+                if (!current) {
+                    await this.putIndexedMemberForDerived(batch, guildId, {
+                        userId,
+                        roles: [],
+                        joinedAt: event.createdAt
+                    }, memberSnapshots, snapshot?.searchTerms, snapshot?.member);
+                }
+                break;
+            }
             case "MEMBER_UPDATE": {
                 const userId = typeof body.userId === "string" && body.userId.trim() ? body.userId : event.author;
                 const snapshot = memberSnapshots?.get(userId);
@@ -1319,6 +1354,11 @@ export class LevelStore implements Store {
         switch (body.type) {
             case "GUILD_CREATE":
                 members.set(event.author, { userId: event.author, roles: ["owner"], joinedAt: event.createdAt });
+                break;
+            case "MEMBER_JOIN":
+                if (!members.has(event.author)) {
+                    members.set(event.author, { userId: event.author, roles: [], joinedAt: event.createdAt });
+                }
                 break;
             case "MEMBER_UPDATE": {
                 const userId = typeof body.userId === "string" && body.userId.trim() ? body.userId : event.author;

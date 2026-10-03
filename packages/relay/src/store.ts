@@ -1,5 +1,7 @@
 import { ChannelId, GuildEvent, GuildId, SerializableMember, SerializableMessageRef, UserId, type DeviceAuthorityPin } from "@cgp/core";
 import type { RelaySequencerPersistentState } from "./sequencer_consensus";
+import type { ConsensusPersistentState } from "./consensus_v2";
+import type { LegacyConsensusFreezeRecord } from "@cgp/core";
 
 export interface StoreStorageEstimate {
     bytes: number;
@@ -270,6 +272,10 @@ export function selectReplaySnapshotEvents(log: GuildEvent[], query: ReplaySnaps
 }
 
 export interface Store {
+    getLegacyConsensusFreeze?(guildId: string): Promise<LegacyConsensusFreezeRecord | undefined> | LegacyConsensusFreezeRecord | undefined;
+    putLegacyConsensusFreeze?(guildId: string, record: LegacyConsensusFreezeRecord): Promise<void> | void;
+    getConsensusState?(guildId: string): Promise<ConsensusPersistentState | undefined> | ConsensusPersistentState | undefined;
+    putConsensusState?(guildId: string, state: ConsensusPersistentState): Promise<void> | void;
     getDeviceAuthorityPin?(account: string): Promise<DeviceAuthorityPin | undefined> | DeviceAuthorityPin | undefined;
     putDeviceAuthorityPin?(account: string, pin: DeviceAuthorityPin): Promise<void> | void;
     getLog(guildId: GuildId): Promise<GuildEvent[]> | GuildEvent[];
@@ -299,6 +305,17 @@ export interface Store {
 }
 
 export class MemoryStore implements Store {
+    private legacyConsensusFreezes = new Map<string, LegacyConsensusFreezeRecord>();
+    getLegacyConsensusFreeze(guildId: string) { const value = this.legacyConsensusFreezes.get(guildId); return value ? JSON.parse(JSON.stringify(value)) : undefined; }
+    putLegacyConsensusFreeze(guildId: string, record: LegacyConsensusFreezeRecord) { this.legacyConsensusFreezes.set(guildId, JSON.parse(JSON.stringify(record))); }
+    private consensusStates = new Map<string, ConsensusPersistentState>();
+    getConsensusState(guildId: string) {
+        const state = this.consensusStates.get(guildId);
+        return state ? JSON.parse(JSON.stringify(state)) as ConsensusPersistentState : undefined;
+    }
+    putConsensusState(guildId: string, state: ConsensusPersistentState) {
+        this.consensusStates.set(guildId, JSON.parse(JSON.stringify(state)));
+    }
     private deviceAuthorityPins = new Map<string, DeviceAuthorityPin>();
     getDeviceAuthorityPin(account: string) { const pin = this.deviceAuthorityPins.get(account); return pin ? {...pin} : undefined; }
     putDeviceAuthorityPin(account: string, pin: DeviceAuthorityPin) { this.deviceAuthorityPins.set(account,{...pin}); }
@@ -732,6 +749,16 @@ export class MemoryStore implements Store {
                     joinedAt: event.createdAt
                 });
                 break;
+            case "MEMBER_JOIN": {
+                if (!members.has(event.author)) {
+                    this.setIndexedMember(guildId, members, {
+                        userId: event.author,
+                        roles: [],
+                        joinedAt: event.createdAt
+                    });
+                }
+                break;
+            }
             case "MEMBER_UPDATE": {
                 const userId = typeof body.userId === "string" && body.userId.trim() ? body.userId : event.author;
                 const current = members.get(userId) || { userId, roles: [], joinedAt: event.createdAt };

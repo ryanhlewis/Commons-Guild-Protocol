@@ -2,6 +2,7 @@ import fs from "fs";
 import path from "path";
 import { generatePrivateKey, getPublicKey } from "@cgp/core";
 import { normalizeProfile } from "./profile";
+import { dockerBindPath } from "./docker";
 
 const positionalArgs = collectPositionalArgs();
 
@@ -175,7 +176,7 @@ function main() {
     const dataDir = resolveInside(scratchRoot, argValue("data-dir", positionalArgs[2] || scratchRoot)!, "data-dir");
     const resultsDir = path.resolve("loadnet", "results");
     const keepData = process.argv.includes("--keep-data");
-    const composePath = (value: string) => value.replace(/\\/g, "/");
+    const composePath = dockerBindPath;
     const image = safeImageName(argValue("image", "cgp-loadnet:local")!);
     const serviceCount = profile.pubSubShards + profile.relays + 1 + profile.subscriberWorkers + profile.publisherWorkers + profile.fullClientWorkers + 1;
     const subnet = argValue("subnet", defaultSubnetForServiceCount(serviceCount))!;

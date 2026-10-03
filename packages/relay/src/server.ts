@@ -55,6 +55,8 @@ import {
   type DeviceAuthorization,
 } from "@cgp/core";
 import { LevelStore } from "./store_level";
+import { RelayConsensusService, type RelayConsensusConfig } from './consensus_service';
+import { verifyConsensusHistory, type ConsensusValue, type LegacyConsensusMigrationRequest, type ConsensusHistory } from '@cgp/core';
 import {
   HistoryQuery,
   MemberPageQuery,
@@ -447,6 +449,7 @@ export interface RelayServerOptions {
   fanoutDrainDelayMs?: number;
   instanceId?: string;
   relayPrivateKeyHex?: string;
+  consensusV2?: RelayConsensusConfig;
   pubSubAdapter?: RelayPubSubAdapter;
   writeQuorum?: RelayWriteQuorumConfig | false;
   sequencerConsensus?: RelaySequencerConsensusConfig | false;
@@ -1454,6 +1457,7 @@ export class RelayServer {
   private pruneTimer: NodeJS.Timeout;
   private checkpointTimer?: NodeJS.Timeout;
   private keyPair: { publicKey: string; privateKey: Uint8Array };
+  private consensusV2?: RelayConsensusService;
   private recentPublishAcks = new Map<string, PublishReplayEntry>();
   private recentPublishProofs = new Map<string, PublishProofEntry>();
   private recentKnownEventIds = new Map<string, number>();
@@ -1653,6 +1657,54 @@ export class RelayServer {
       publicKey: getPublicKey(privateKey),
     };
     console.log(`Relay started with public key: ${this.keyPair.publicKey}`);
+    if (options.consensusV2) {
+      if (!this.store.getConsensusState || !this.store.putConsensusState) throw Error('Consensus v2 requires atomic durable state storage');
+      this.consensusV2 = new RelayConsensusService(options.consensusV2, this.keyPair, {
+        getConsensusState: guildId => this.store.getConsensusState!(guildId),
+        putConsensusState: (guildId, state) => this.store.putConsensusState!(guildId, state),
+      }, guildId => ({
+        validateEvent: async (event, prefix, mode) => {
+          try {
+            // Plugin policy bypasses and relay-generated checkpoints require separate
+            // protocol support; they cannot bypass normal v2 event authorization.
+            if (event.body.type === 'CHECKPOINT' || (event.body as any).certifier !== undefined) return false;
+            if (!Number.isFinite(event.createdAt)) return false;
+            const authorities = new DeviceAuthorityRegistry();
+            for (const item of [...prefix, event]) {
+              const verified = authorities.verify({ body: item.body, author: item.author, createdAt: item.createdAt },
+                item.signature, item.author, item.deviceAuthorization, 'publish', item.createdAt);
+              if (!verified.ok) return false;
+            }
+            if (prefix.length) validateEvent(rebuildStateFromEvents(prefix).state, event, { now: event.createdAt });
+            else if (event.body.type !== 'GUILD_CREATE' ||
+                (!this.consensusV2!.config.legacyTrust?.[guildId] && !this.consensusV2!.config.guilds[guildId].administrators.includes(event.author))) return false;
+            if (mode === 'accept') {
+              if (event.createdAt > Date.now() + 300_000) return false;
+              const verified = await this.verifyAccountAuthorization({ body: event.body, author: event.author, createdAt: event.createdAt },
+                event.signature, event.author, event.deviceAuthorization, 'publish');
+              if (!verified.ok) return false;
+            }
+            return true;
+          } catch { return false; }
+        },
+        materialize: async events => {
+          await this.withGuildMutex(guildId, async () => {
+            const existing = await this.store.getLog(guildId);
+            if (existing.length > events.length || existing.some((event, index) => event.id !== events[index]?.id)) {
+              throw Error('Existing app log requires a verified migration bridge; refusing overwrite');
+            }
+            for (const event of events.slice(existing.length)) {
+              await this.store.append(guildId, event);
+              this.broadcast(guildId, event);
+            }
+            this.stateCache.delete(guildId);
+            this.checkpointCache.delete(guildId);
+            this.deviceAuthorityHydrations.delete(guildId);
+            await this.hydrateDeviceAuthorities(guildId);
+          });
+        },
+      }));
+    }
 
     const writeQuorumConfig =
       options.writeQuorum === false
@@ -1676,6 +1728,11 @@ export class RelayServer {
           getWriteVoteFence: (key) => this.store.getWriteVoteFence!(key),
           putWriteVoteFence: (key, proposalId) =>
             this.store.putWriteVoteFence!(key, proposalId),
+          getLegacyConsensusFreeze: guildId => this.store.getLegacyConsensusFreeze?.(guildId),
+          putLegacyConsensusFreeze: async (guildId, record) => {
+            if (!this.store.putLegacyConsensusFreeze) throw Error('Durable legacy retirement storage required');
+            await this.store.putLegacyConsensusFreeze(guildId, record);
+          },
         },
         {
           publish: (vote) =>
@@ -2695,6 +2752,10 @@ export class RelayServer {
     events: GuildEvent[],
     options: { broadcast?: boolean; runHooks?: boolean } = {},
   ): Promise<GuildEvent[]> {
+    if (events.some(event => this.consensusV2?.has(event?.body?.guildId))) throw Error('Consensus guilds require certified v2 ingress');
+    if (this.writeQuorumCoordinator) {
+      throw new Error("Direct plugin bulk append is unavailable with write quorum; use sequenced publishing");
+    }
     const shouldBroadcast = options.broadcast !== false;
     const shouldRunHooks = options.runHooks !== false;
     const byGuild = new Map<GuildId, GuildEvent[]>();
@@ -2710,7 +2771,7 @@ export class RelayServer {
 
     const accepted: GuildEvent[] = [];
     for (const [guildId, guildEvents] of byGuild) {
-      await this.withGuildMutex(guildId, async () => {
+      await this.withLegacyGuildMutex(guildId, async () => {
         let lastEvent = await this.store.getLastEvent(guildId);
         const sequenced = guildEvents.map((event) => {
           const nextEvent: GuildEvent = {
@@ -2761,6 +2822,7 @@ export class RelayServer {
   }
 
   public async createCheckpoints() {
+    if (this.consensusV2) return;
     // A relay-local checkpoint is a valid cache optimization only for a
     // single-writer log. In a sequenced quorum guild, two witnesses would
     // otherwise append different relay-authored events at the same head.
@@ -2828,7 +2890,14 @@ export class RelayServer {
         }),
       );
 
-      await this.store.append(guildId, fullEvent);
+      const checkpointWritten = await this.withGuildMutex(guildId, async () => {
+        if (await this.store.getLegacyConsensusFreeze?.(guildId)) return false;
+        const current = await this.store.getLastEvent(guildId);
+        if (current?.id !== lastEvent.id) return false;
+        await this.store.append(guildId, fullEvent);
+        return true;
+      });
+      if (!checkpointWritten) continue;
       this.storageUnestimatedWrittenBytes +=
         this.estimatedPublishBytes(fullEvent);
       this.ensurePubSubHostedGuildReplication(guildId);
@@ -2843,6 +2912,7 @@ export class RelayServer {
   }
 
   public async prune() {
+    if (this.consensusV2) return;
     const guilds = await this.store.getGuildIds();
     const now = Date.now();
 
@@ -2891,13 +2961,18 @@ export class RelayServer {
       }
 
       if (seqsToDelete.length > 0) {
-        if (this.store.deleteEvents) {
-          await this.store.deleteEvents(guildId, seqsToDelete);
-        } else {
-          for (const seq of seqsToDelete) {
-            await this.store.deleteEvent(guildId, seq);
+        const pruned = await this.withGuildMutex(guildId, async () => {
+          if (await this.store.getLegacyConsensusFreeze?.(guildId)) return false;
+          if (this.store.deleteEvents) {
+            await this.store.deleteEvents(guildId, seqsToDelete);
+          } else {
+            for (const seq of seqsToDelete) {
+              await this.store.deleteEvent(guildId, seq);
+            }
           }
-        }
+          return true;
+        });
+        if (!pruned) continue;
         this.stateCache.delete(guildId);
         this.checkpointCache.delete(guildId);
         await this.refreshStorageStatus(true);
@@ -2911,6 +2986,66 @@ export class RelayServer {
     payload: unknown,
   ) {
     if (this.closing) {
+      return;
+    }
+
+    if (['CONSENSUS_RPC', 'CONSENSUS_PUBLISH', 'CONSENSUS_HISTORY', 'CONSENSUS_FREEZE', 'CONSENSUS_IMPORT'].includes(kind)) {
+      const request = objectPayload(payload);
+      try {
+        if (!this.consensusV2) throw Error('Consensus v2 is not configured');
+        if (kind === 'CONSENSUS_RPC') {
+          this.sendFrame(socket, 'CONSENSUS_RPC_RESULT', await this.consensusV2.handleRpc(request as any));
+          return;
+        }
+        const { guildId, requestId, author, createdAt, signature, deviceAuthorization } = request;
+        if (!this.consensusV2.has(guildId) || typeof requestId !== 'string' || requestId.length > 100 ||
+            typeof author !== 'string' || typeof signature !== 'string' || typeof createdAt !== 'number' || !Number.isFinite(createdAt) ||
+            Math.abs(Date.now() - createdAt) > 300_000) throw Error('Invalid signed consensus request');
+        const authorization = await this.verifyAccountAuthorization({ protocol: 'cgp/consensus-read/2', guildId, requestId, createdAt },
+          signature, author, deviceAuthorization as DeviceAuthorization | undefined, 'read');
+        if (!authorization.ok) throw Error('Invalid consensus read authorization');
+        const coordinator = this.consensusV2.coordinator(guildId);
+        if (kind === 'CONSENSUS_FREEZE' || kind === 'CONSENSUS_IMPORT') {
+          const administrators = [...coordinator.anchor.administrators, ...(coordinator.legacyTrust?.administrators ?? [])];
+          if (!administrators.includes(author)) throw Error('Migration operator authorization required');
+          if (kind === 'CONSENSUS_FREEZE') {
+            const migration = request.migration as LegacyConsensusMigrationRequest;
+            if (migration?.guildId !== guildId) throw Error('Migration guild mismatch');
+            this.sendFrame(socket, 'CONSENSUS_FROZEN', { guildId, requestId, freeze: await this.freezeLegacyConsensus(migration) });
+          } else {
+            const imported = request.history as ConsensusHistory;
+            if (imported?.guildId !== guildId) throw Error('Migration history guild mismatch');
+            await this.importConsensusHistory(imported);
+            this.sendFrame(socket, 'CONSENSUS_RESULT', { guildId, requestId, history: await coordinator.history() });
+          }
+          return;
+        }
+        const history = await coordinator.history();
+        const checked = verifyConsensusHistory(history, guildId, coordinator.anchor, coordinator.legacyTrust);
+        if (checked.events.length ? !canReadGuild(rebuildStateFromEvents(checked.events).state, author) : !coordinator.anchor.administrators.includes(author)) {
+          throw Error('Consensus history access denied');
+        }
+        if (kind === 'CONSENSUS_PUBLISH') {
+          const gate = await this.checkStorageWriteGate(this.estimatedPublishBytes(request.value));
+          if (!gate.ok) throw Error('Relay storage limit reached');
+          const result = await this.consensusV2.propose(guildId, request.value as ConsensusValue);
+          // A selected earlier proposal may change membership; recheck before disclosure.
+          const final = verifyConsensusHistory(result, guildId, coordinator.anchor, coordinator.legacyTrust);
+          if (final.events.length && !canReadGuild(rebuildStateFromEvents(final.events).state, author)) throw Error('Consensus history access denied after commit');
+          this.sendFrame(socket, 'CONSENSUS_RESULT', { guildId, requestId, history: result });
+        } else this.sendFrame(socket, 'CONSENSUS_RESULT', { guildId, requestId, history });
+      } catch (error) {
+        this.sendFrame(socket, 'CONSENSUS_ERROR', { guildId: request.guildId, requestId: request.requestId,
+          code: 'CONSENSUS_REJECTED', message: error instanceof Error ? error.message : 'Consensus operation failed' });
+      }
+      return;
+    }
+    const consensusGuardPayload = objectPayload(payload);
+    if (this.consensusV2?.has(consensusGuardPayload.guildId) ||
+        this.consensusV2?.has((consensusGuardPayload.body as any)?.guildId)) {
+      this.sendFrame(socket, 'ERROR', { code: 'CONSENSUS_V2_REQUIRED',
+        message: 'This guild requires the explicitly anchored consensus v2 client protocol',
+        requestId: consensusGuardPayload.requestId, clientEventId: consensusGuardPayload.clientEventId });
       return;
     }
     if (this.verboseLogging) {
@@ -4021,6 +4156,7 @@ export class RelayServer {
   }
 
   private async requestPeerLogCatchup(guildId: GuildId, targetSeq?: number) {
+    if (this.consensusV2?.has(guildId)) return;
     if (this.closing || this.peerUrls.length === 0) {
       return;
     }
@@ -4337,19 +4473,35 @@ export class RelayServer {
   }
 
   private async replicatePubSubEvents(guildId: GuildId, events: GuildEvent[]) {
+    if (this.consensusV2?.has(guildId)) throw Error('Legacy replication cannot append to a consensus v2 guild');
     if (events.length === 0) {
       return [];
     }
 
     await this.hydrateDeviceAuthorities(guildId);
     const ordered = [...events].sort((left, right) => left.seq - right.seq);
-    return await this.withGuildMutex(guildId, async () => {
+    return await this.withLegacyGuildMutex(guildId, async () => {
       let lastEvent = await this.store.getLastEvent(guildId);
       let state = this.stateCache.get(guildId);
       let checkpointEvent = this.checkpointCache.get(guildId);
       const accepted: GuildEvent[] = [];
 
       for (const event of ordered) {
+        // Authenticate the durable commit before authority pins or state can change.
+        if (this.writeQuorumCoordinator) {
+          try {
+            const config = this.writeQuorumCoordinator.config;
+            const policy = normalizeRelayWriteQuorumPolicy(event.writeCertificate?.policy);
+            const expected = normalizeRelayWriteQuorumPolicy({
+              protocol: "cgp/write-quorum/1", epoch: config.epoch,
+              members: config.members, requiredVotes: config.requiredVotes,
+            });
+            if (event.body.guildId !== guildId || hashObject(policy) !== hashObject(expected) ||
+                !verifyRelayWriteCertificate(event, { expectedGuildId: guildId })) continue;
+          } catch {
+            continue;
+          }
+        }
         if (lastEvent && event.seq <= lastEvent.seq) {
           continue;
         }
@@ -6460,6 +6612,10 @@ export class RelayServer {
     for (const item of items) {
       const body = item?.body;
       const targetGuildId = body?.guildId;
+      if (this.consensusV2?.has(targetGuildId)) {
+        sendError(item, 'CONSENSUS_V2_REQUIRED', 'Guild requires certified consensus v2 ingress');
+        continue;
+      }
       if (typeof targetGuildId !== "string" || !targetGuildId.trim()) {
         sendError(item, "VALIDATION_FAILED", "Event body requires a guildId");
         continue;
@@ -6537,7 +6693,7 @@ export class RelayServer {
         continue;
       }
 
-      const groupResults = await this.withGuildMutex(
+      const groupResults = await this.withLegacyGuildMutex(
         targetGuildId,
         async () => {
           const accepted: PublishBatchResult[] = [];
@@ -6865,6 +7021,7 @@ export class RelayServer {
   }
 
   private async validateWriteQuorumProposal(proposal: RelayWriteProposal) {
+    if (this.consensusV2?.has(proposal?.guildId)) return false;
     const body = proposal?.body as EventBody;
     const guildId = proposal?.guildId;
     if (
@@ -7065,6 +7222,10 @@ export class RelayServer {
       sendError("VALIDATION_FAILED", "Event body requires a guildId");
       return undefined;
     }
+    if (this.consensusV2?.has(targetGuildId)) {
+      sendError('CONSENSUS_V2_REQUIRED', 'Guild requires certified consensus v2 ingress');
+      return undefined;
+    }
 
     if (body.type === "CHECKPOINT") {
       sendError(
@@ -7209,7 +7370,7 @@ export class RelayServer {
     }
 
     try {
-      return await this.withGuildMutex(targetGuildId, async () => {
+      return await this.withLegacyGuildMutex(targetGuildId, async () => {
       const replay = this.lookupRecentPublishAck(targetGuildId, p);
       if (replay.kind === "mismatch") {
         sequencingFinalized = true;
@@ -7358,7 +7519,6 @@ export class RelayServer {
       }
 
       if (
-        claimedCertifier !== undefined &&
         writeProposal &&
         writeVotes &&
         this.writeQuorumCoordinator
@@ -8944,6 +9104,29 @@ export class RelayServer {
     );
   }
 
+  private async withLegacyGuildMutex<T>(guildId: GuildId, operation: () => Promise<T>): Promise<T> {
+    return this.withGuildMutex(guildId, async () => {
+      if (this.consensusV2?.has(guildId) || await this.store.getLegacyConsensusFreeze?.(guildId)) {
+        throw Error('Legacy writes are retired for this guild');
+      }
+      return operation();
+    });
+  }
+
+  /** Operator migration API; an administrator threshold signs the exact request. */
+  public async freezeLegacyConsensus(request: LegacyConsensusMigrationRequest) {
+    const config = this.consensusV2?.config;
+    const trust = config?.legacyTrust?.[request.guildId];
+    const anchor = config?.guilds[request.guildId];
+    if (!trust || !anchor || !this.writeQuorumCoordinator) throw Error('Explicit old/new trust and legacy quorum coordinator required');
+    return this.withGuildMutex(request.guildId, () => this.writeQuorumCoordinator!.freezeGuild(request, trust, anchor, () => this.store.getLog(request.guildId)));
+  }
+
+  public async importConsensusHistory(history: ConsensusHistory) {
+    if (!this.consensusV2) throw Error('Consensus v2 is not configured');
+    await this.consensusV2.coordinator(history.guildId).sync(history);
+  }
+
   private async withGuildMutex<T>(
     guildId: GuildId,
     task: () => Promise<T>,
@@ -9028,6 +9211,7 @@ export class RelayServer {
       this.peerCatchupTimer = undefined;
     }
     clearInterval(this.pruneTimer);
+    await this.consensusV2?.close();
     if (this.checkpointTimer) {
       clearInterval(this.checkpointTimer);
     }

@@ -17,6 +17,7 @@ export class StaticShardUploadCache {
       return bytes;
     } catch (error: any) { if (error.code === 'ENOENT') return undefined; throw error; }
   }
+  async size(hash: string) { try { return (await stat(this.file(hash))).size; } catch(error:any) { if(error.code==='ENOENT') return undefined; throw error; } }
   async put(hash: string, bytes: Buffer) {
     if (createHash('sha256').update(bytes).digest('hex') !== hash) throw new Error('Upload content hash mismatch.');
     const operation = this.queue.then(async () => {

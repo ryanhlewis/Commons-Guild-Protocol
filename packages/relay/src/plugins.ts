@@ -1,5 +1,10 @@
 import { reassembleStaticFiles } from "./static_shard_chunks.js";
+import { staticShardListingAttribution } from "./static_shard_listing.js";
+import { RawPinnedMedia } from './raw_pinned_media.js';
 import { StaticShardUploadCache } from "./static_shard_upload_cache.js";
+import { staticShardZipReservation, staticShardChunkReservation } from './static_shard_reservation.js';
+import { StorageAdmission, AdmissionError } from './storage_admission.js';
+import { admissionWorkValid } from '@cgp/core';
 import type { IncomingMessage, ServerResponse } from "http";
 import { request as httpRequest } from "http";
 import { request as httpsRequest } from "https";
@@ -7,7 +12,7 @@ import { once } from "node:events";
 import { spawn } from "node:child_process";
 import { createHash, createHmac, createSign, randomUUID, timingSafeEqual } from "crypto";
 import { createReadStream, createWriteStream } from "node:fs";
-import { appendFile, mkdir, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, readdir, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { gzipSync, gunzipSync } from "node:zlib";
 import type { WebSocket } from "ws";
@@ -475,6 +480,9 @@ export interface StaticShardSeedPolicy {
   autoIngest?: boolean;
   maxShardBytes?: number;
   uploadMaxBytes?: number;
+  /** Operator-selected proof cost, 0 disables work on explicitly private/test relays. */
+  uploadWorkBits?: number;
+  storageAdmission?: Partial<import('./storage_admission').StorageAdmissionPolicy>;
   maxManifestBytes?: number;
   requestTimeoutMs?: number;
   /** Append-only registry entries written before an atomic snapshot compaction. */
@@ -1937,6 +1945,7 @@ export function createHollowRoomRelayPlugin(
   policy: HollowRoomRelayPolicy = {},
 ): RelayPlugin {
   const rooms = new Map<string, Map<string, HollowRoomPeer>>();
+  const callStarts = new Map<string, number>();
   const socketMemberships = new WeakMap<WebSocket, HollowRoomMembership>();
   const closeListeners = new WeakSet<WebSocket>();
   const maxPeersPerRoom =
@@ -1963,6 +1972,7 @@ export function createHollowRoomRelayPlugin(
     room.delete(membership.peerId);
     if (room.size === 0) {
       rooms.delete(membership.roomId);
+      callStarts.delete(membership.roomId);
     }
 
     for (const peer of room.values()) {
@@ -1970,7 +1980,11 @@ export function createHollowRoomRelayPlugin(
         roomId: membership.roomId,
         peerId: membership.peerId,
         metadata: leaving?.metadata,
+        joinedAt: leaving?.joinedAt, leftAt: Date.now(), callStartedAt: callStarts.get(membership.roomId),
       });
+    }
+    if (![...room.values()].some((peer) => membership.roomId.startsWith("server:") || peer.metadata?.kind === "call")) {
+      callStarts.delete(membership.roomId);
     }
   };
 
@@ -2081,6 +2095,7 @@ export function createHollowRoomRelayPlugin(
           joinedAt: Date.now(),
         };
         room.set(peerId, peer);
+        if ((roomId.startsWith('server:') || metadata?.kind === 'call') && !callStarts.has(roomId)) callStarts.set(roomId, peer.joinedAt);
         socketMemberships.set(socket, { roomId, peerId });
         if (!closeListeners.has(socket)) {
           closeListeners.add(socket);
@@ -2092,6 +2107,7 @@ export function createHollowRoomRelayPlugin(
           roomId,
           peerId,
           peers: existingPeers,
+          joinedAt: peer.joinedAt, callStartedAt: callStarts.get(roomId), serverNow: Date.now(),
         });
         for (const existing of room.values()) {
           if (existing.peerId === peerId) {
@@ -2101,6 +2117,7 @@ export function createHollowRoomRelayPlugin(
             roomId,
             peerId,
             metadata,
+            joinedAt: peer.joinedAt, callStartedAt: callStarts.get(roomId),
           });
         }
         return true;
@@ -4604,6 +4621,7 @@ export function createHeliaIpfsPlugin(
   );
 
   let helia: any;
+  const rawPinnedMedia = new RawPinnedMedia(storeDir, importEsm);
   let unix: any;
   let cidModule: any;
   let multiaddrModule: any;
@@ -4795,6 +4813,7 @@ export function createHeliaIpfsPlugin(
         }
       }
       await provideCid(cid);
+      if (input.pin !== false && input.mimeType?.startsWith('image/')) await rawPinnedMedia.register({cid:cidString,sha256,bytes:bytes.byteLength,mimeType:input.mimeType});
       return {
         providerId: id,
         backend: "helia",
@@ -5073,6 +5092,12 @@ export function createHeliaIpfsPlugin(
           return true;
         }
         try {
+          if (pathSegments.length === 3) {
+            const media = await rawPinnedMedia.read(cidValue);
+            if (media) {
+              res.statusCode=200;res.setHeader('Content-Type',media.mimeType);res.setHeader('Content-Length',media.bytes.length);res.setHeader('Cache-Control','public, max-age=31536000, immutable');res.setHeader('X-IPFS-CID',cidValue);res.setHeader('X-Content-Type-Options','nosniff');res.end(media.bytes);return true;
+            }
+          }
           await ensureStarted();
           const parsed = cidModule.CID.parse(cidValue);
           const requestUrl = new URL(req.url || "/", "http://localhost");
@@ -5319,6 +5344,7 @@ interface IngestedStaticShardRelease {
   creatorName?: string;
   creatorUsername?: string;
   creatorAvatar?: string;
+  previewUrl?: string;
   creatorBio?: string;
   source?: Record<string, unknown>;
   sourceBranch?: string;
@@ -6296,6 +6322,9 @@ function normalizeStaticShardDisplayMetadata(
     numberField(releaseViewport, "height");
 
   const display: Record<string, unknown> = {};
+  if (manifestDisplay.crossOriginIsolated === true || releaseDisplay.crossOriginIsolated === true) {
+    display.crossOriginIsolated = true;
+  }
   if (aspectRatio) display.aspectRatio = aspectRatio;
   if (viewportWidth && viewportHeight) {
     display.viewport = { width: viewportWidth, height: viewportHeight };
@@ -6821,6 +6850,22 @@ export function createStaticShardSeedPlugin(
       rememberRelease(release);
     }
     registryJournalEntries = journal.entries;
+    // Older registries discarded this signed display requirement. Recover it
+    // from the original hash-checked release without changing artifact bytes.
+    for (const release of releases.values()) {
+      if (release.display?.crossOriginIsolated === true) continue;
+      if (!release.manifests.length && !release.shards.length) continue;
+      try {
+        const releaseFile = path.join(storeDir, staticShardStoreReleasePrefix(release.id, release.version), "release.json");
+        assertInsideDirectory(storeDir, releaseFile);
+        const bytes = await readFile(releaseFile);
+        if (createHash("sha256").update(bytes).digest("hex") !== release.releaseSha256) continue;
+        const raw = JSON.parse(bytes.toString("utf8"));
+        if (raw.display?.crossOriginIsolated === true) {
+          release.display = { ...release.display, crossOriginIsolated: true };
+        }
+      } catch { /* Missing original files cannot grant an isolation requirement. */ }
+    }
     if (journal.invalidEntries > 0) {
       const repaired = journal.releases.length > 0
         ? `${journal.releases.map((release) => JSON.stringify(release)).join("\n")}\n`
@@ -6925,6 +6970,9 @@ export function createStaticShardSeedPlugin(
     req?: IncomingMessage,
   ) => ({
     ...release,
+    ...gameSocialRoutes(release),
+    updatedAt: new Date(release.listingUpdatedAt || release.storedAt).toISOString(),
+    retention: storageAdmission.retention(staticShardStoreReleasePrefix(release.id,release.version)),
     isCurrentRelease: latestReleaseKeyByGameId.get(release.id) === staticShardReleaseKey(release.id, release.version),
     publisherVerification: release.publisher
       ? "verified"
@@ -6941,6 +6989,24 @@ export function createStaticShardSeedPlugin(
     iconUrl: releaseAssetUrl(release, release.icon, req),
   });
 
+  const gameSocialRoutes = (release: IngestedStaticShardRelease) => {
+    if (!createGameGuilds || release.type !== "game") return {};
+    const guildId = staticShardGameGuildId(release.id);
+    const community = isRecord(release.source?.community) ? release.source.community : undefined;
+    const fork = isRecord(release.source?.fork) ? release.source.fork : undefined;
+    const configured = process.env.CGP_STATIC_SHARD_COMMUNITY_LINKS_JSON;
+    const links = configured ? JSON.parse(configured) : {};
+    const configuredDestination = typeof links[release.id] === "string" ? links[release.id] : "";
+    const destination = stringField(community, "guildId") || stringField(fork, "parentGuildId") || configuredDestination;
+    return {
+      guildId,
+      chatChannelId: hashObject({ kind: "cgp-static-shard-game-social-channel", id: release.id, name: "chat" }),
+      commentsChannelId: hashObject({ kind: "cgp-static-shard-game-social-channel", id: release.id, name: "comments" }),
+      voiceChannelId: hashObject({ kind: "cgp-static-shard-game-social-channel", id: release.id, name: "Lobby" }),
+      communityGuildId: /^[a-f0-9]{64}$/i.test(destination) ? destination : guildId,
+    };
+  };
+
   const registerReleaseInCgp = async (release: IngestedStaticShardRelease) => {
     const ctx = ctxRef;
     if (!ctx || !createGameGuilds) return release;
@@ -6955,6 +7021,8 @@ export function createStaticShardSeedPlugin(
         description:
           `CGP mirror for ${release.title} static shard releases.`,
         flags: { allowForksBy: "any" },
+        access: "public",
+        policies: { posting: "public" },
       } as EventBody);
       await ctx.publishAsRelay({
         type: "CHANNEL_CREATE",
@@ -6965,6 +7033,32 @@ export function createStaticShardSeedPlugin(
         topic:
           "Verified static source/media shards mirrored by this CGP relay.",
       } as EventBody);
+      state = await ctx.getState?.(guildId);
+    }
+
+    // The catalog's social routes must refer to real channels, not client shells.
+    // Repair partial publication idempotently, including after registry restore.
+    if (release.type === "game") {
+      const routes = gameSocialRoutes(release);
+      for (const channel of [
+        { channelId: routes.chatChannelId, name: "chat", kind: "text" },
+        { channelId: routes.commentsChannelId, name: "comments", kind: "text" },
+        { channelId: routes.voiceChannelId, name: "Lobby", kind: "voice" },
+      ]) {
+        if (channel.channelId && !state?.channels?.has(channel.channelId)) {
+          await ctx.publishAsRelay({ type: "CHANNEL_CREATE", guildId, ...channel } as EventBody);
+        }
+      }
+      state = await ctx.getState?.(guildId);
+    }
+    if (release.publisher) {
+      const roleId = hashObject({ kind: "cgp-static-shard-publisher-role", id: release.id });
+      if (!state?.roles?.has(roleId)) {
+        await ctx.publishAsRelay({ type: "ROLE_UPSERT", guildId, roleId, name: "Publisher", permissions: ["administrator"] } as EventBody);
+      }
+      if (!state?.members?.get(release.publisher.publicKey)?.roles.has(roleId)) {
+        await ctx.publishAsRelay({ type: "ROLE_ASSIGN", guildId, roleId, userId: release.publisher.publicKey } as EventBody);
+      }
       state = await ctx.getState?.(guildId);
     }
     // A guild can arrive through federation before its release channel (or a
@@ -6996,8 +7090,22 @@ export function createStaticShardSeedPlugin(
     const existingSha = isRecord(existingRelease?.value)
       ? stringField(existingRelease?.value, "releaseSha256")
       : "";
+    const social = gameSocialRoutes(release);
+    const existingHome = findStaticShardAppObject(state, hollowHomeNamespace, "game-profile", `game:${release.id}`);
+    const routesMatch = stringField(existingRelease?.value, "commentsChannelId") === (social.commentsChannelId || "") &&
+      stringField(existingRelease?.value, "communityGuildId") === (social.communityGuildId || "");
+    const releaseMatches = existingSha === release.releaseSha256 &&
+      (Number(existingRelease?.value?.listingRevision) || 0) === (release.listingRevision || 0) && routesMatch;
+    if (releaseMatches && (!publishHollowHomeObjects || release.type !== "game" ||
+      (stringField(existingHome?.value, "commentsChannelId") === social.commentsChannelId &&
+       stringField(existingHome?.value, "communityGuildId") === social.communityGuildId &&
+       stringField(existingHome?.value, "updatedAt") === new Date(release.listingUpdatedAt || release.storedAt).toISOString()))) {
+      release.guildId = guildId;
+      release.channelId = channelId;
+      return release;
+    }
     if (existingSha !== release.releaseSha256 ||
-        (Number(existingRelease?.value?.listingRevision) || 0) !== (release.listingRevision || 0)) {
+        (Number(existingRelease?.value?.listingRevision) || 0) !== (release.listingRevision || 0) || !routesMatch) {
       await ctx.publishAsRelay({
         type: "APP_OBJECT_UPSERT",
         guildId,
@@ -7007,6 +7115,7 @@ export function createStaticShardSeedPlugin(
         channelId,
         value: {
           id: release.id,
+          ...gameSocialRoutes(release),
           isCurrentRelease: !latest || latest.storedAt <= release.storedAt,
           title: release.title,
           description: release.description,
@@ -7017,6 +7126,7 @@ export function createStaticShardSeedPlugin(
           creatorName: release.creatorName,
           creatorUsername: release.creatorUsername,
           creatorAvatar: releaseAssetUrl(release, release.creatorAvatar),
+          previewUrl: releaseAssetUrl(release, release.previewUrl),
           creatorBio: release.creatorBio,
           display: release.display,
           network: release.network,
@@ -7120,6 +7230,7 @@ export function createStaticShardSeedPlugin(
           serveMode: releaseEffectiveServeMode(release),
           guildId,
           creatorId,
+          ...gameSocialRoutes(release),
           updatedAt: new Date(release.listingUpdatedAt || release.storedAt).toISOString(),
         },
       } as EventBody);
@@ -7213,7 +7324,9 @@ export function createStaticShardSeedPlugin(
       release.version,
       releaseDownload.sha256,
     );
-    if (existingRelease) return registerReleaseInCgp(existingRelease);
+    if (existingRelease && await stat(path.join(storeDir,staticShardStoreReleasePrefix(release.id,release.version),'release.json')).then(()=>true,()=>false)) {
+      return registerReleaseInCgp(existingRelease);
+    }
     const releaseMaxShardBytes =
       release.shardPolicy?.maxShardBytes &&
       release.shardPolicy.maxShardBytes > 0
@@ -7225,6 +7338,8 @@ export function createStaticShardSeedPlugin(
     );
     const releaseDir = path.join(storeDir, releasePrefix);
     assertInsideDirectory(storeDir, releaseDir);
+    const reservation=releaseDownload.buffer.byteLength+2048+Object.keys(release.manifests??{}).length*maxManifestBytes+release.shards.reduce((sum,shard)=>sum+(shard.bytes||releaseMaxShardBytes)+256,0)+(extractPlayable?maxExtractedBytes:0);
+    return storageAdmission.run(publisher?.publicKey || 'operator',releasePrefix,reservation,Date.now()+retentionMs+90*86400000,pinToIpfs,async()=>{
     await mkdir(releaseDir, { recursive: true });
     const unpackedRoot = staticShardReleaseUnpackedRoot(storeDir, release.id, release.version);
     assertInsideDirectory(storeDir, unpackedRoot);
@@ -7425,6 +7540,7 @@ export function createStaticShardSeedPlugin(
     }
     return ingested;
     });
+    });
   };
 
   const ingestCatalog = async (source: StaticShardSeedSource) => {
@@ -7495,6 +7611,26 @@ export function createStaticShardSeedPlugin(
   };
 
   const uploadCache = new StaticShardUploadCache(path.join(storeDir, "pending-upload-blobs"));
+  const retentionMs = positiveIntegerFromEnv('CGP_STATIC_SHARD_RETENTION_DAYS',365) * 86400000;
+  const storageAdmission = new StorageAdmission(storeDir, {
+    totalBytes: positiveIntegerFromEnv('CGP_STATIC_SHARD_STORE_MAX_BYTES',10 * 1024 ** 3),
+    publisherBytes: positiveIntegerFromEnv('CGP_STATIC_SHARD_PUBLISHER_MAX_BYTES',1024 ** 3),
+    pinBytes: positiveIntegerFromEnv('CGP_STATIC_SHARD_PIN_MAX_BYTES',2 * 1024 ** 3),
+    publisherPinBytes: positiveIntegerFromEnv('CGP_STATIC_SHARD_PUBLISHER_PIN_MAX_BYTES',512 * 1024 ** 2),
+    minimumFreeBytes: positiveIntegerFromEnv('CGP_STATIC_SHARD_MIN_FREE_BYTES',512 * 1024 ** 2),
+    maxConcurrent: positiveIntegerFromEnv('CGP_STATIC_SHARD_MAX_CONCURRENT_UPLOADS',2),
+    requestsPerMinute: positiveIntegerFromEnv('CGP_STATIC_SHARD_IP_REQUESTS_PER_MINUTE',30),
+    networkRequestsPerMinute: positiveIntegerFromEnv('CGP_STATIC_SHARD_NETWORK_REQUESTS_PER_MINUTE',90),
+    globalRequestsPerMinute: positiveIntegerFromEnv('CGP_STATIC_SHARD_REQUESTS_PER_MINUTE',300),
+    ...policy.storageAdmission
+  }, process.env.CGP_STATIC_SHARD_TRUST_PROXY === '1');
+  const pinPublishers = new Set((process.env.CGP_STATIC_SHARD_PIN_PUBLISHERS || '').split(',').map(key=>key.trim().toLowerCase()).filter(Boolean));
+  const uploadWorkBits = policy.uploadWorkBits ?? positiveIntegerFromEnv('CGP_STATIC_SHARD_WORK_BITS',16);
+  if(!Number.isInteger(uploadWorkBits)||uploadWorkBits<0||uploadWorkBits>20)throw new Error('Invalid upload admission difficulty');
+  let cleanupTimer: ReturnType<typeof setInterval> | undefined;
+  let restoringClosed = false;
+  let restoreCommunities: Promise<void> | undefined;
+  let restoreAdmissions: Promise<void> | undefined;
   const uploadReferences = (release: ReturnType<typeof normalizeStaticShardRelease>) => [
     ...Object.values(release.manifests ?? {}), ...release.shards
   ];
@@ -7503,6 +7639,8 @@ export function createStaticShardSeedPlugin(
     const publisher = verifyStaticShardReleasePublisher(raw, { deviceAuthorityRegistry: publisherDeviceAuthorities });
     const release = normalizeStaticShardRelease(raw);
     assertPublisherContinuity(release.id, publisher, { requireSigned: true });
+    storageAdmission.admitPublisher(publisher!.publicKey);
+    if (uploadWorkBits && !admissionWorkValid(createHash('sha256').update(staticShardUploadReleaseBytes(body,maxManifestBytes)).digest('hex'),body.admissionNonce,uploadWorkBits)) throw new AdmissionError('Upload admission work required',428);
     const references = uploadReferences(release);
     if (references.length > maxExtractedFiles) throw new Error("Too many upload references.");
     if (write) {
@@ -7510,7 +7648,7 @@ export function createStaticShardSeedPlugin(
       if (files.size !== 1) throw new Error("Upload exactly one content blob at a time.");
       for (const file of files.values()) {
         if (!references.some(ref => ref.path === file.path && ref.sha256 === file.sha256)) throw new Error("Blob is not authorized by this signed release.");
-        await uploadCache.put(file.sha256, file.buffer);
+        if (!await uploadCache.get(file.sha256)) await storageAdmission.run(publisher!.publicKey, `pending-upload-blobs/${file.sha256}`, file.bytes, Date.now()+86400000, false, () => uploadCache.put(file.sha256, file.buffer));
       }
       return { ok: true };
     }
@@ -7539,6 +7677,8 @@ export function createStaticShardSeedPlugin(
     const publisher = verifyStaticShardReleasePublisher(releaseJson, {
       deviceAuthorityRegistry: publisherDeviceAuthorities,
     });
+    if (publisher) storageAdmission.admitPublisher(publisher.publicKey);
+    if (uploadWorkBits && !admissionWorkValid(releaseSha256,body.admissionNonce,uploadWorkBits)) throw new AdmissionError('Upload admission work required',428);
     const release = normalizeStaticShardRelease(releaseJson);
     return withGameIngestLock(release.id, async () => {
     assertPublisherContinuity(release.id, publisher, {
@@ -7549,7 +7689,9 @@ export function createStaticShardSeedPlugin(
       release.version,
       releaseSha256,
     );
-    if (existingRelease) return registerReleaseInCgp(existingRelease);
+    if (existingRelease && await stat(path.join(storeDir,staticShardStoreReleasePrefix(release.id,release.version),'release.json')).catch(()=>undefined)) {
+      return registerReleaseInCgp(existingRelease);
+    }
     const releaseMaxShardBytes =
       release.shardPolicy?.maxShardBytes &&
       release.shardPolicy.maxShardBytes > 0
@@ -7566,6 +7708,37 @@ export function createStaticShardSeedPlugin(
       const buffer = await uploadCache.get(hash);
       return buffer ? { path: relative, buffer, bytes: buffer.length, sha256: hash } : undefined;
     };
+    let reservation = releaseBuffer.length + 2048;
+    for (const ref of uploadReferences(release)) {
+      const provided = uploadFiles.get(ref.path);
+      const bytes = provided?.bytes ?? (ref.sha256 ? await uploadCache.size(ref.sha256) : undefined);
+      if (bytes === undefined) throw new Error(`Upload is missing ${ref.path}`);
+      reservation += bytes + 256;
+    }
+    if (extractPlayable) {
+      // Verified redirects retain their existing conservative reservation.
+      // Local uploads reserve authenticated ZIP contents rather than charging
+      // every tiny release for the operator's entire extraction allowance.
+      if (allowVerifiedRedirects && servePlayableMode === 'redirect' && release.hosting) {
+        reservation += maxExtractedBytes;
+      } else {
+        let plannedBytes = 0, plannedFiles = 0;
+        for (const shard of release.shards) {
+          if (path.extname(shard.path).toLowerCase() !== '.zip') continue;
+          const upload = await getUpload(safeStaticRelativePath(shard.path), shard.sha256);
+          if (!upload || upload.sha256 !== shard.sha256 || upload.bytes > releaseMaxShardBytes)
+            throw new Error(`Invalid uploaded shard ${shard.id}.`);
+          const planned = staticShardZipReservation(upload.buffer, {
+            bytes: maxExtractedBytes - plannedBytes,
+            files: maxExtractedFiles - plannedFiles,
+          }, name => Boolean(safeStaticRelativePath(name)));
+          plannedBytes += planned.bytes; plannedFiles += planned.files;
+        }
+        reservation += plannedBytes + staticShardChunkReservation(release.fileChunks, maxExtractedBytes, maxExtractedFiles);
+      }
+    }
+    const admittedPinning = pinToIpfs && !!publisher && pinPublishers.has(publisher.publicKey);
+    return storageAdmission.run(publisher?.publicKey || 'operator', staticShardStoreReleasePrefix(release.id,release.version), reservation, Date.now()+retentionMs+90*86400000, admittedPinning, async () => {
     const releasePrefix = staticShardStoreReleasePrefix(
       release.id,
       release.version,
@@ -7680,7 +7853,7 @@ export function createStaticShardSeedPlugin(
       }
       let ipfsCid: string | undefined;
       let ipfsPinnedGatewayUrl: string | undefined;
-      if (pinToIpfs) {
+      if (admittedPinning) {
         const backend = preferredIpfsBackend();
         if (backend) {
           const added = await backend.addFile({
@@ -7782,6 +7955,7 @@ export function createStaticShardSeedPlugin(
       await persist(ingested);
     }
     return ingested;
+    });
     });
   };
 
@@ -8000,6 +8174,16 @@ export function createStaticShardSeedPlugin(
       return;
     }
 
+    // Threaded WASM needs isolation on the document AND worker responses.
+    // Apply the signed release requirement consistently on local relays too.
+    // Every hosted game can embed in Hollow's isolated SPA. Ordinary games
+    // retain their persistent origin and may load public media without CORP;
+    // threaded releases keep their signed, stricter require-corp policy.
+    res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+    res.setHeader("Cross-Origin-Embedder-Policy",
+      release.display?.crossOriginIsolated === true ? "require-corp" : "credentialless");
+    res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+
     const safeRel = safeStaticRelativePath(relPath);
     const relForExternal = safeRel || release.entryPath || undefined;
     if (allowVerifiedRedirects && releaseEffectiveServeMode(release) === "redirect") {
@@ -8065,6 +8249,13 @@ export function createStaticShardSeedPlugin(
     if (!release.unpacked) {
       return false;
     }
+    // Every hosted game can embed in Hollow's isolated SPA. Ordinary games
+    // retain their persistent origin and may load public media without CORP;
+    // threaded releases keep their signed, stricter require-corp policy.
+    res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+    res.setHeader("Cross-Origin-Embedder-Policy",
+      release.display?.crossOriginIsolated === true ? "require-corp" : "credentialless");
+    res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
     const unpackedRoot = staticShardReleaseUnpackedRoot(storeDir, release.id, release.version);
     for (const candidate of staticShardPlayablePathCandidates(release, relPath)) {
       const resolved = path.join(unpackedRoot, candidate);
@@ -8217,12 +8408,40 @@ export function createStaticShardSeedPlugin(
     },
     onInit: async (ctx) => {
       ctxRef = ctx;
-      initPromise = autoIngest
-        ? ingestConfiguredSources()
-        : (async () => {
-            await loadPersistedReleases();
-          })();
+      initPromise = (async()=>{
+      await loadPersistedReleases();
+      const restored = [...releases.values()].filter((release) =>
+        release.guildId || release.shards.length || release.manifests.length || release.externalEntryUrl);
+      const restore = async (entries: IngestedStaticShardRelease[]) => {
+        for (const release of entries) {
+          if (restoringClosed) break;
+          try { await registerReleaseInCgp(release); }
+          catch (error) { rememberError(`restore-community:${release.id}@${release.version}`, error); }
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        }
+      };
+      // Bound cold startup even for huge catalogs. Small deployments are ready
+      // immediately; remaining repairs run cooperatively and stop on shutdown.
+      await restore(restored.slice(0, 32));
+      restoreCommunities = restore(restored.slice(32));
+      restoreAdmissions = (async () => {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      for (const release of restored) {
+        if (restoringClosed) return;
+        await storageAdmission.seed(release.publisher?.publicKey || 'operator',staticShardStoreReleasePrefix(release.id,release.version),Date.now()+retentionMs+90*86400000,release.shards.some(shard=>!!shard.ipfsCid),false);
+      }
+      for(const file of await readdir(path.join(storeDir,'pending-upload-blobs')).catch(()=>[]))if(/^[a-f0-9]{64}$/.test(file)){
+        const relative=`pending-upload-blobs/${file}`,info=await stat(path.join(storeDir,relative));
+        await storageAdmission.seed('legacy-staging',relative,Math.floor(info.mtimeMs)+86400000,false,false);
+      }
+      await storageAdmission.cleanup();
+      })();
+      void restoreAdmissions.catch((error) => rememberError("restore-storage-admission", error));
+      if(autoIngest)await ingestConfiguredSources();
+      })();
       await initPromise;
+      cleanupTimer=setInterval(()=>void storageAdmission.cleanup().catch(error=>console.error('Storage retention cleanup failed',error.message)),3600000);
+      cleanupTimer.unref?.();
     },
     onHttp: async ({ req, res, pathname, pathSegments }) => {
       if (pathSegments[0] !== "cgp.static-shards") {
@@ -8245,6 +8464,18 @@ export function createStaticShardSeedPlugin(
       }
       await initPromise;
       const action = pathSegments[1] || "status";
+      // Quotas must be restored before accepting new bytes. Catalog reads and
+      // unrelated chat/voice traffic do not need to wait for filesystem scans.
+      if (req.method === "POST") await restoreAdmissions;
+      let leaveUpload: (()=>void) | undefined;
+      let uploadTimeout: ReturnType<typeof setTimeout> | undefined;
+      if (req.method === 'POST' && ['upload','upload-blob','upload-status','listing','retain'].includes(action)) {
+        try {
+          leaveUpload=storageAdmission.enter(req);
+          uploadTimeout=setTimeout(()=>{if(!req.complete)req.destroy(new Error('Upload body timed out'));},30000);
+        } catch(error:any) {res.setHeader('Retry-After','60');sendJson(res,error.status || 429,{ok:false,error:error.message});return true;}
+      }
+      try {
       if (action === "status" && req.method === "GET") {
         sendJson(res, 200, {
           ok: true,
@@ -8252,6 +8483,12 @@ export function createStaticShardSeedPlugin(
           sourceCount: sources.length,
           autoIngest,
           pinToIpfs,
+          uploadWorkBits,
+          storageAdmission: storageAdmission.policy,
+          retentionDays: retentionMs / 86400000,
+          retentionGraceDays: 90,
+          publicPinning: false,
+          pinPublisherCount: pinPublishers.size,
           uploadMaxBytes,
           ipfsApiConfigured: Boolean(ipfsApiUrl),
           ipfsBackendId,
@@ -8278,6 +8515,15 @@ export function createStaticShardSeedPlugin(
         const requestUrl = new URL(req.url || "/", "http://localhost");
         const gameId = requestUrl.searchParams.get("id")?.trim() || "";
         const query = requestUrl.searchParams.get("q")?.trim() || "";
+        const creator = requestUrl.searchParams.get("creator")?.trim().toLowerCase() || "";
+        if (creator) {
+          if (creator.length > 200) { sendJson(res, 400, {ok:false,error:'Invalid creator handle.'}); return true; }
+          const matches = gameCatalogIds.map(id => latestReleaseForGameId(id)).filter((release): release is IngestedStaticShardRelease => Boolean(release) && release!.creatorUsername?.trim().toLowerCase() === creator);
+          const cursor = Math.max(0, Math.floor(Number(requestUrl.searchParams.get('creatorOffset')) || 0));
+          const selected = matches.slice(cursor, cursor + 64);
+          sendJson(res, 200, {ok:true, total:matches.length, releases:selected.map(release=>publicReleasePayload(release,req)), page:{hasMore:cursor+selected.length<matches.length,nextOffset:cursor+selected.length}});
+          return true;
+        }
         if (gameId) {
           sendJson(res, 200, catalogLookupPayload(req, gameId));
           return true;
@@ -8340,12 +8586,14 @@ export function createStaticShardSeedPlugin(
           const claim = await readJsonRequestBody(req, maxManifestBytes);
           if (claim.kind !== "cgp-game-listing-update/1") throw new Error("Invalid listing update protocol.");
           const publisher = verifyStaticShardReleasePublisher(claim, { deviceAuthorityRegistry: publisherDeviceAuthorities });
+          if (publisher) storageAdmission.admitPublisher(publisher.publicKey);
           const id = stringField(claim, "id");
           const version = stringField(claim, "version");
           const updated = await withGameIngestLock(id, async () => {
             assertPublisherContinuity(id, publisher, {requireSigned: true});
             const existing = releases.get(staticShardReleaseKey(id, version));
             if (!existing || existing.releaseSha256 !== claim.releaseSha256) throw new Error("Listing target release was not found.");
+            if(Number.isSafeInteger(claim.timestamp)&&Math.abs(Date.now()-Number(claim.timestamp))<=300000)await storageAdmission.renew(publisher!.publicKey,staticShardStoreReleasePrefix(id,version),Date.now()+retentionMs+90*86400000);
             if (existing.listingClaim && hashObject(staticShardReleaseSigningPayload(existing.listingClaim)) === hashObject(staticShardReleaseSigningPayload(claim))) {
               await registerReleaseInCgp(existing);
               return existing;
@@ -8354,6 +8602,7 @@ export function createStaticShardSeedPlugin(
             const title = stringField(claim, "title").trim();
             if (!title || title.length > 200) throw new Error("Listing title must be 1–200 characters.");
             const next: IngestedStaticShardRelease = {...existing, title,
+              ...staticShardListingAttribution(claim),
               description: stringField(claim, "description").slice(0, 8000),
               thumbnail: stringField(claim, "thumbnail").slice(0, 2048) || undefined,
               listingRevision: (existing.listingRevision || 0) + 1, listingUpdatedAt: Date.now(), listingClaim: claim};
@@ -8364,11 +8613,32 @@ export function createStaticShardSeedPlugin(
         } catch (error: any) { sendJson(res, 409, {ok: false, error: error?.message || "Listing update failed."}); }
         return true;
       }
+      if (action==='retain' && req.method==='POST') {
+        try {
+          const claim=await readJsonRequestBody(req,32768);
+          if(claim.kind!=='cgp-static-shard-retention/1'||!Number.isSafeInteger(claim.timestamp)||Math.abs(Date.now()-Number(claim.timestamp))>300000)throw new AdmissionError('A fresh signed retention request is required',403);
+          const publisher=verifyStaticShardReleasePublisher(claim,{deviceAuthorityRegistry:publisherDeviceAuthorities});
+          if(!publisher)throw new AdmissionError('Publisher signature required',403);
+          storageAdmission.admitPublisher(publisher.publicKey);
+          const id=stringField(claim,'id'),version=stringField(claim,'version');
+          const retained=await withGameIngestLock(id,async()=>{
+            assertPublisherContinuity(id,publisher,{requireSigned:true});
+            const existing=releases.get(staticShardReleaseKey(id,version));
+            if(!existing||existing.releaseSha256!==claim.releaseSha256)throw new AdmissionError('Retention target not found',404);
+            const relative=staticShardStoreReleasePrefix(id,version);
+            if(!storageAdmission.retention(relative))throw new AdmissionError('Stored content expired; upload its original signed release again',410);
+            await storageAdmission.renew(publisher.publicKey,relative,Date.now()+retentionMs+90*86400000);
+            return existing;
+          });
+          sendJson(res,200,{ok:true,release:publicReleasePayload(retained,req)});
+        } catch(error:any){sendJson(res,error.status||400,{ok:false,error:error.message});}
+        return true;
+      }
       if ((action === "upload-status" || action === "upload-blob") && req.method === "POST") {
         try {
           const body = await readJsonRequestBody(req, action === "upload-status" ? maxManifestBytes * 2 : Math.max(maxShardBytes, maxManifestBytes) * 2 + maxManifestBytes * 2);
           sendJson(res, 200, await stageUpload(body, action === "upload-blob"));
-        } catch (error: any) { sendJson(res, 400, { ok: false, error: error?.message || "Unable to stage upload." }); }
+        } catch (error: any) { sendJson(res, error.status || 400, { ok: false, error: error?.message || "Unable to stage upload.", ...(error.status===428?{workBits:uploadWorkBits,protocol:'cgp-upload-admission/1'}:{}) }); }
         return true;
       }
       if (action === "upload" && req.method === "POST") {
@@ -8391,9 +8661,10 @@ export function createStaticShardSeedPlugin(
           });
         } catch (error: any) {
           rememberError("upload", error);
-          sendJson(res, 409, {
+          sendJson(res, error.status || 409, {
             ok: false,
             error: error?.message || "Static shard upload failed.",
+            ...(error.status===428?{workBits:uploadWorkBits,protocol:'cgp-upload-admission/1'}:{})
           });
         }
         return true;
@@ -8423,9 +8694,14 @@ export function createStaticShardSeedPlugin(
       }
       sendJson(res, 404, { ok: false, error: "Unknown static shard route." });
       return true;
+      } finally { if(uploadTimeout)clearTimeout(uploadTimeout);leaveUpload?.(); }
     },
     onClose: async () => {
+      restoringClosed = true;
+      await restoreCommunities;
+      await restoreAdmissions;
       await registryPersistQueue;
+      if (cleanupTimer) clearInterval(cleanupTimer);
     },
   };
 }

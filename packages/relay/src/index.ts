@@ -278,13 +278,14 @@ if (require.main === module) {
       .split(",")
       .map((entry) => entry.trim())
       .filter(Boolean);
+    const pubSubOptions = { authToken: process.env.CGP_RELAY_PUBSUB_AUTH_TOKEN };
     const pubSubAdapter =
       pubSubUrls.length > 1
         ? process.env.CGP_RELAY_PUBSUB_MODE === "redundant"
-          ? new RedundantWebSocketRelayPubSubAdapter(pubSubUrls)
-          : new ShardedWebSocketRelayPubSubAdapter(pubSubUrls)
+          ? new RedundantWebSocketRelayPubSubAdapter(pubSubUrls, pubSubOptions)
+          : new ShardedWebSocketRelayPubSubAdapter(pubSubUrls, pubSubOptions)
         : pubSubUrls.length === 1
-          ? new WebSocketRelayPubSubAdapter(pubSubUrls[0])
+          ? new WebSocketRelayPubSubAdapter(pubSubUrls[0], pubSubOptions)
           : undefined;
     new RelayServer(PORT, DB_PATH, plugins, {
       pubSubAdapter,

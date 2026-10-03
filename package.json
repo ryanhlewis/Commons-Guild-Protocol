@@ -18,6 +18,7 @@
     "loadnet:call-verification": "vitest run packages/tests/src/call_verification_loadnet.test.ts",
     "load:verify": "tsx scripts/verify-load-report.ts",
     "ops:relay": "tsx scripts/relay-ops.ts",
+    "ops:continuity": "npm run build:protocol && tsx scripts/community-continuity-drill.ts",
     "github:backup-app": "tsx scripts/github-backup-app-setup.ts",
     "github:backup-check": "tsx scripts/github-backup-check.ts",
     "ops:drill": "vitest run packages/tests/src/ops_durability.test.ts packages/tests/src/sandboxed_plugin.test.ts",

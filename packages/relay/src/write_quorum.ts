@@ -1,3 +1,4 @@
+import { normalizeRelayVoterMembers } from "./relay_voter_identity";
 import {
   hashObject,
   relayWriteProposalId,
@@ -6,6 +7,10 @@ import {
   type RelayWriteProposal,
   type RelayWriteQuorumVote,
   type RelayWriteQuorumVoteUnsigned,
+  verifyLegacyConsensusRequest, verifyLegacyCertifiedPrefix, legacyConsensusPolicyHash,
+  legacyConsensusRequestPayload, consensusUnsigned,
+  type ConsensusPolicy, type LegacyConsensusTrust, type LegacyConsensusMigrationRequest,
+  type LegacyConsensusFreeze, type LegacyConsensusFreezeRecord, type GuildEvent,
 } from "@cgp/core";
 
 export type {
@@ -25,6 +30,17 @@ export interface RelayWriteQuorumConfig {
 export interface RelayWriteVoteFenceStore {
   getWriteVoteFence(key: string): Promise<string | undefined> | string | undefined;
   putWriteVoteFence(key: string, proposalId: string): Promise<void> | void;
+  getLegacyConsensusFreeze?(guildId: string): Promise<LegacyConsensusFreezeRecord | undefined> | LegacyConsensusFreezeRecord | undefined;
+  putLegacyConsensusFreeze?(guildId: string, record: LegacyConsensusFreezeRecord): Promise<void> | void;
+}
+const legacyGuildQueues = new WeakMap<RelayWriteVoteFenceStore, Map<string, Promise<unknown>>>();
+async function withLegacyGuildMutation<T>(store: RelayWriteVoteFenceStore, guildId: string, operation: () => Promise<T>) {
+  let queues = legacyGuildQueues.get(store);
+  if (!queues) { queues = new Map(); legacyGuildQueues.set(store, queues); }
+  const result = (queues.get(guildId) ?? Promise.resolve()).catch(() => undefined).then(operation);
+  queues.set(guildId, result);
+  void result.finally(() => { if (queues!.get(guildId) === result) queues!.delete(guildId); }).catch(() => undefined);
+  return await result;
 }
 
 export interface RelayWriteVoteTransport {
@@ -42,17 +58,12 @@ interface PendingVoteWaiter {
   timer: NodeJS.Timeout;
 }
 
-function uniqueMembers(members: string[]) {
-  return Array.from(
-    new Set(members.map((member) => member.trim().toLowerCase()).filter(Boolean)),
-  );
-}
 
 export function normalizeRelayWriteQuorumConfig(
   config: RelayWriteQuorumConfig,
 ): Required<RelayWriteQuorumConfig> {
   const epoch = config.epoch?.trim();
-  const members = uniqueMembers(config.members ?? []);
+  const members = normalizeRelayVoterMembers(config.members ?? []);
   if (!epoch) {
     throw new Error("Relay write quorum requires an epoch");
   }
@@ -167,9 +178,35 @@ export class RelayWriteQuorumCoordinator {
     return await this.waitForQuorum(proposalId);
   }
 
+  /** Caller must hold its guild append mutex while supplying the current log. */
+  async freezeGuild(request: LegacyConsensusMigrationRequest, trust: LegacyConsensusTrust,
+    nextPolicy: ConsensusPolicy, readEvents: () => Promise<GuildEvent[]> | GuildEvent[]): Promise<LegacyConsensusFreeze> {
+    if (!this.store.getLegacyConsensusFreeze || !this.store.putLegacyConsensusFreeze) throw Error('Durable legacy retirement storage required');
+    if (!verifyLegacyConsensusRequest(request, request.guildId, nextPolicy, trust) ||
+      legacyConsensusPolicyHash(trust) !== legacyConsensusPolicyHash({ ...trust, policy: this.config })) throw Error('Unauthorized legacy migration');
+    return await withLegacyGuildMutation(this.store, request.guildId, async () => {
+      const existing = await this.store.getLegacyConsensusFreeze!(request.guildId);
+      const requestHash = hashObject(legacyConsensusRequestPayload(request));
+      if (existing) {
+        if (existing.freeze.requestHash !== requestHash) throw Error('Legacy guild already frozen for another migration');
+        return existing.freeze;
+      }
+      const events = await readEvents();
+      verifyLegacyCertifiedPrefix(events, request.guildId, trust);
+      const last = events.at(-1), headSeq = last?.seq ?? -1, headHash = last?.id ?? null;
+      const fenceProposalId = await this.store.getWriteVoteFence(voteFenceKey(this.config.epoch, { guildId: request.guildId, headSeq, headHash })) ?? null;
+      const unsigned = { protocol: 'cgp/legacy-freeze/2' as const, guildId: request.guildId,
+        requestHash, headSeq, headHash, fenceProposalId, relayPublicKey: this.identity.publicKey };
+      const freeze = { ...unsigned, signature: await sign(this.identity.privateKey, hashObject(unsigned)) };
+      await this.store.putLegacyConsensusFreeze!(request.guildId, { request, freeze });
+      return freeze;
+    });
+  }
+
   private async castVote(proposal: RelayWriteProposal, proposalId: string) {
     const fenceKey = voteFenceKey(this.config.epoch, proposal);
-    return await this.withFenceMutation(fenceKey, async () => {
+    return await withLegacyGuildMutation(this.store, proposal.guildId, () => this.withFenceMutation(fenceKey, async () => {
+      if (await this.store.getLegacyConsensusFreeze?.(proposal.guildId)) throw Error('Legacy guild is durably frozen for consensus migration');
       const existingVote = await this.store.getWriteVoteFence(fenceKey);
       if (existingVote && existingVote !== proposalId) {
         throw new Error("Relay already voted for a competing proposal at this guild head");
@@ -198,7 +235,7 @@ export class RelayWriteQuorumCoordinator {
       this.observeVote(vote);
       await this.transport.publish(vote);
       return vote;
-    });
+    }));
   }
 
   private withFenceMutation<T>(key: string, task: () => Promise<T>) {
@@ -223,7 +260,6 @@ export class RelayWriteQuorumCoordinator {
     }
     const proposalId = relayWriteProposalId(this.config.epoch, proposal);
     if (
-      this.votesByProposal.get(proposalId)?.has(this.identity.publicKey.toLowerCase()) ||
       this.proposalsInFlight.has(proposalId)
     ) {
       return false;
