@@ -734,6 +734,28 @@ function validateMemberUpdate(
   );
 }
 
+function validateMemberJoin(
+  state: GuildState,
+  author: string,
+  body: Record<string, unknown>,
+) {
+  if (body.guildId !== state.guildId) {
+    throw new Error("MEMBER_JOIN guildId must match the current guild");
+  }
+  const unexpectedKeys = Object.keys(body).filter(
+    (key) => key !== "type" && key !== "guildId",
+  );
+  if (unexpectedKeys.length > 0) {
+    throw new Error("MEMBER_JOIN only accepts the authenticated author as its member");
+  }
+  if (state.access !== "public") {
+    throw new Error("Only public guilds allow self-join");
+  }
+  if (state.bans.has(author)) {
+    throw new Error(`User ${author} is banned`);
+  }
+}
+
 export function validateEvent(
   state: GuildState,
   event: GuildEvent,
@@ -1053,6 +1075,9 @@ export function validateEvent(
     case "MEMBER_UPDATE":
       validateMemberUpdate(state, author, bodyRecord);
       break;
+    case "MEMBER_JOIN":
+      validateMemberJoin(state, author, bodyRecord);
+      break;
     case "SFU_AUTHORITY_SET":
       if (author !== state.ownerId) {
         throw new Error("Only the guild owner may rotate SFU authorities");
@@ -1080,6 +1105,9 @@ export function validateEvent(
       break;
     }
     default: {
+      if (bodyRecord.type === "PARTY_INVITE_SNAPSHOT" && author !== state.ownerId) {
+        throw new Error("Only the guild owner may publish party invite snapshots");
+      }
       const adminScope = ADMIN_EVENT_TYPES.get(bodyRecord.type);
       if (adminScope) {
         assertCanModerateScope(state, author, bodyRecord.type, adminScope);

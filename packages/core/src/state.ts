@@ -562,6 +562,17 @@ export function applyEvent(state: GuildState, event: GuildEvent, options: { muta
             ensureMembers().set(targetUserId, member);
             break;
         }
+        case "MEMBER_JOIN": {
+            const current = state.members.get(event.author);
+            if (!current) {
+                ensureMembers().set(event.author, {
+                    userId: event.author,
+                    roles: new Set(),
+                    joinedAt: event.createdAt
+                });
+            }
+            break;
+        }
         case "SFU_AUTHORITY_SET": {
             const next = normalizeSfuAuthoritySet(body, event.createdAt);
             const retained = state.sfuAuthoritySets

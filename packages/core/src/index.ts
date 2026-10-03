@@ -12,4 +12,5 @@ export * from "./write_certificate.js";
 export * from "./device_authority.js";
 export * from "./app_object_lease.js";
 export * from "./directory_registration.js";
+export * from "./admission.js";
 export * from "./consensus_v2.js";

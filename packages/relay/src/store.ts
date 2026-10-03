@@ -749,6 +749,16 @@ export class MemoryStore implements Store {
                     joinedAt: event.createdAt
                 });
                 break;
+            case "MEMBER_JOIN": {
+                if (!members.has(event.author)) {
+                    this.setIndexedMember(guildId, members, {
+                        userId: event.author,
+                        roles: [],
+                        joinedAt: event.createdAt
+                    });
+                }
+                break;
+            }
             case "MEMBER_UPDATE": {
                 const userId = typeof body.userId === "string" && body.userId.trim() ? body.userId : event.author;
                 const current = members.get(userId) || { userId, roles: [], joinedAt: event.createdAt };

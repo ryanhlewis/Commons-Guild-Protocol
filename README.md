@@ -1,5 +1,7 @@
 # Commons Guild Protocol (CGP)
 
+Hosting media for Hollow? Read [the operator guide](docs/hollow-media-hosting.md) for GIF/VRM service discovery, uploaded-media storage and the distinction between local gateways, real IPFS networking and synthetic backends.
+
 > **CGP** is a tokenless, forkable, guild-based community chat protocol inspired by Bitcoin’s data structures (hash chains, Merkle trees) but without PoW, mining, or per-message fees.
 
 CGP’s focus:

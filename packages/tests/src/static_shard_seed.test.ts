@@ -10,6 +10,7 @@ import {
     getPublicKey,
     hashObject,
     sign,
+    solveAdmissionWork,
     type DeviceAuthorization,
 } from "@cgp/core";
 import {
@@ -276,6 +277,29 @@ describe("static shard seed plugin", () => {
         })).toThrow("stale revocation epoch");
     });
 
+    it('challenges signed uploads before storage and admits only work for that release',async()=>{
+        const key=generatePrivateKey();
+        const shard=zipTextFiles({'index.html':'<!doctype html><title>Proof Test</title>'});
+        const release=await signStaticShardRelease({kind:'cgp-static-shard-release',schemaVersion:1,id:'admission-game',title:'Admission Game',type:'game',version:'1.0.0',manifests:{},shards:[{id:'source-000',kind:'source',path:'source-000.zip',bytes:shard.length,sha256:sha256(shard)}]},key);
+        const bytes=Buffer.from(JSON.stringify(release)),releaseSha256=sha256(bytes);
+        const storeDir=await fs.mkdtemp(path.join(os.tmpdir(),'cgp-work-upload-'));tempDirs.push(storeDir);
+        const relay=new RelayServer(0,new MemoryStore(),[createStaticShardSeedPlugin({storageAdmission:{minimumFreeBytes:0},storeDir,autoIngest:false,uploadWorkBits:8})],{enableDefaultPlugins:false});relays.push(relay);
+        const port=await waitForPort(relay),envelope={releaseBase64:bytes.toString('base64'),releaseSha256};
+        const post=(body:unknown,route='upload-status')=>fetch(`http://127.0.0.1:${port}/plugins/cgp.static-shards/${route}`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+        const challenge=await post(envelope);expect(challenge.status).toBe(428);expect(await challenge.json()).toMatchObject({protocol:'cgp-upload-admission/1',workBits:8});
+        expect((await post(envelope,'upload')).status).toBe(428);
+        expect((await fs.readdir(storeDir)).includes('games')).toBe(false);
+        const admitted={...envelope,admissionNonce:await solveAdmissionWork(releaseSha256,8),files:[{path:'source-000.zip',bytesBase64:shard.toString('base64'),sha256:sha256(shard)}]};
+        expect((await post(admitted)).status).toBe(200);
+        const upload=await post(admitted,'upload');expect(upload.status,await upload.clone().text()).toBe(201);
+        expect((await upload.json() as any).release.publisher.publicKey).toBe(getPublicKey(key));
+        const retentionClaim={kind:'cgp-static-shard-retention/1',id:'admission-game',version:'1.0.0',releaseSha256,timestamp:Date.now()};
+        const stolen=await signStaticShardRelease(retentionClaim,generatePrivateKey());expect((await post(stolen,'retain')).status).toBe(400);
+        const stale=await signStaticShardRelease({...retentionClaim,timestamp:Date.now()-600000},key);expect((await post(stale,'retain')).status).toBe(403);
+        const renewal=await post(await signStaticShardRelease(retentionClaim,key),'retain');expect(renewal.status,await renewal.clone().text()).toBe(200);
+        expect((await renewal.json() as any).release.retention).toMatchObject({pinned:false});
+    });
+
     it("uploads and restores a delegated-device release under its account owner", async () => {
         const shard = zipTextFiles({ "index.html": "<!doctype html><title>Device Game</title>" });
         const manifest = Buffer.from(JSON.stringify({
@@ -310,7 +334,7 @@ describe("static shard seed plugin", () => {
             const relay = new RelayServer(
                 0,
                 new MemoryStore(),
-                [createStaticShardSeedPlugin({ storeDir, autoIngest: false })],
+                [createStaticShardSeedPlugin({storageAdmission:{minimumFreeBytes:0}, uploadWorkBits:0, storeDir, autoIngest: false })],
                 { enableDefaultPlugins: false },
             );
             relays.push(relay);
@@ -387,7 +411,7 @@ describe("static shard seed plugin", () => {
                 }
             },
             media: { thumbnail: "assets/thumb.png" },
-            display: { aspectRatio: "1 / 1", viewport: { width: 750, height: 750 } },
+            display: { aspectRatio: "1 / 1", viewport: { width: 750, height: 750 }, crossOriginIsolated: true },
             creator: { id: "avera-studio", username: "avera-studio", name: "Avera Studio" },
             tags: ["voxel", "sandbox"]
         }));
@@ -489,7 +513,7 @@ describe("static shard seed plugin", () => {
             0,
             store,
             [
-                createStaticShardSeedPlugin({
+                createStaticShardSeedPlugin({storageAdmission:{minimumFreeBytes:0}, uploadWorkBits:0,
                     sources: [{ url: `${baseUrl}/index.json`, kind: "catalog" }],
                     storeDir,
                     autoIngest: true,
@@ -527,17 +551,20 @@ describe("static shard seed plugin", () => {
             expect(status.releases[0].playUrl).toBe(`http://127.0.0.1:${port}/plugins/cgp.static-shards/play/avera/0.1.0/index.html?world=samples%2Fstarter-haven.litematic&playerView=1&hideChrome=1`);
             expect(status.releases[0].thumbnailUrl).toBe(`http://127.0.0.1:${port}/plugins/cgp.static-shards/play/avera/0.1.0/assets/thumb.png`);
             expect(status.releases[0].creatorId).toBe("avera-studio");
-            expect(status.releases[0].display).toEqual({ aspectRatio: "1 / 1", viewport: { width: 750, height: 750 } });
+            expect(status.releases[0].display).toEqual({ aspectRatio: "1 / 1", viewport: { width: 750, height: 750 }, crossOriginIsolated: true });
             expect(status.releases[0].unpacked).toMatchObject({ files: 6 });
 
             const playableEntry = await fetch(status.releases[0].playUrl);
             expect(playableEntry.status).toBe(200);
+            expect(playableEntry.headers.get("cross-origin-opener-policy")).toBe("same-origin");
+            expect(playableEntry.headers.get("cross-origin-embedder-policy")).toBe("require-corp");
             expect(await playableEntry.text()).toContain("<title>Avera</title>");
 
             const escapedNextChunk = await fetch(`http://127.0.0.1:${port}/plugins/cgp.static-shards/_next/static/chunks/webpack.js`, {
                 headers: { referer: status.releases[0].playUrl }
             });
             expect(escapedNextChunk.status).toBe(200);
+            expect(escapedNextChunk.headers.get("cross-origin-embedder-policy")).toBe("require-corp");
             expect(await escapedNextChunk.text()).toContain("__averaNextChunkLoaded");
 
             const escapedModel = await fetch(`http://127.0.0.1:${port}/plugins/cgp.static-shards/models/Wuhu_Island.glb`, {
@@ -559,7 +586,7 @@ describe("static shard seed plugin", () => {
             expect((releaseObject?.body as any)?.value.releaseSha256).toBe(releaseHash);
             expect((releaseObject?.body as any)?.value.playUrl).toBe(`${status.releases[0].entryServePath}?world=samples%2Fstarter-haven.litematic&playerView=1&hideChrome=1`);
             expect((releaseObject?.body as any)?.value.launchQuery).toBe("world=samples%2Fstarter-haven.litematic&playerView=1&hideChrome=1");
-            expect((releaseObject?.body as any)?.value.display).toEqual({ aspectRatio: "1 / 1", viewport: { width: 750, height: 750 } });
+            expect((releaseObject?.body as any)?.value.display).toEqual({ aspectRatio: "1 / 1", viewport: { width: 750, height: 750 }, crossOriginIsolated: true });
             const homeProfileObject = log.find((event) =>
                 event.body.type === "APP_OBJECT_UPSERT" &&
                 (event.body as any).namespace === "app.hollow.home" &&
@@ -568,7 +595,7 @@ describe("static shard seed plugin", () => {
             );
             expect((homeProfileObject?.body as any)?.value.playUrl).toBe(`${status.releases[0].entryServePath}?world=samples%2Fstarter-haven.litematic&playerView=1&hideChrome=1`);
             expect((homeProfileObject?.body as any)?.value.creatorId).toBe("avera-studio");
-            expect((homeProfileObject?.body as any)?.value.display).toEqual({ aspectRatio: "1 / 1", viewport: { width: 750, height: 750 } });
+            expect((homeProfileObject?.body as any)?.value.display).toEqual({ aspectRatio: "1 / 1", viewport: { width: 750, height: 750 }, crossOriginIsolated: true });
             const homeCreatorObject = log.find((event) =>
                 event.body.type === "APP_OBJECT_UPSERT" &&
                 (event.body as any).namespace === "app.hollow.home" &&
@@ -637,7 +664,7 @@ describe("static shard seed plugin", () => {
         const relay = new RelayServer(
             0,
             new MemoryStore(),
-            [createStaticShardSeedPlugin({
+            [createStaticShardSeedPlugin({storageAdmission:{minimumFreeBytes:0}, uploadWorkBits:0,
                 storeDir,
                 autoIngest: false,
                 registryCompactEvery: 3,
@@ -783,6 +810,9 @@ describe("static shard seed plugin", () => {
 
         const playableEntry = await fetch(uploaded.release.playUrl);
         expect(playableEntry.status).toBe(200);
+        expect(playableEntry.headers.get("cross-origin-opener-policy")).toBe("same-origin");
+        expect(playableEntry.headers.get("cross-origin-embedder-policy")).toBe("credentialless");
+        expect(playableEntry.headers.get("cross-origin-resource-policy")).toBe("cross-origin");
         expect(await playableEntry.text()).toContain("Uploaded Game");
 
         const stalePlayableEntry = await fetch(`http://127.0.0.1:${port}/plugins/cgp.static-shards/play/uploaded-game/0.1.0/index.html`);
@@ -965,7 +995,7 @@ describe("static shard seed plugin", () => {
 
         const restartedStore = new MemoryStore();
         let failListingProfile = false;
-        const restartedPlugin = createStaticShardSeedPlugin({ storeDir, autoIngest: false });
+        const restartedPlugin = createStaticShardSeedPlugin({storageAdmission:{minimumFreeBytes:0}, uploadWorkBits:0, storeDir, autoIngest: false });
         const initializePlugin = restartedPlugin.onInit!;
         restartedPlugin.onInit = async ctx => initializePlugin({...ctx, publishAsRelay: async body => {
             if (failListingProfile && (body as any).objectType === 'game-profile') {
@@ -994,6 +1024,11 @@ describe("static shard seed plugin", () => {
         ]);
         expect(restartedCatalog.releases[1].version).toBe("0.3.0");
         expect(restartedCatalog.releases[1].publisher.publicKey).toBe(publisherPublicKey);
+        const restoredGame = restartedCatalog.releases[1];
+        expect(restoredGame.commentsChannelId).not.toBe(restoredGame.chatChannelId);
+        const restoredEvents = (await restartedStore.getLog(restoredGame.guildId)).map(event => event.body as any);
+        expect(restoredEvents.filter(event => event.type === 'CHANNEL_CREATE').map(event => event.name)).toEqual(expect.arrayContaining(['releases', 'chat', 'comments', 'Lobby']));
+        expect(restoredEvents.filter(event => event.type === 'ROLE_ASSIGN').map(event => event.userId)).toContain(publisherPublicKey);
         const restartedSearchResponse = await fetch(
             `http://127.0.0.1:${restartedPort}/plugins/cgp.static-shards/catalog?q=upload&limit=2`,
         );
@@ -1061,11 +1096,15 @@ describe("static shard seed plugin", () => {
             getPublicKey(attackerPrivateKey),
         ]).toContain(raceLookup.releases[0].publisher.publicKey);
         const listingStage = (body: unknown) => fetch(`http://127.0.0.1:${restartedPort}/plugins/cgp.static-shards/listing`, {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(body)});
-        const listing = await signStaticShardRelease({kind:'cgp-game-listing-update/1', id:'uploaded-game', version:'0.1.0', releaseSha256: sha256(releaseBody), expectedRevision:0, title:'Updated listing', description:'New description', thumbnail:'dist/assets/thumb.png'}, publisherPrivateKey);
+        const listing = await signStaticShardRelease({kind:'cgp-game-listing-update/1', id:'uploaded-game', version:'0.1.0', releaseSha256: sha256(releaseBody), expectedRevision:0, title:'Updated listing', description:'New description', thumbnail:'dist/assets/thumb.png', icon:'https://art.example/game.webp', creatorAvatar:'https://art.example/author.webp', creatorName:'Original Author', creatorUsername:'original-author'}, publisherPrivateKey);
         const listingResponse = await listingStage(listing);
         const listingPayload = await listingResponse.json() as any;
         expect(listingResponse.status, JSON.stringify(listingPayload)).toBe(200);
         expect(listingPayload.release.title).toBe('Updated listing');
+        expect(listingPayload.release.icon).toBe('https://art.example/game.webp');
+        expect(listingPayload.release.creatorName).toBe('Original Author');
+        expect(listingPayload.release.creatorAvatar).toBe('https://art.example/author.webp');
+        expect(listingPayload.release.creatorId).toBe('upload-studio');
         expect(listingPayload.release.releaseSha256).toBe(sha256(releaseBody));
         expect(listingPayload.release.version).toBe('0.1.0');
         expect(listingPayload.release.isCurrentRelease).toBe(false);
@@ -1074,8 +1113,8 @@ describe("static shard seed plugin", () => {
         expect((await listingStage(staleListing)).status).toBe(409);
         const listingGuild = hashObject({kind:'cgp-static-shard-game-guild', id:'uploaded-game'});
         const listingEvents = (await restartedStore.getLog(listingGuild)).map(event => event.body as any);
-        expect(listingEvents.find(event => event.objectType === 'game-release' && event.objectId === 'uploaded-game@0.1.0')?.value.title).toBe('Updated listing');
-        expect(listingEvents.filter(event => event.objectType === 'game-profile')).toHaveLength(0);
+        expect(listingEvents.filter(event => event.objectType === 'game-release' && event.objectId === 'uploaded-game@0.1.0').at(-1)?.value.title).toBe('Updated listing');
+        expect(listingEvents.filter(event => event.objectType === 'game-profile').at(-1)?.value.version).toBe('0.3.0');
         const currentListing = await signStaticShardRelease({...listing, version:'0.3.0', releaseSha256:sha256(updatedReleaseBody), title:'Current listing'}, publisherPrivateKey);
         failListingProfile = true;
         expect((await listingStage(currentListing)).status).toBe(409);
@@ -1083,7 +1122,13 @@ describe("static shard seed plugin", () => {
         expect(refreshedListing.release).toMatchObject({title:'Current listing',listingRevision:1,isCurrentRelease:true});
         expect((await listingStage(currentListing)).status).toBe(200);
         const currentEvents = (await restartedStore.getLog(listingGuild)).map(event => event.body as any);
-        expect(currentEvents.find(event => event.objectType === 'game-profile')?.value).toMatchObject({title:'Current listing', version:'0.3.0'});
+        expect(currentEvents.filter(event => event.objectType === 'game-profile').at(-1)?.value).toMatchObject({title:'Current listing', version:'0.3.0'});
+        const creatorLookup = await (await fetch(`http://127.0.0.1:${restartedPort}/plugins/cgp.static-shards/catalog?creator=ORIGINAL-AUTHOR`)).json() as any;
+        expect(creatorLookup.releases).toHaveLength(1);
+        expect(creatorLookup.releases[0]).toMatchObject({id:'uploaded-game',version:'0.3.0',creatorUsername:'original-author',creatorAvatar:'https://art.example/author.webp'});
+        expect(creatorLookup.releases[0].updatedAt).toBe(new Date(creatorLookup.releases[0].listingUpdatedAt).toISOString());
+        const missingCreator = await (await fetch(`http://127.0.0.1:${restartedPort}/plugins/cgp.static-shards/catalog?creator=original`)).json() as any;
+        expect(missingCreator.releases).toEqual([]);
     });
 
     it("loads and searches a large persisted catalog without scanning every release", async () => {
@@ -1114,7 +1159,7 @@ describe("static shard seed plugin", () => {
         const relay = new RelayServer(
             0,
             new MemoryStore(),
-            [createStaticShardSeedPlugin({ storeDir, autoIngest: false })],
+            [createStaticShardSeedPlugin({storageAdmission:{minimumFreeBytes:0}, uploadWorkBits:0, storeDir, autoIngest: false })],
             { enableDefaultPlugins: false },
         );
         relays.push(relay);
@@ -1209,7 +1254,7 @@ describe("static shard seed plugin", () => {
             0,
             new MemoryStore(),
             [
-                createStaticShardSeedPlugin({
+                createStaticShardSeedPlugin({storageAdmission:{minimumFreeBytes:0}, uploadWorkBits:0,
                     sources: [{
                         url: `http://127.0.0.1:${address.port}/release.json`,
                         kind: "release",

@@ -164,6 +164,8 @@ function needsDerivedRebuildAfterBatch(events: GuildEvent[]) {
 function batchMemberIndexUserId(event: GuildEvent): string | null {
     const body = event.body as Record<string, any>;
     switch (body.type) {
+        case "MEMBER_JOIN":
+            return event.author;
         case "MEMBER_UPDATE":
         case "BAN_USER":
         case "BAN_ADD":
@@ -1143,6 +1145,19 @@ export class LevelStore implements Store {
                 }, memberSnapshots);
                 break;
             }
+            case "MEMBER_JOIN": {
+                const userId = event.author;
+                const snapshot = memberSnapshots?.get(userId);
+                const current = snapshot?.member || await this.readMember(guildId, userId);
+                if (!current) {
+                    await this.putIndexedMemberForDerived(batch, guildId, {
+                        userId,
+                        roles: [],
+                        joinedAt: event.createdAt
+                    }, memberSnapshots, snapshot?.searchTerms, snapshot?.member);
+                }
+                break;
+            }
             case "MEMBER_UPDATE": {
                 const userId = typeof body.userId === "string" && body.userId.trim() ? body.userId : event.author;
                 const snapshot = memberSnapshots?.get(userId);
@@ -1339,6 +1354,11 @@ export class LevelStore implements Store {
         switch (body.type) {
             case "GUILD_CREATE":
                 members.set(event.author, { userId: event.author, roles: ["owner"], joinedAt: event.createdAt });
+                break;
+            case "MEMBER_JOIN":
+                if (!members.has(event.author)) {
+                    members.set(event.author, { userId: event.author, roles: [], joinedAt: event.createdAt });
+                }
                 break;
             case "MEMBER_UPDATE": {
                 const userId = typeof body.userId === "string" && body.userId.trim() ? body.userId : event.author;
