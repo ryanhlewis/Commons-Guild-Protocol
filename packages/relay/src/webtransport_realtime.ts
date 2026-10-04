@@ -52,6 +52,7 @@ export interface CgpWebTransportOptions {
   maxDatagramBytes?: number;
   maxBufferedBytes?: number;
   advertiseCertificateHash?: boolean;
+  reliableFrames?: boolean;
 }
 
 export interface CgpWebTransportAdvertisement {
@@ -140,6 +141,7 @@ export class CgpWebTransportSocket extends EventEmitter {
   private readonly reassembler = new RealtimeDatagramReassembler();
   private readonly maxDatagramBytes: number;
   private readonly maxBufferedBytes: number;
+  private readonly reliableFrames: boolean;
   private nextMessageId = randomBytes(4).readUInt32BE(0);
   private closeEmitted = false;
 
@@ -149,12 +151,14 @@ export class CgpWebTransportSocket extends EventEmitter {
       url: string;
       maxDatagramBytes: number;
       maxBufferedBytes: number;
+      reliableFrames?: boolean;
     },
   ) {
     super();
     this.url = options.url;
     this.maxDatagramBytes = options.maxDatagramBytes;
     this.maxBufferedBytes = options.maxBufferedBytes;
+    this.reliableFrames = options.reliableFrames === true;
     this.writer = session.datagrams
       .createWritable()
       .getWriter() as WebTransportDatagramWriter;
@@ -177,7 +181,7 @@ export class CgpWebTransportSocket extends EventEmitter {
         : data instanceof ArrayBuffer
           ? new Uint8Array(data)
           : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-    if (bytes.byteLength > this.maxDatagramBytes - 13) {
+    if (this.reliableFrames || bytes.byteLength > this.maxDatagramBytes - 13) {
       if (this.bufferedAmount + bytes.byteLength > this.maxBufferedBytes) {
         throw new Error("WebTransport stream queue is backpressured");
       }
@@ -435,6 +439,7 @@ export class CgpWebTransportRelayServer {
           url: this.advertisement.url,
           maxDatagramBytes: this.advertisement.maxDatagramBytes,
           maxBufferedBytes: this.options.maxBufferedBytes ?? 512 * 1024,
+          reliableFrames: this.options.reliableFrames,
         });
         this.sockets.add(socket);
         socket.once("close", () => this.sockets.delete(socket));
