@@ -7,6 +7,7 @@ Admission limits are operator policy, independent of CGP identity and membership
 | Limit | Default | Environment variable |
 | --- | --- | --- |
 | Stored static-shard bytes, including staging and existing files | 10 GiB | `CGP_STATIC_SHARD_STORE_MAX_BYTES` |
+| Files and directories visited per complete storage audit | 200,000 (operator configurable, maximum 2,000,000) | `CGP_STATIC_SHARD_STORE_MAX_SCAN_ENTRIES` |
 | Cumulative bytes per publisher root | 1 GiB | `CGP_STATIC_SHARD_PUBLISHER_MAX_BYTES` |
 | Minimum free disk after a reservation | 512 MiB | `CGP_STATIC_SHARD_MIN_FREE_BYTES` |
 | Concurrent upload requests | 2 | `CGP_STATIC_SHARD_MAX_CONCURRENT_UPLOADS` |
@@ -22,6 +23,8 @@ Admission limits are operator policy, independent of CGP identity and membership
 `GET /plugins/cgp.static-shards/status` exposes the selected limits. A configured private/test plugin may explicitly choose zero work bits. Public production defaults require work. Configure larger budgets deliberately for large game libraries; a pre-existing over-budget library remains readable but new writes fail closed.
 
 The durable `admission-ledger.json` charges actual files, including failed partial writes. Reservations include the maximum allowed extraction size, not just compressed ZIP bytes. Mutations and cleanup are serialized. Disk exhaustion returns HTTP 507; request/concurrency admission returns 429. A request body must finish within 30 seconds. Disconnecting does not free the concurrency slot while its handler is still processing. Preserve this ledger along with the publisher ownership registry in backups.
+
+`upload-status` advertises `maxUploadBlobFiles` (64) and `maxUploadBlobBodyBytes`. A content-blob request may batch signed references within that existing body limit. Admission audits the entire storage root once per batch, reserves the sum of all missing blobs, and durably charges every partial write. Cached hashes are skipped. Batching does not cache storage totals or ignore untracked files. Catalog reads become available after registry loading while community repairs run in the background; new uploads still wait for storage accounting restoration.
 
 Pending content and failed new uploads expire after 24 hours. Published, unpinned files expire after retention plus 90 days of grace. Cleanup runs at startup and hourly. Existing records receive a one-time migration retention period; restarting does not reset it. Cleanup removes served bytes, never the signed publisher ownership registry, guild history, account keys, or permissions. Re-uploading the original signed bytes remains subject to the original publisher binding. Changing content requires a new immutable version.
 

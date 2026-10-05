@@ -4,6 +4,7 @@ import { hmac } from "@noble/hashes/hmac";
 import * as secp from "@noble/secp256k1";
 import stringify from "safe-stable-stringify";
 import { HashHex, PublicKeyHex, SignatureHex } from "./types.js";
+import { createSignatureVerificationCache } from "./signature_verification_cache.js";
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
@@ -30,13 +31,19 @@ export async function sign(
     return sig.toCompactHex();
 }
 
+const verifySignatureBytes = createSignatureVerificationCache((publicKey, payloadHash, signature) =>
+    secp.verify(signature, payloadHash, publicKey));
+
+/** Aggregate diagnostics contain no public keys, hashes, signatures or authority state. */
+export const signatureVerificationCacheStatistics = () => verifySignatureBytes.statistics();
+
 export function verify(
     pubKeyHex: PublicKeyHex,
     msgHashHex: HashHex,
     sigHex: SignatureHex
 ): boolean {
     try {
-        return secp.verify(sigHex, msgHashHex, pubKeyHex);
+        return verifySignatureBytes(pubKeyHex, msgHashHex, sigHex);
     } catch (e) {
         return false;
     }

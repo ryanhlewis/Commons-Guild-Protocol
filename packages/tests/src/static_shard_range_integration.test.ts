@@ -1,0 +1,41 @@
+import { createHash } from 'node:crypto';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import os from 'node:os';
+import { afterEach, expect, it } from 'vitest';
+import { generatePrivateKey, getPublicKey, hashObject, sign } from '@cgp/core';
+import { createStaticShardSeedPlugin, staticShardReleaseSigningPayload, STATIC_SHARD_PUBLISHER_PROTOCOL } from '@cgp/relay/src/plugins';
+import { RelayServer } from '@cgp/relay/src/server';
+import { MemoryStore } from '@cgp/relay/src/store';
+import { zipSync } from 'fflate';
+const hash = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex');
+const relays: RelayServer[] = [], directories: string[] = [];
+afterEach(async () => { await Promise.all(relays.splice(0).map(relay => relay.close())); await Promise.all(directories.splice(0).map(directory => fs.rm(directory, {recursive: true, force: true}))); });
+it('serves signed playable, stored-shard and referer assets with partial bytes, preserving isolation and rejecting unknown releases', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cgp-signed-range-')); directories.push(directory);
+  const payload = Buffer.from('authenticated-collision-bundle-contents');
+  const manifest = Buffer.from(JSON.stringify({kind: 'hollow-game', id: 'range-game', title: 'Range game', entry: {type: 'web', localPath: 'index.html'}}));
+  const shard = Buffer.from(zipSync({'index.html': Buffer.from('<h1>Range game</h1>'), 'collision.vrwb': payload}));
+  const key = generatePrivateKey();
+  const claim = {kind: 'cgp-static-shard-release', schemaVersion: 1, id: 'range-game', title: 'Range game', type: 'game', version: '1', display: {crossOriginIsolated: true}, manifests: {game: {path: 'manifest.json', sha256: hash(manifest)}}, shards: [{id: 'code', kind: 'code', path: 'code.zip', bytes: shard.length, sha256: hash(shard)}], publisher: {protocol: STATIC_SHARD_PUBLISHER_PROTOCOL, publicKey: getPublicKey(key)}};
+  const release = {...claim, publisher: {...claim.publisher, signature: await sign(key, hashObject(staticShardReleaseSigningPayload(claim)))}};
+  const releaseBytes = Buffer.from(JSON.stringify(release));
+  const relay = new RelayServer(0, new MemoryStore(), [createStaticShardSeedPlugin({storeDir: directory, autoIngest: false, uploadWorkBits: 0, storageAdmission: {minimumFreeBytes: 0}})], {enableDefaultPlugins: false}); relays.push(relay);
+  for (let i = 0; i < 200 && !relay.getPort(); i++) await new Promise(resolve => setTimeout(resolve, 25));
+  const base = 'http://127.0.0.1:' + relay.getPort();
+  const upload = await fetch(base + '/plugins/cgp.static-shards/upload', {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({releaseBase64: releaseBytes.toString('base64'), releaseSha256: hash(releaseBytes), files: [{path: 'manifest.json', sha256: hash(manifest), bytesBase64: manifest.toString('base64')}, {path: 'code.zip', sha256: hash(shard), bytesBase64: shard.toString('base64')}]})});
+  expect(upload.status, await upload.text()).toBe(201);
+  for (const [url, bytes, referer] of [[base + '/plugins/cgp.static-shards/play/range-game/1/collision.vrwb', payload, undefined], [base + '/plugins/cgp.static-shards/files/games/range-game/1/code.zip', shard, undefined], [base + '/collision.vrwb', payload, base + '/plugins/cgp.static-shards/play/range-game/1/index.html']] as const) {
+    const response = await fetch(url, {headers: {range: 'bytes=3-10', ...(referer ? {referer} : {})}});
+    expect(response.status).toBe(206); expect(response.headers.get('content-range')).toBe(`bytes 3-10/${bytes.length}`);
+    expect(Buffer.from(await response.arrayBuffer())).toEqual(bytes.subarray(3, 11));
+    if (url.includes('/play/') || referer) expect(response.headers.get('cross-origin-embedder-policy')).toBe('require-corp');
+  }
+  const absent = await fetch(base + '/plugins/cgp.static-shards/play/not-published/1/collision.vrwb', {headers: {range: 'bytes=0-1'}});
+  expect(absent.status).toBe(404);
+  const invalid = await fetch(base + '/plugins/cgp.static-shards/play/range-game/1/..%2F..%2Findex.json', {redirect: 'manual', headers: {range: 'bytes=0-1'}});
+  expect(invalid.status).toBe(302);
+  expect(invalid.headers.get('location')).toContain('/plugins/cgp.static-shards/play/range-game/1/index.html');
+  const preflight = await fetch(base + '/plugins/cgp.static-shards/play/range-game/1/collision.vrwb', {method: 'OPTIONS', headers: {origin: 'https://viewer.example', 'access-control-request-method': 'GET', 'access-control-request-headers': 'range,if-range'}});
+  expect(preflight.status).toBe(204); expect(preflight.headers.get('access-control-allow-headers')).toContain('If-Range');
+}, 20000);

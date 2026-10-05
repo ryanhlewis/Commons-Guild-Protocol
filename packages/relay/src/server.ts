@@ -1,3 +1,4 @@
+import {traceAsyncPhase} from './async_phase_trace.js';
 import { WebSocketServer, WebSocket, RawData } from "ws";
 import { createServer, IncomingMessage, ServerResponse } from "http";
 import { createReadStream } from "fs";
@@ -1916,7 +1917,9 @@ export class RelayServer {
         return await this.store.getLog(guildId);
       },
       getState: async (guildId: GuildId) => {
-        return (await this.rebuildGuildState(guildId))?.state ?? null;
+        return (await traceAsyncPhase('rebuildGuildState',()=>this.rebuildGuildState(guildId),value=>{
+          if(value.state!=='complete'||value.durationMs>=1000)console.info('[relay] plugin state phase',JSON.stringify(value));
+        }))?.state ?? null;
       },
     };
     this.pluginsReady = this.initPlugins();
@@ -2175,7 +2178,7 @@ export class RelayServer {
     );
     res.setHeader(
       "Access-Control-Allow-Headers",
-      "Authorization, Content-Type",
+      "Authorization, Content-Type, Range, If-Range",
     );
     res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
     if (req.method === "OPTIONS") {
@@ -2719,7 +2722,7 @@ export class RelayServer {
   private async initPlugins() {
     for (const plugin of this.plugins) {
       try {
-        await plugin.onInit?.(this.pluginCtx);
+        await traceAsyncPhase('onInit',()=>plugin.onInit?.(this.pluginCtx),value=>{if(value.state==='complete'&&value.durationMs<1000)return;console.info('[relay-plugin-init] plugin='+plugin.name+' phase='+value.phase+' state='+value.state+' durationMs='+value.durationMs);});
       } catch (e: any) {
         console.error(`Relay plugin ${plugin.name} failed to init:`, e);
       }
@@ -2736,14 +2739,17 @@ export class RelayServer {
       this.keyPair.privateKey,
       hashObject(unsignedForSig),
     );
-    const fullEvent = await this.appendSequencedEvent({
+    const reportPhase=(value:{phase:string;state:string;durationMs:number})=>{
+      if(value.state!=='complete'||value.durationMs>=1000)console.info('[relay] authoritative publish phase',JSON.stringify({eventType:body.type,...value}));
+    };
+    const fullEvent = await traceAsyncPhase('appendSequencedEvent',()=>this.appendSequencedEvent({
       body,
       author,
       signature,
       createdAt,
-    });
+    }),reportPhase);
     if (fullEvent) {
-      await this.runOnEventAppended(fullEvent);
+      await traceAsyncPhase('appendHooks',()=>this.runOnEventAppended(fullEvent),reportPhase);
     }
     return fullEvent;
   }
@@ -7199,6 +7205,9 @@ export class RelayServer {
       onError?: (code: string, message: string) => void;
     } = {},
   ): Promise<GuildEvent | undefined> {
+    const tracePublishPhase=<T>(phase:string,work:()=>Promise<T>|T)=>traceAsyncPhase(phase,work,value=>{
+      if(value.state!=='complete'||value.durationMs>=1000)console.info('[relay] sequenced append phase',JSON.stringify({eventType:p.body.type,...value}));
+    });
     const {
       body,
       author,
@@ -7249,9 +7258,9 @@ export class RelayServer {
       return undefined;
     }
 
-    const storageGate = await this.checkStorageWriteGate(
+    const storageGate = await tracePublishPhase('storageWriteGate',()=>this.checkStorageWriteGate(
       this.estimatedPublishBytes(body),
-    );
+    ));
     if (!storageGate.ok) {
       sendError(
         "RELAY_STORAGE_FULL",
@@ -7260,7 +7269,7 @@ export class RelayServer {
       return undefined;
     }
 
-    await this.hydrateDeviceAuthorities(targetGuildId);
+    await tracePublishPhase('hydrateDeviceAuthorities',()=>this.hydrateDeviceAuthorities(targetGuildId));
     const unsignedForSig = { body, author, createdAt };
     const verifiedAuthorization = await this.verifyAccountAuthorization(
       unsignedForSig,
@@ -7327,8 +7336,8 @@ export class RelayServer {
     let sequencingFinalized = false;
     if (this.sequencerConsensusCoordinator) {
       try {
-        await this.sequencerConsensusReady;
-        sequencingToken = await this.sequencerConsensusCoordinator.sequence({
+        await tracePublishPhase('sequencerConsensusReady',()=>this.sequencerConsensusReady);
+        sequencingToken = await tracePublishPhase('sequencerConsensusSequence',()=>this.sequencerConsensusCoordinator!.sequence({
           guildId: targetGuildId,
           body,
           author,
@@ -7336,7 +7345,7 @@ export class RelayServer {
           deviceAuthorization,
           createdAt,
           clientEventId,
-        });
+        }));
       } catch (error) {
         sendError(
           "SEQUENCER_UNAVAILABLE",
@@ -7790,12 +7799,16 @@ export class RelayServer {
     for (const plugin of this.plugins) {
       try {
         if (plugin.onEventsAppended) {
-          await plugin.onEventsAppended({ events, socket }, this.pluginCtx);
+          await traceAsyncPhase('onEventsAppended',()=>plugin.onEventsAppended!({ events, socket }, this.pluginCtx),value=>{
+            if(value.state!=='complete'||value.durationMs>=1000)console.info('[relay] plugin append phase',JSON.stringify({plugin:plugin.name,eventCount:events.length,...value}));
+          });
           continue;
         }
         if (plugin.onEventAppended) {
           for (const event of events) {
-            await plugin.onEventAppended({ event, socket }, this.pluginCtx);
+            await traceAsyncPhase('onEventAppended',()=>plugin.onEventAppended!({ event, socket }, this.pluginCtx),value=>{
+              if(value.state!=='complete'||value.durationMs>=1000)console.info('[relay] plugin append phase',JSON.stringify({plugin:plugin.name,eventType:event.body.type,...value}));
+            });
           }
         }
       } catch (e: any) {

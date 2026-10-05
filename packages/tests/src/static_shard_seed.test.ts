@@ -716,10 +716,12 @@ describe("static shard seed plugin", () => {
         const envelope = {releaseBase64: uploadBody.releaseBase64, releaseSha256: uploadBody.releaseSha256};
         const missingBefore = await (await stage('upload-status', envelope)).json() as any;
         expect(missingBefore.missing, JSON.stringify(missingBefore)).toHaveLength(2);
-        for (const file of uploadBody.files) {
-            const staged = await stage('upload-blob', {...envelope, files:[file]});
-            expect(staged.status, await staged.text()).toBe(200);
-        }
+        expect(missingBefore.maxUploadBlobFiles).toBe(64);
+        expect(missingBefore.maxUploadBlobBodyBytes).toBeGreaterThan(25 * 1024 * 1024);
+        const staged = await stage('upload-blob', {...envelope, files:uploadBody.files});
+        expect(staged.status, await staged.text()).toBe(200);
+        const duplicateBlob = await stage('upload-blob', {...envelope, files:[uploadBody.files[0],uploadBody.files[0]]});
+        expect(duplicateBlob.status).toBe(400);
         const missingAfter = await (await stage('upload-status', envelope)).json() as any;
         expect(missingAfter.missing).toEqual([]);
         const rejectedBlob = await stage('upload-blob', {...envelope, files:[{path:'unlisted', bytesBase64:Buffer.from('bad').toString('base64')}]});
@@ -978,6 +980,12 @@ describe("static shard seed plugin", () => {
         expect(prefixSearch.releases.map((entry: any) => entry.id)).toEqual(["uploaded-game"]);
         expect(prefixSearch.releases[0].version).toBe("0.3.0");
         expect(prefixSearch.page).toMatchObject({ count: 1, hasMore: true });
+        expect(prefixSearch.page.nextCursor).toEqual(expect.any(String));
+        const nextSearch = await fetch(`http://127.0.0.1:${port}/plugins/cgp.static-shards/catalog?q=upload&limit=1&cursor=${encodeURIComponent(prefixSearch.page.nextCursor)}`);
+        const nextSearchPayload = await nextSearch.json() as any;
+        expect(nextSearch.status).toBe(200);
+        expect(nextSearchPayload.releases.map((entry: any) => entry.id)).toEqual(['uploaded-game-two']);
+        expect(nextSearchPayload.page.hasMore).toBe(false);
 
         const invalidCursorResponse = await fetch(
             `http://127.0.0.1:${port}/plugins/cgp.static-shards/catalog?limit=1&cursor=missing`,
@@ -1026,6 +1034,7 @@ describe("static shard seed plugin", () => {
         expect(restartedCatalog.releases[1].publisher.publicKey).toBe(publisherPublicKey);
         const restoredGame = restartedCatalog.releases[1];
         expect(restoredGame.commentsChannelId).not.toBe(restoredGame.chatChannelId);
+        await expect.poll(async()=> (await restartedStore.getLog(restoredGame.guildId)).some(event => (event.body as any).type==='ROLE_ASSIGN'&&(event.body as any).userId===publisherPublicKey)).toBe(true);
         const restoredEvents = (await restartedStore.getLog(restoredGame.guildId)).map(event => event.body as any);
         expect(restoredEvents.filter(event => event.type === 'CHANNEL_CREATE').map(event => event.name)).toEqual(expect.arrayContaining(['releases', 'chat', 'comments', 'Lobby']));
         expect(restoredEvents.filter(event => event.type === 'ROLE_ASSIGN').map(event => event.userId)).toContain(publisherPublicKey);
@@ -1131,6 +1140,19 @@ describe("static shard seed plugin", () => {
         expect(missingCreator.releases).toEqual([]);
     });
 
+    it('serves the restored catalog while the first community repair is blocked',async()=>{
+        const storeDir=await fs.mkdtemp(path.join(os.tmpdir(),'cgp-static-background-repair-'));tempDirs.push(storeDir);
+        await fs.writeFile(path.join(storeDir,'index.json'),JSON.stringify({kind:'cgp-relay-static-shard-registry',schemaVersion:1,releases:[{id:'background-game',title:'Background Game',type:'game',version:'1.0.0',releaseUrl:'https://static.example/release.json',releaseSha256:sha256('background-game'),storedAt:1,guildId:hashObject({kind:'cgp-static-shard-game-guild',id:'background-game'}),manifests:[],shards:[]}]}));
+        let releaseRepair!:()=>void;const blocked=new Promise<void>(resolve=>{releaseRepair=resolve;});let repairStarted=false;
+        const plugin=createStaticShardSeedPlugin({storeDir,autoIngest:false,uploadWorkBits:0,storageAdmission:{minimumFreeBytes:0}}),initialize=plugin.onInit!;
+        plugin.onInit=ctx=>initialize({...ctx,publishAsRelay:async body=>{repairStarted=true;await blocked;return ctx.publishAsRelay(body);}});
+        const store=new MemoryStore(),relay=new RelayServer(0,store,[plugin],{enableDefaultPlugins:false});relays.push(relay);
+        try{
+            const port=await waitForPort(relay);const response=await fetch(`http://127.0.0.1:${port}/plugins/cgp.static-shards/catalog`,{signal:AbortSignal.timeout(1000)});
+            expect(response.status).toBe(200);expect((await response.json() as any).releases[0].id).toBe('background-game');
+            await expect.poll(()=>repairStarted).toBe(true);
+        }finally{releaseRepair();}
+    });
     it("loads and searches a large persisted catalog without scanning every release", async () => {
         const releaseCount = 20_000;
         const storeDir = await fs.mkdtemp(path.join(os.tmpdir(), "cgp-static-large-catalog-"));

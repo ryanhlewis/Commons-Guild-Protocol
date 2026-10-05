@@ -1,3 +1,18 @@
+/** Preserve signed preview URLs, including version query strings. */
+export function normalizeStaticShardPreviewUrl(value: unknown): string | undefined {
+  if (typeof value !== 'string' || value.length > 2048) return undefined;
+  const raw = value.trim();
+  if (!raw) return undefined;
+  if (/^https:\/\//i.test(raw)) {
+    try {
+      const url = new URL(raw);
+      return url.protocol === 'https:' && !url.username && !url.password ? raw : undefined;
+    } catch { return undefined; }
+  }
+  if (/[:\\?#\x00-\x1f]/.test(raw) || raw.startsWith('/') || raw.split('/').some(part => !part || part === '.' || part === '..')) return undefined;
+  return raw;
+}
+
 /** Optional signed listing fields. Attribution does not change publisher or creator authority. */
 export function staticShardListingAttribution(claim: Record<string, unknown>) {
   const fields: Record<string, string | undefined> = {};

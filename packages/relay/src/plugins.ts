@@ -1,7 +1,11 @@
+import {traceAsyncPhase} from './async_phase_trace.js';
+import { createCatalogSearchPages } from './catalog_search_pages.js';
+import { serveStaticShardFile } from './static_shard_range.js';
 import { reassembleStaticFiles } from "./static_shard_chunks.js";
-import { staticShardListingAttribution } from "./static_shard_listing.js";
+import { staticShardListingAttribution, normalizeStaticShardPreviewUrl } from "./static_shard_listing.js";
 import { RawPinnedMedia } from './raw_pinned_media.js';
 import { StaticShardUploadCache } from "./static_shard_upload_cache.js";
+import { StaticShardCommunityQueue, publishDurableStaticLibrary } from './static_shard_community_queue.js';
 import { staticShardZipReservation, staticShardChunkReservation } from './static_shard_reservation.js';
 import { StorageAdmission, AdmissionError } from './storage_admission.js';
 import { admissionWorkValid } from '@cgp/core';
@@ -12,7 +16,7 @@ import { once } from "node:events";
 import { spawn } from "node:child_process";
 import { createHash, createHmac, createSign, randomUUID, timingSafeEqual } from "crypto";
 import { createReadStream, createWriteStream } from "node:fs";
-import { appendFile, mkdir, readFile, readdir, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, readdir, rename, rm, stat, lstat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { gzipSync, gunzipSync } from "node:zlib";
 import type { WebSocket } from "ws";
@@ -6253,6 +6257,8 @@ function normalizeStaticShardGameMetadata(
     stringField(manifest, "creatorBio") ||
     stringField(creator, "bio") ||
     stringField(release as Record<string, unknown>, "creatorBio");
+  const previewUrl = normalizeStaticShardPreviewUrl(stringField(manifest, "previewUrl")) ||
+    normalizeStaticShardPreviewUrl(stringField(release as Record<string, unknown>, "previewUrl"));
   const display = normalizeStaticShardDisplayMetadata(manifest, release as Record<string, unknown>);
 
   return {
@@ -6271,6 +6277,7 @@ function normalizeStaticShardGameMetadata(
     creatorUsername,
     creatorAvatar: creatorAvatar || undefined,
     creatorBio: creatorBio || undefined,
+    previewUrl,
     display,
     sourceBranch: stringField(hollow, "sourceBranch") || undefined,
     launchQuery: normalizeStaticShardLaunchQuery(release, manifest) || undefined,
@@ -6544,6 +6551,7 @@ export function createStaticShardSeedPlugin(
   // the value served from that slot without moving it, so opaque cursors do
   // not skip a game or emit it twice while releases are being appended.
   const gameCatalogIds: string[] = [];
+  let searchGeneration = 0;
   const gameCatalogIndex = new Map<string, number>();
   const latestReleaseKeyByGameId = new Map<string, string>();
   const searchTokensByGameId = new Map<string, string[]>();
@@ -6578,6 +6586,7 @@ export function createStaticShardSeedPlugin(
   let initPromise: Promise<void> | undefined;
   let registryJournalEntries = 0;
   let registryPersistQueue = Promise.resolve();
+  const durableCommittedReleases = new Set<string>();
   const gameIngestTails = new Map<string, Promise<void>>();
 
   const validPersistedPublisherProof = (
@@ -6798,6 +6807,7 @@ export function createStaticShardSeedPlugin(
     }
     searchTokensByGameId.set(release.id, tokens);
     latestReleaseKeyByGameId.set(release.id, key);
+    searchGeneration++;
   };
 
   const rememberRelease = (release: IngestedStaticShardRelease) => {
@@ -6833,45 +6843,69 @@ export function createStaticShardSeedPlugin(
       await appendFile(registryJournalPath, `${JSON.stringify(release)}\n`, "utf8");
       registryJournalEntries += 1;
       if (registryJournalEntries < registryCompactEvery) return;
-      await writeStaticShardRegistry(registryPath, Array.from(releases.values()));
+      const snapshot = new Map(releases);
+      snapshot.set(staticShardReleaseKey(release.id, release.version), release);
+      await writeStaticShardRegistry(registryPath, Array.from(snapshot.values()));
       await writeFile(registryJournalPath, "", "utf8");
       registryJournalEntries = 0;
     });
     registryPersistQueue = operation.catch(() => undefined);
     await operation;
+    durableCommittedReleases.add(`${staticShardReleaseKey(release.id,release.version)}:${release.releaseSha256}`);
   };
 
   const loadPersistedReleases = async () => {
-    for (const release of await readStaticShardRegistry(registryPath)) {
-      rememberRelease(release);
-    }
-    const journal = await readStaticShardRegistryJournal(registryJournalPath);
-    for (const release of journal.releases) {
-      rememberRelease(release);
-    }
+    const catalogLoadStarted=Date.now();let recoveredArtifacts=0;
+    const stageTimings:Record<string,number>={};
+    const snapshotStarted=Date.now(),snapshot=await readStaticShardRegistry(registryPath);
+    stageTimings.snapshotReadMs=Date.now()-snapshotStarted;
+    const journalStarted=Date.now(),journal=await readStaticShardRegistryJournal(registryJournalPath);
+    stageTimings.journalReadMs=Date.now()-journalStarted;
+    // Verification remains ordered and exhaustive, but cannot monopolize the
+    // relay event loop during cold replay of thousands of publisher proofs.
+    const proofStarted=Date.now();let workStarted=Date.now(),batch=0,yields=0;
+    const yieldRecovery=async()=>{if(++batch>=8||Date.now()-workStarted>=12){await new Promise<void>(resolve=>setImmediate(resolve));workStarted=Date.now();batch=0;yields++;}};
+    await new Promise<void>(resolve=>setImmediate(resolve));
+    for(const release of [...snapshot,...journal.releases]){rememberRelease(release);durableCommittedReleases.add(`${staticShardReleaseKey(release.id,release.version)}:${release.releaseSha256}`);await yieldRecovery();}
+    stageTimings.publisherIndexMs=Date.now()-proofStarted;
     registryJournalEntries = journal.entries;
-    // Older registries discarded this signed display requirement. Recover it
-    // from the original hash-checked release without changing artifact bytes.
+    // Older registries discarded signed display and preview metadata. Recover
+    // missing values from original artifacts without changing signed bytes.
+    const recoveryStarted=Date.now();
     for (const release of releases.values()) {
-      if (release.display?.crossOriginIsolated === true) continue;
+      await yieldRecovery();
+      const needsDisplay = release.display?.crossOriginIsolated !== true;
+      const needsPreview = release.previewUrl === undefined &&
+        !(release.listingClaim && Object.prototype.hasOwnProperty.call(release.listingClaim, "previewUrl"));
+      if (!needsDisplay && !needsPreview) continue;
       if (!release.manifests.length && !release.shards.length) continue;
       try {
         const releaseFile = path.join(storeDir, staticShardStoreReleasePrefix(release.id, release.version), "release.json");
         assertInsideDirectory(storeDir, releaseFile);
         const bytes = await readFile(releaseFile);
+        recoveredArtifacts++;
         if (createHash("sha256").update(bytes).digest("hex") !== release.releaseSha256) continue;
         const raw = JSON.parse(bytes.toString("utf8"));
-        if (raw.display?.crossOriginIsolated === true) {
+        if (needsDisplay && raw.display?.crossOriginIsolated === true) {
           release.display = { ...release.display, crossOriginIsolated: true };
+        }
+        if (needsPreview && raw.id === release.id && raw.version === release.version) {
+          const previewUrl = normalizeStaticShardPreviewUrl(raw.previewUrl);
+          if (previewUrl && raw.publisher) {
+            const publisher = verifyStaticShardReleasePublisher(raw, { deviceAuthorityRegistry: publisherDeviceAuthorities });
+            if (publisher?.publicKey === release.publisher?.publicKey) release.previewUrl = previewUrl;
+          }
         }
       } catch { /* Missing original files cannot grant an isolation requirement. */ }
     }
+    stageTimings.originalMetadataMs=Date.now()-recoveryStarted;
     if (journal.invalidEntries > 0) {
       const repaired = journal.releases.length > 0
         ? `${journal.releases.map((release) => JSON.stringify(release)).join("\n")}\n`
         : "";
       await writeFile(registryJournalPath, repaired, "utf8");
     }
+    console.info('[cgp.static-shards] catalog restored',JSON.stringify({durationMs:Date.now()-catalogLoadStarted,releases:releases.size,recoveredArtifacts,verifiedPublisherRecords:snapshot.length+journal.releases.length,yields,stages:stageTimings}));
   };
 
   const preferredIpfsBackend = () => {
@@ -7008,8 +7042,16 @@ export function createStaticShardSeedPlugin(
   };
 
   const registerReleaseInCgp = async (release: IngestedStaticShardRelease) => {
-    const ctx = ctxRef;
-    if (!ctx || !createGameGuilds) return release;
+    const originalCtx = ctxRef;
+    if (!originalCtx || !createGameGuilds) return release;
+    const reportPhase = (value: {phase:string;state:string;durationMs:number}) => {
+      if(value.state !== 'complete' || value.durationMs >= 1000) console.info('[cgp.static-shards] game registration phase', JSON.stringify({id:release.id,version:release.version,...value}));
+    };
+    const ctx: RelayPluginContext = release.type === 'game' ? {
+      ...originalCtx,
+      getState: originalCtx.getState ? (guildId) => traceAsyncPhase('getState', () => originalCtx.getState!(guildId), reportPhase) : undefined,
+      publishAsRelay: (body,createdAt) => traceAsyncPhase('publishAsRelay:'+body.type, () => originalCtx.publishAsRelay(body,createdAt), reportPhase),
+    } : originalCtx;
     const guildId = staticShardGameGuildId(release.id);
     const channelId = staticShardReleaseChannelId(release.id);
     let state = await ctx.getState?.(guildId);
@@ -7040,6 +7082,7 @@ export function createStaticShardSeedPlugin(
     // Repair partial publication idempotently, including after registry restore.
     if (release.type === "game") {
       const routes = gameSocialRoutes(release);
+      let repairedSocialChannels = false;
       for (const channel of [
         { channelId: routes.chatChannelId, name: "chat", kind: "text" },
         { channelId: routes.commentsChannelId, name: "comments", kind: "text" },
@@ -7047,19 +7090,23 @@ export function createStaticShardSeedPlugin(
       ]) {
         if (channel.channelId && !state?.channels?.has(channel.channelId)) {
           await ctx.publishAsRelay({ type: "CHANNEL_CREATE", guildId, ...channel } as EventBody);
+          repairedSocialChannels = true;
         }
       }
-      state = await ctx.getState?.(guildId);
+      if (repairedSocialChannels) state = await ctx.getState?.(guildId);
     }
     if (release.publisher) {
       const roleId = hashObject({ kind: "cgp-static-shard-publisher-role", id: release.id });
+      let repairedPublisher = false;
       if (!state?.roles?.has(roleId)) {
         await ctx.publishAsRelay({ type: "ROLE_UPSERT", guildId, roleId, name: "Publisher", permissions: ["administrator"] } as EventBody);
+        repairedPublisher = true;
       }
       if (!state?.members?.get(release.publisher.publicKey)?.roles.has(roleId)) {
         await ctx.publishAsRelay({ type: "ROLE_ASSIGN", guildId, roleId, userId: release.publisher.publicKey } as EventBody);
+        repairedPublisher = true;
       }
-      state = await ctx.getState?.(guildId);
+      if (repairedPublisher) state = await ctx.getState?.(guildId);
     }
     // A guild can arrive through federation before its release channel (or a
     // prior relay can fail between those two writes). Repair that partial
@@ -7096,9 +7143,22 @@ export function createStaticShardSeedPlugin(
       stringField(existingRelease?.value, "communityGuildId") === (social.communityGuildId || "");
     const releaseMatches = existingSha === release.releaseSha256 &&
       (Number(existingRelease?.value?.listingRevision) || 0) === (release.listingRevision || 0) && routesMatch;
-    if (releaseMatches && (!publishHollowHomeObjects || release.type !== "game" ||
+    const isCurrentRelease = !latest || latest.storedAt <= release.storedAt;
+    const expectedShardValue = (shard: IngestedStaticShardRelease['shards'][number]) => ({
+      gameId: release.id, version: release.version, ...shard,
+      releaseSha256: release.releaseSha256, mirroredAt: release.storedAt,
+    });
+    const shardMatches = (shard: IngestedStaticShardRelease['shards'][number]) => {
+      const existing = findStaticShardAppObject(state, namespace, shardObjectType, `${releaseObjectId}:${shard.id}`);
+      return !!existing && hashObject(existing.value) === hashObject(expectedShardValue(shard));
+    };
+    // Historical releases must not compare against a newer Home profile. Repair
+    // every missing/changed shard, but never append identical durable shard rows.
+    if (releaseMatches && release.shards.every(shardMatches) && (!publishHollowHomeObjects || release.type !== "game" || !isCurrentRelease ||
       (stringField(existingHome?.value, "commentsChannelId") === social.commentsChannelId &&
        stringField(existingHome?.value, "communityGuildId") === social.communityGuildId &&
+       stringField(existingHome?.value, "version") === release.version &&
+       stringField(existingHome?.value, "releaseSha256") === release.releaseSha256 &&
        stringField(existingHome?.value, "updatedAt") === new Date(release.listingUpdatedAt || release.storedAt).toISOString()))) {
       release.guildId = guildId;
       release.channelId = channelId;
@@ -7276,6 +7336,7 @@ export function createStaticShardSeedPlugin(
     }
 
     for (const shard of release.shards) {
+      if (shardMatches(shard)) continue;
       const shardObjectId = `${releaseObjectId}:${shard.id}`;
       await ctx.publishAsRelay({
         type: "APP_OBJECT_UPSERT",
@@ -7284,19 +7345,27 @@ export function createStaticShardSeedPlugin(
         objectType: shardObjectType,
         objectId: shardObjectId,
         channelId,
-        value: {
-          gameId: release.id,
-          version: release.version,
-          ...shard,
-          releaseSha256: release.releaseSha256,
-          mirroredAt: release.storedAt,
-        },
+        value: expectedShardValue(shard),
       } as EventBody);
     }
 
     release.guildId = guildId;
     release.channelId = channelId;
     return release;
+  };
+
+  const libraryCommunities = new StaticShardCommunityQueue<IngestedStaticShardRelease>(
+    registerReleaseInCgp,
+    (release,error)=>rememberError(`library-community:${release.id}@${release.version}`,error),
+  );
+  const publishLibrary = (release:IngestedStaticShardRelease) => publishDurableStaticLibrary(release,{
+    persist:async value=>{if(releases.get(staticShardReleaseKey(value.id,value.version))?.releaseSha256!==value.releaseSha256)await persist(value);},
+    remember:rememberRelease,
+    enqueue:value=>libraryCommunities.enqueue(value),
+  });
+  const registerExistingRelease = (release:IngestedStaticShardRelease) => {
+    if(release.type==='library'){libraryCommunities.enqueue(release);return Promise.resolve(release);}
+    return registerReleaseInCgp(release);
   };
 
   const ingestRelease = async (source: StaticShardSeedSource) => {
@@ -7325,7 +7394,7 @@ export function createStaticShardSeedPlugin(
       releaseDownload.sha256,
     );
     if (existingRelease && await stat(path.join(storeDir,staticShardStoreReleasePrefix(release.id,release.version),'release.json')).then(()=>true,()=>false)) {
-      return registerReleaseInCgp(existingRelease);
+      return registerExistingRelease(existingRelease);
     }
     const releaseMaxShardBytes =
       release.shardPolicy?.maxShardBytes &&
@@ -7495,6 +7564,7 @@ export function createStaticShardSeedPlugin(
       creatorUsername: gameMetadata.creatorUsername,
       creatorAvatar: gameMetadata.creatorAvatar,
       creatorBio: gameMetadata.creatorBio,
+      previewUrl: gameMetadata.previewUrl,
       display: gameMetadata.display,
       source: isRecord(release.source) ? release.source : undefined,
       network: gameMetadata.network,
@@ -7532,6 +7602,7 @@ export function createStaticShardSeedPlugin(
       manifests: ingestedManifests,
       shards: ingestedShards,
     };
+    if(ingested.type==='library')return publishLibrary(ingested);
     await registerReleaseInCgp(ingested);
     const previousRelease = releases.get(staticShardReleaseKey(ingested.id, ingested.version));
     rememberRelease(ingested);
@@ -7610,10 +7681,41 @@ export function createStaticShardSeedPlugin(
     return await ingestCatalog(normalized);
   };
 
-  const uploadCache = new StaticShardUploadCache(path.join(storeDir, "pending-upload-blobs"));
+  const durableUpload = async (hash:string):Promise<Buffer|undefined> => {
+    if(!/^[a-f0-9]{64}$/.test(hash))throw new Error('Invalid upload content hash.');
+    for(const committed of releases.values()) {
+      if(!durableCommittedReleases.has(`${staticShardReleaseKey(committed.id,committed.version)}:${committed.releaseSha256}`))continue;
+      if(!committed.publisher || ![...committed.manifests,...committed.shards].some(ref=>ref.sha256===hash))continue;
+      const root=path.join(storeDir,staticShardStoreReleasePrefix(committed.id,committed.version));
+      assertInsideDirectory(storeDir,root);
+      try {
+        const signedInfo=await lstat(path.join(root,'release.json'));
+        if(!signedInfo.isFile()||signedInfo.isSymbolicLink()||signedInfo.size>maxManifestBytes)continue;
+        const signedBytes=await readFile(path.join(root,'release.json'));
+        if(createHash('sha256').update(signedBytes).digest('hex')!==committed.releaseSha256)continue;
+        const raw=JSON.parse(signedBytes.toString('utf8'));
+        const publisher=verifyStaticShardReleasePublisher(raw,{deviceAuthorityRegistry:publisherDeviceAuthorities});
+        if(!publisher||publisher.publicKey!==committed.publisher.publicKey)continue;
+        const signed=normalizeStaticShardRelease(raw);
+        if(signed.id!==committed.id||signed.version!==committed.version)continue;
+        const refs=[...Object.values(signed.manifests??{}),...signed.shards];
+        for(const ref of refs.filter(ref=>ref.sha256===hash)) {
+          const relative=safeStaticRelativePath(ref.path);if(!relative)continue;
+          const file=path.join(root,relative);assertInsideDirectory(root,file);
+          const info=await lstat(file);
+          if(!info.isFile()||info.isSymbolicLink()||info.size>Math.max(maxShardBytes,maxManifestBytes)||('bytes' in ref&&ref.bytes!==undefined&&info.size!==ref.bytes))continue;
+          const bytes=await readFile(file);
+          if(createHash('sha256').update(bytes).digest('hex')===hash)return bytes;
+        }
+      } catch(error:any) { if(error.code!=='ENOENT')continue; }
+    }
+    return undefined;
+  };
+  const uploadCache = new StaticShardUploadCache(path.join(storeDir, "pending-upload-blobs"),undefined,durableUpload);
   const retentionMs = positiveIntegerFromEnv('CGP_STATIC_SHARD_RETENTION_DAYS',365) * 86400000;
   const storageAdmission = new StorageAdmission(storeDir, {
     totalBytes: positiveIntegerFromEnv('CGP_STATIC_SHARD_STORE_MAX_BYTES',10 * 1024 ** 3),
+    maxScanEntries: positiveIntegerFromEnv('CGP_STATIC_SHARD_STORE_MAX_SCAN_ENTRIES',200000),
     publisherBytes: positiveIntegerFromEnv('CGP_STATIC_SHARD_PUBLISHER_MAX_BYTES',1024 ** 3),
     pinBytes: positiveIntegerFromEnv('CGP_STATIC_SHARD_PIN_MAX_BYTES',2 * 1024 ** 3),
     publisherPinBytes: positiveIntegerFromEnv('CGP_STATIC_SHARD_PUBLISHER_PIN_MAX_BYTES',512 * 1024 ** 2),
@@ -7631,6 +7733,7 @@ export function createStaticShardSeedPlugin(
   let restoringClosed = false;
   let restoreCommunities: Promise<void> | undefined;
   let restoreAdmissions: Promise<void> | undefined;
+  let staticCatalogReady=false;
   const uploadReferences = (release: ReturnType<typeof normalizeStaticShardRelease>) => [
     ...Object.values(release.manifests ?? {}), ...release.shards
   ];
@@ -7643,18 +7746,25 @@ export function createStaticShardSeedPlugin(
     if (uploadWorkBits && !admissionWorkValid(createHash('sha256').update(staticShardUploadReleaseBytes(body,maxManifestBytes)).digest('hex'),body.admissionNonce,uploadWorkBits)) throw new AdmissionError('Upload admission work required',428);
     const references = uploadReferences(release);
     if (references.length > maxExtractedFiles) throw new Error("Too many upload references.");
+    // Outside runBatch: reclamation and ledger reconciliation never nest admission locks.
+    const reclaimed=await uploadCache.reclaimCommitted();
+    if(reclaimed.length)await storageAdmission.forgetMissingFiles(reclaimed.map(hash=>`pending-upload-blobs/${hash}`));
     if (write) {
+      const fileCount = [body.files,body.manifests,body.shards].reduce<number>((count,value)=>count+(Array.isArray(value)?value.length:0),0);
+      if(fileCount<1||fileCount>64)throw new Error('Upload between 1 and 64 content blobs at a time.');
       const files = staticShardUploadFileList(body, Math.max(maxShardBytes, maxManifestBytes));
-      if (files.size !== 1) throw new Error("Upload exactly one content blob at a time.");
+      if(files.size!==fileCount)throw new Error('Duplicate upload blob path.');
+      const missing = new Map<string,StaticShardUploadedFile>();
       for (const file of files.values()) {
         if (!references.some(ref => ref.path === file.path && ref.sha256 === file.sha256)) throw new Error("Blob is not authorized by this signed release.");
-        if (!await uploadCache.get(file.sha256)) await storageAdmission.run(publisher!.publicKey, `pending-upload-blobs/${file.sha256}`, file.bytes, Date.now()+86400000, false, () => uploadCache.put(file.sha256, file.buffer));
+        if (!await uploadCache.get(file.sha256)) missing.set(file.sha256,file);
       }
+      if(missing.size){const expiresAt=Date.now()+86400000;await storageAdmission.runBatch(publisher!.publicKey,[...missing.values()].map(file=>({relative:`pending-upload-blobs/${file.sha256}`,reservation:file.bytes,expiresAt,pinned:false})),async()=>{await uploadCache.putBatch([...missing.values()].map(file=>({hash:file.sha256,bytes:file.buffer})));});}
       return { ok: true };
     }
     const missing: string[] = [];
     for (const ref of references) if (!ref.sha256 || !await uploadCache.get(ref.sha256)) missing.push(ref.sha256 || "");
-    return { ok: true, protocol: "cgp-static-shard-upload/2", missing };
+    return { ok: true, protocol: "cgp-static-shard-upload/2", missing, maxUploadBlobFiles:64, maxUploadBlobBodyBytes:Math.max(maxShardBytes,maxManifestBytes)*2+maxManifestBytes*2 };
   };
 
   const ingestUpload = async (body: Record<string, unknown>, req?: IncomingMessage) => {
@@ -7690,7 +7800,7 @@ export function createStaticShardSeedPlugin(
       releaseSha256,
     );
     if (existingRelease && await stat(path.join(storeDir,staticShardStoreReleasePrefix(release.id,release.version),'release.json')).catch(()=>undefined)) {
-      return registerReleaseInCgp(existingRelease);
+      return registerExistingRelease(existingRelease);
     }
     const releaseMaxShardBytes =
       release.shardPolicy?.maxShardBytes &&
@@ -7911,6 +8021,7 @@ export function createStaticShardSeedPlugin(
       creatorUsername: gameMetadata.creatorUsername,
       creatorAvatar: gameMetadata.creatorAvatar,
       creatorBio: gameMetadata.creatorBio,
+      previewUrl: gameMetadata.previewUrl,
       display: gameMetadata.display,
       source: isRecord(release.source) ? release.source : undefined,
       network: gameMetadata.network,
@@ -7948,6 +8059,7 @@ export function createStaticShardSeedPlugin(
       manifests: ingestedManifests,
       shards: ingestedShards,
     };
+    if(ingested.type==='library')return publishLibrary(ingested);
     await registerReleaseInCgp(ingested);
     const previousRelease = releases.get(staticShardReleaseKey(ingested.id, ingested.version));
     rememberRelease(ingested);
@@ -8055,22 +8167,12 @@ export function createStaticShardSeedPlugin(
     };
   };
 
-  const catalogSearchPayload = (
-    req: IncomingMessage,
-    rawQuery: string,
-    rawLimit: string | null,
-  ) => {
-    const query = rawQuery.trim().toLowerCase().slice(0, 128);
+  const searchPages = createCatalogSearchPages((query: string) => {
     const compactQuery = normalizeMediaToken(query);
     const wordTerms = query.split(/[^a-z0-9]+/g).filter((term) => term.length >= 2);
     const terms = [...new Set(
       wordTerms.length > 1 ? wordTerms : [compactQuery, ...wordTerms],
     )].filter(Boolean).slice(0, 8);
-    const requestedLimit = rawLimit === null ? Number.NaN : Number(rawLimit);
-    const limit = Math.min(
-      64,
-      Math.max(1, Number.isFinite(requestedLimit) ? Math.floor(requestedLimit) : 24),
-    );
     let candidates: Set<string> | undefined;
     for (const term of terms) {
       const matches = new Set<string>();
@@ -8111,20 +8213,23 @@ export function createStaticShardSeedPlugin(
           right.release.storedAt - left.release.storedAt ||
           left.release.id.localeCompare(right.release.id),
       );
+    return scored.map(({ release }) => release);
+  });
+
+  const catalogSearchPayload = (req: IncomingMessage, rawQuery: string, rawLimit: string | null, cursor: string | null) => {
+    const query = rawQuery.trim().toLowerCase().slice(0, 128);
+    const requestedLimit = rawLimit === null ? Number.NaN : Number(rawLimit);
+    const limit = Math.min(64, Math.max(1, Number.isFinite(requestedLimit) ? Math.floor(requestedLimit) : 24));
+    const result = searchPages(query, limit, cursor, searchGeneration);
+    if (!result.ok) return result;
     return {
-      ok: true,
+      ok: true as const,
       kind: "cgp-relay-static-shard-catalog-search",
       schemaVersion: 2,
       publicHttpUrl: publicBaseForRequest(req),
-      query,
-      total: scored.length,
-      releases: scored.slice(0, limit).map(({ release }) => publicReleasePayload(release, req)),
-      page: {
-        limit,
-        count: Math.min(limit, scored.length),
-        hasMore: scored.length > limit,
-        nextCursor: null,
-      },
+      query, total: result.total,
+      releases: result.selected.map(release => publicReleasePayload(release, req)),
+      page: result.page,
     };
   };
 
@@ -8146,15 +8251,7 @@ export function createStaticShardSeedPlugin(
         sendJson(res, 404, { ok: false, error: "Shard file not found." });
         return;
       }
-      res.statusCode = 200;
-      res.setHeader("content-type", staticShardContentType(resolved));
-      res.setHeader("content-length", file.size);
-      res.setHeader("cache-control", "public, max-age=31536000, immutable");
-      if (req.method === "HEAD") {
-        res.end();
-        return;
-      }
-      createReadStream(resolved).pipe(res);
+      serveStaticShardFile(req, res, resolved, file.size, staticShardContentType(resolved));
     } catch {
       sendJson(res, 404, { ok: false, error: "Shard file not found." });
     }
@@ -8223,15 +8320,7 @@ export function createStaticShardSeedPlugin(
         if (!file.isFile()) {
           continue;
         }
-        res.statusCode = 200;
-        res.setHeader("content-type", staticShardContentType(resolved));
-        res.setHeader("content-length", file.size);
-        res.setHeader("cache-control", "public, max-age=31536000, immutable");
-        if (req.method === "HEAD") {
-          res.end();
-          return;
-        }
-        createReadStream(resolved).pipe(res);
+        serveStaticShardFile(req, res, resolved, file.size, staticShardContentType(resolved));
         return;
       } catch {
         // Try entry-directory fallback candidates before returning 404.
@@ -8265,15 +8354,7 @@ export function createStaticShardSeedPlugin(
         if (!file.isFile()) {
           continue;
         }
-        res.statusCode = 200;
-        res.setHeader("content-type", staticShardContentType(resolved));
-        res.setHeader("content-length", file.size);
-        res.setHeader("cache-control", "public, max-age=31536000, immutable");
-        if (req.method === "HEAD") {
-          res.end();
-          return true;
-        }
-        createReadStream(resolved).pipe(res);
+        serveStaticShardFile(req, res, resolved, file.size, staticShardContentType(resolved));
         return true;
       } catch {
         // Try entry-directory fallback candidates before giving up.
@@ -8410,6 +8491,7 @@ export function createStaticShardSeedPlugin(
       ctxRef = ctx;
       initPromise = (async()=>{
       await loadPersistedReleases();
+      staticCatalogReady=true;
       const restored = [...releases.values()].filter((release) =>
         release.guildId || release.shards.length || release.manifests.length || release.externalEntryUrl);
       const restore = async (entries: IngestedStaticShardRelease[]) => {
@@ -8420,31 +8502,47 @@ export function createStaticShardSeedPlugin(
           await new Promise<void>((resolve) => setImmediate(resolve));
         }
       };
-      // Bound cold startup even for huge catalogs. Small deployments are ready
-      // immediately; remaining repairs run cooperatively and stop on shutdown.
-      await restore(restored.slice(0, 32));
-      restoreCommunities = restore(restored.slice(32));
+      // Catalog bytes and publisher bindings are loaded before HTTP readiness.
+      // Community repair can publish many signed objects, so even its first
+      // release must not block status, catalog reads or unrelated chat traffic.
+      restoreCommunities = (async()=>{await new Promise<void>(resolve=>setImmediate(resolve));await restore(restored);})();
+      void restoreCommunities.catch(error=>rememberError('restore-communities',error));
       restoreAdmissions = (async () => {
+      const admissionRestoreStarted=Date.now();
       await new Promise<void>((resolve) => setImmediate(resolve));
       for (const release of restored) {
         if (restoringClosed) return;
         await storageAdmission.seed(release.publisher?.publicKey || 'operator',staticShardStoreReleasePrefix(release.id,release.version),Date.now()+retentionMs+90*86400000,release.shards.some(shard=>!!shard.ipfsCid),false);
       }
-      for(const file of await readdir(path.join(storeDir,'pending-upload-blobs')).catch(()=>[]))if(/^[a-f0-9]{64}$/.test(file)){
-        const relative=`pending-upload-blobs/${file}`,info=await stat(path.join(storeDir,relative));
-        await storageAdmission.seed('legacy-staging',relative,Math.floor(info.mtimeMs)+86400000,false,false);
+      const pendingBlobs=(await readdir(path.join(storeDir,'pending-upload-blobs')).catch(()=>[])).filter(file=>/^[a-f0-9]{64}$/.test(file));
+      for(let offset=0;offset<pendingBlobs.length;offset+=32){
+        const batch=await Promise.all(pendingBlobs.slice(offset,offset+32).map(async file=>({relative:`pending-upload-blobs/${file}`,info:await stat(path.join(storeDir,'pending-upload-blobs',file)).catch(error=>{if(error.code==='ENOENT')return undefined;throw error;})})));
+        for(const {relative,info} of batch)if(info)await storageAdmission.seed('legacy-staging',relative,Math.floor(info.mtimeMs)+86400000,false,false);
       }
       await storageAdmission.cleanup();
+      console.info('[cgp.static-shards] storage admission restored',JSON.stringify({restoreDurationMs:Date.now()-admissionRestoreStarted,releases:restored.length,pendingBlobs:pendingBlobs.length,audit:storageAdmission.cleanupAuditSummary()}));
       })();
       void restoreAdmissions.catch((error) => rememberError("restore-storage-admission", error));
       if(autoIngest)await ingestConfiguredSources();
       })();
-      await initPromise;
+      // Static catalogue HTTP retains its own readiness gate below. Do not
+      // hold unrelated relay chat/discovery initialization behind its disk
+      // metadata recovery; upload admission still awaits the fresh audit.
+      void initPromise.catch(error=>rememberError('initialize-static-catalog',error));
       cleanupTimer=setInterval(()=>void storageAdmission.cleanup().catch(error=>console.error('Storage retention cleanup failed',error.message)),3600000);
       cleanupTimer.unref?.();
     },
     onHttp: async ({ req, res, pathname, pathSegments }) => {
       if (pathSegments[0] !== "cgp.static-shards") {
+        // Root-relative game assets must not turn unrelated extension/discovery
+        // routes into catalogue readiness waits or thousands of file probes.
+        if(req.method!=="GET"&&req.method!=="HEAD")return false;
+        const assetPath=decodeUrlPathname(pathname);
+        const referer=String(req.headers.referer||req.headers.referrer||'');
+        const hasPlayableContext=/\/plugins\/cgp\.static-shards\/play\/[^/]+\/[^/]+\//.test(referer);
+        const assetCandidate=hasPlayableContext||/^\/(assets|hollow-assets|public)\//.test(assetPath)||/\.[a-zA-Z0-9]{1,12}$/.test(assetPath);
+        if(!assetCandidate)return false;
+        if(!staticCatalogReady){res.setHeader('Retry-After','1');sendJson(res,503,{ok:false,error:'Static game assets are initializing.'});return true;}
         await initPromise;
         if (await servePlayableRootRelativeAsset(req, res, pathname)) {
           return true;
@@ -8529,11 +8627,8 @@ export function createStaticShardSeedPlugin(
           return true;
         }
         if (query) {
-          sendJson(
-            res,
-            200,
-            catalogSearchPayload(req, query, requestUrl.searchParams.get("limit")),
-          );
+          const result = catalogSearchPayload(req, query, requestUrl.searchParams.get("limit"), requestUrl.searchParams.get("cursor"));
+          sendJson(res, result.ok ? 200 : result.status, result);
           return true;
         }
         if (requestUrl.searchParams.has("limit") || requestUrl.searchParams.has("cursor")) {
@@ -8636,8 +8731,9 @@ export function createStaticShardSeedPlugin(
       }
       if ((action === "upload-status" || action === "upload-blob") && req.method === "POST") {
         try {
-          const body = await readJsonRequestBody(req, action === "upload-status" ? maxManifestBytes * 2 : Math.max(maxShardBytes, maxManifestBytes) * 2 + maxManifestBytes * 2);
-          sendJson(res, 200, await stageUpload(body, action === "upload-blob"));
+          const report=(value:{phase:string;state:string;durationMs:number})=>{if(value.state==='complete'&&value.durationMs<1000)return;console.info('[static-shards] at='+new Date().toISOString()+' action='+action+' phase='+value.phase+' state='+value.state+' durationMs='+value.durationMs);};
+          const body = await traceAsyncPhase('read-body',()=>readJsonRequestBody(req, action === "upload-status" ? maxManifestBytes * 2 : Math.max(maxShardBytes, maxManifestBytes) * 2 + maxManifestBytes * 2),report);
+          sendJson(res, 200, await traceAsyncPhase('stage-upload',()=>stageUpload(body, action === "upload-blob"),report));
         } catch (error: any) { sendJson(res, error.status || 400, { ok: false, error: error?.message || "Unable to stage upload.", ...(error.status===428?{workBits:uploadWorkBits,protocol:'cgp-upload-admission/1'}:{}) }); }
         return true;
       }
@@ -8698,6 +8794,7 @@ export function createStaticShardSeedPlugin(
     },
     onClose: async () => {
       restoringClosed = true;
+      libraryCommunities.close();
       await restoreCommunities;
       await restoreAdmissions;
       await registryPersistQueue;

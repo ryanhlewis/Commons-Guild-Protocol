@@ -95,6 +95,19 @@ async function fixture() {
 }
 
 describe("delegated CGP device authorization", () => {
+    it("rechecks expiry and pinned revocation after identical signatures have been cached", async () => {
+        const value = await fixture(), registry = new DeviceAuthorityRegistry();
+        const payload = { content: 'same signed bytes' };
+        const signature = await value.signPayload(payload);
+        for (let index = 0; index < 3; index++) {
+            expect(registry.verify(payload, signature, value.accountPublicKey, value.authorization, 'publish', NOW + 1).ok).toBe(true);
+        }
+        expect(registry.verify(payload, signature, value.accountPublicKey, value.authorization, 'publish', value.authorization.certificate.expiresAt + 1).ok).toBe(false);
+        const newer = { ...value.authorization, revocation: await value.createRevocation(2) };
+        const newerSignature = await value.signPayload(payload, newer);
+        expect(registry.verify(payload, newerSignature, value.accountPublicKey, newer, 'publish', NOW + 3).ok).toBe(true);
+        expect(registry.verify(payload, signature, value.accountPublicKey, value.authorization, 'publish', NOW + 3).ok).toBe(false);
+    });
     it("verifies account binding, device certificate, and payload together", async () => {
         const value = await fixture();
         const payload = {
