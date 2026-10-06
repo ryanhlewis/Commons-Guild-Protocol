@@ -1105,6 +1105,16 @@ export function validateEvent(
       break;
     }
     default: {
+      if (bodyRecord.type === "PARTY_LEADER_TRANSFER") {
+        if (!state.guildId.startsWith("party:") || author !== state.ownerId) {
+          throw new Error("Only the party metadata owner may transfer leadership");
+        }
+        if (typeof bodyRecord.leaderId !== "string" || !/^(02|03)[a-f0-9]{64}$/.test(bodyRecord.leaderId) || bodyRecord.leaderId === author) {
+          throw new Error("Party leadership requires a different account public key");
+        }
+        if (state.bans.has(bodyRecord.leaderId)) throw new Error("A banned account cannot lead the party");
+        break;
+      }
       if (bodyRecord.type === "PARTY_INVITE_SNAPSHOT" && author !== state.ownerId) {
         throw new Error("Only the guild owner may publish party invite snapshots");
       }
