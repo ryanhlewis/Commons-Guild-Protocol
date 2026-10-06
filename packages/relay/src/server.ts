@@ -1453,6 +1453,7 @@ export class RelayServer {
     unavailable: true,
   };
   private storageEstimatePromise?: Promise<RelayStorageStatus>;
+  private storageEstimateCompleted = false;
   private storageUnestimatedWrittenBytes = 0;
 
   private pruneTimer: NodeJS.Timeout;
@@ -2230,7 +2231,10 @@ export class RelayServer {
     }
 
     if (pathname === "/metrics") {
-      await this.refreshStorageStatus(true);
+      // Metrics must not make a scrape wait for a full store walk. Refresh in
+      // the background; writes use the initial quota baseline plus incremental
+      // accounting while later estimates run.
+      void this.refreshStorageStatus(false).catch(() => undefined);
       const body = this.renderPrometheusMetrics();
       res.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
       res.statusCode = 200;
@@ -2242,10 +2246,18 @@ export class RelayServer {
       return true;
     }
 
-    const storage = await this.refreshStorageStatus(true);
+    // Health endpoints report the latest cached estimate and never wait on a
+    // filesystem walk. The first readiness response stays not-ready until an
+    // estimate completes; stale estimates refresh in the background. Write
+    // admission continues to enforce the hard limit before accepting writes.
+    const storage = this.storageStatus;
+    const storageEstimateUnknown = !this.storageEstimateCompleted;
+    if (pathname === "/readyz") {
+      void this.refreshStorageStatus(false).catch(() => undefined);
+    }
     const pubSubReady = !this.pubSubAdapter || this.pubSubAdapter.isReady?.() !== false;
     const ready =
-      !this.closing && this.httpServer.listening && !storage.overSoftLimit && pubSubReady;
+      !this.closing && this.httpServer.listening && !storageEstimateUnknown && !storage.unavailable && !storage.overSoftLimit && pubSubReady;
     const payload = {
       ok: pathname === "/healthz" ? true : ready,
       status: pathname === "/healthz" ? "ok" : ready ? "ready" : "not_ready",
@@ -2267,6 +2279,10 @@ export class RelayServer {
         overSoftLimit: storage.overSoftLimit,
         overHardLimit: storage.overHardLimit,
         unavailable: storage.unavailable,
+        unknown: storageEstimateUnknown,
+        checkedAt: this.storageEstimateCompleted ? storage.checkedAt : null,
+        ageMs: this.storageEstimateCompleted ? Math.max(0, Date.now() - storage.checkedAt) : null,
+        stale: this.storageEstimateCompleted && Date.now() - storage.checkedAt >= this.storagePolicy.estimateIntervalMs,
       },
       closing: this.closing,
     };
@@ -2335,10 +2351,11 @@ export class RelayServer {
   ): Promise<RelayStorageStatus> {
     if (!this.store.estimateStorage) {
       this.storageStatus = this.emptyStorageStatus();
+      this.storageEstimateCompleted = true;
       return this.storageStatus;
     }
     const now = Date.now();
-    const stale =
+    const stale = !this.storageEstimateCompleted ||
       now - (this.storageStatus.checkedAt || 0) >=
       this.storagePolicy.estimateIntervalMs;
     if (!force && !stale) {
@@ -2348,13 +2365,22 @@ export class RelayServer {
       return this.storageEstimatePromise;
     }
 
+    const writtenBytesAtStart = this.storageUnestimatedWrittenBytes;
     this.storageEstimatePromise = Promise.resolve(this.store.estimateStorage())
       .then((estimate) => {
+        this.storageEstimateCompleted = true;
         this.storageStatus = this.storageStatusFromEstimate(estimate);
-        this.storageUnestimatedWrittenBytes = 0;
+        // Keep write estimates accumulated while this walk was in flight. Some
+        // may already be reflected by the walk, so this can overcount, but it
+        // cannot make a hard-limit decision underestimate accepted writes.
+        this.storageUnestimatedWrittenBytes = Math.max(
+          0,
+          this.storageUnestimatedWrittenBytes - writtenBytesAtStart,
+        );
         return this.storageStatus;
       })
       .catch((error: any) => {
+        this.storageEstimateCompleted = true;
         this.storageStatus = this.storageStatusFromEstimate({
           bytes: this.storageStatus.bytes,
           files: this.storageStatus.files,
@@ -2383,7 +2409,21 @@ export class RelayServer {
     if (hardLimitBytes <= 0) {
       return { ok: true };
     }
-    const storage = await this.refreshStorageStatus(false);
+    let storage = this.storageStatus;
+    if (!this.storageEstimateCompleted) {
+      // The initial estimate establishes the quota baseline. Later refreshes
+      // run in the background; accepted writes are charged incrementally below.
+      storage = await this.refreshStorageStatus(false);
+    } else {
+      void this.refreshStorageStatus(false).catch(() => undefined);
+    }
+    if (storage.unavailable) {
+      return {
+        ok: false,
+        storage,
+        message: "Relay storage usage could not be verified; write rejected.",
+      };
+    }
     const projectedTotal =
       storage.bytes +
       this.storageUnestimatedWrittenBytes +
@@ -2471,6 +2511,18 @@ export class RelayServer {
       "cgp_relay_head_conflict_guilds",
       this.relayHeadConflicts.size,
       "Guilds with relay-head conflict evidence.",
+    );
+    metric(
+      "cgp_relay_storage_estimate_unknown",
+      this.storageEstimateCompleted ? 0 : 1,
+      "Whether the relay has completed its initial storage estimate.",
+    );
+    metric(
+      "cgp_relay_storage_estimate_age_seconds",
+      this.storageEstimateCompleted
+        ? Math.max(0, Date.now() - this.storageStatus.checkedAt) / 1000
+        : 0,
+      "Age of the cached relay storage estimate in seconds.",
     );
     metric(
       "cgp_relay_storage_used_bytes",

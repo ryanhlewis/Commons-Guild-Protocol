@@ -1,5 +1,6 @@
 ﻿import { Level } from "level";
 import fs from "node:fs/promises";
+import type { Dirent } from "node:fs";
 import type { ConsensusPersistentState } from "./consensus_v2";
 import type { LegacyConsensusFreezeRecord } from "@cgp/core";
 import {existsSync} from "node:fs";
@@ -649,30 +650,48 @@ export class LevelStore implements Store {
         let bytes = 0;
         let files = 0;
 
-        const walk = async (dir: string) => {
-            const entries = await fs.readdir(dir, { withFileTypes: true });
-            for (const entry of entries) {
-                const fullPath = path.join(dir, entry.name);
-                if (entry.isDirectory()) {
-                    await walk(fullPath);
-                    continue;
-                }
-                if (!entry.isFile()) {
-                    continue;
-                }
-                const stat = await fs.stat(fullPath);
-                bytes += stat.size;
-                files += 1;
-            }
-        };
-
         try {
-            await walk(this.dbPath);
+            let rootEntries: Dirent[];
+            try {
+                rootEntries = await fs.readdir(this.dbPath, { withFileTypes: true });
+            } catch (error: any) {
+                if (error?.code === "ENOENT") {
+                    return { bytes: 0, files: 0, path: this.dbPath, checkedAt };
+                }
+                throw error;
+            }
+
+            let pendingDirectories: Array<{ dir: string; entries?: Dirent[] }> = [
+                { dir: this.dbPath, entries: rootEntries },
+            ];
+            while (pendingDirectories.length) {
+                const directoryBatch = pendingDirectories.splice(0, 8);
+                const discoveredDirectories: string[] = [];
+                const filesInBatch: string[] = [];
+                await Promise.all(directoryBatch.map(async ({ dir, entries: knownEntries }) => {
+                    const entries = knownEntries ?? await fs.readdir(dir, { withFileTypes: true });
+                    for (const entry of entries) {
+                        const fullPath = path.join(dir, entry.name);
+                        if (entry.isDirectory()) discoveredDirectories.push(fullPath);
+                        else if (entry.isFile()) filesInBatch.push(fullPath);
+                    }
+                }));
+
+                // Level stores can contain many small files. Stat files in a
+                // fixed-size batch so a large flat directory does not serialize
+                // one filesystem round-trip per file or overwhelm the disk.
+                for (let offset = 0; offset < filesInBatch.length; offset += 64) {
+                    const batch = filesInBatch.slice(offset, offset + 64);
+                    const sizes = await Promise.all(batch.map(async (file) =>
+                        (await fs.stat(file)).size,
+                    ));
+                    bytes += sizes.reduce((total, size) => total + size, 0);
+                    files += sizes.length;
+                }
+                pendingDirectories.push(...discoveredDirectories.map((dir) => ({ dir })));
+            }
             return { bytes, files, path: this.dbPath, checkedAt };
         } catch (error: any) {
-            if (error?.code === "ENOENT") {
-                return { bytes: 0, files: 0, path: this.dbPath, checkedAt };
-            }
             return {
                 bytes,
                 files,
