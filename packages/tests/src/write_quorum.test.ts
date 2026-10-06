@@ -9,12 +9,14 @@ import {
 import { MemoryStore } from "@cgp/relay";
 
 class VoteBus {
+  dropVotes = false;
   private handlers = new Set<(vote: RelayWriteQuorumVote) => void>();
   private proposalHandlers = new Set<(proposal: RelayWriteProposal) => void>();
 
   transport(): RelayWriteVoteTransport {
     return {
       publish: (vote) => {
+        if (this.dropVotes) return;
         for (const handler of this.handlers) {
           queueMicrotask(() => handler(vote));
         }
@@ -82,6 +84,22 @@ function coordinator(
 }
 
 describe("relay write quorum coordinator", () => {
+  it("rebroadcasts an exact fenced witness vote after its first delivery is lost", async () => {
+    const keys = identities(3), members = keys.map(key => key.publicKey);
+    const bus = new VoteBus();
+    const nodes = keys.map(key => coordinator(key, members, new MemoryStore(), bus));
+    try {
+      await Promise.all(nodes.map(node => node.start()));
+      bus.dropVotes = true;
+      const original = proposal("lost-vote");
+      await expect(nodes[0].authorize(original)).rejects.toThrow("1/2 votes");
+      bus.dropVotes = false;
+      expect(await nodes[0].authorize(original)).toHaveLength(2);
+      await expect(nodes[1].authorize(proposal("competing"))).rejects.toThrow("already voted");
+    } finally {
+      await Promise.all(nodes.map(node => node.close()));
+    }
+  });
   it("authorizes a majority partition and rejects an isolated minority", async () => {
     const keys = identities(3);
     const members = keys.map((key) => key.publicKey);

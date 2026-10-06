@@ -625,3 +625,47 @@ export async function socketDataToCgpFrame(data: unknown, options: CgpWireParseO
     }
     return parseCgpWireData(data, options);
 }
+import type { ConsensusHistory, ConsensusValue, LegacyConsensusMigrationRequest, LegacyConsensusFreeze } from './consensus_v2.js';
+import type { DeviceAuthorization } from './types.js';
+
+export interface ConsensusReadPayload {
+    protocol: 'cgp/consensus-read/2';
+    guildId: string;
+    requestId: string;
+    createdAt: number;
+}
+export interface ConsensusRequestAuthorization {
+    author: string;
+    createdAt: number;
+    signature: string;
+    deviceAuthorization?: DeviceAuthorization;
+}
+export interface ConsensusHistoryRequest extends ConsensusRequestAuthorization {
+    requestId: string;
+    guildId: string;
+}
+export interface ConsensusPublishRequest extends ConsensusHistoryRequest {
+    value: ConsensusValue;
+}
+export interface ConsensusFreezeRequest extends ConsensusHistoryRequest {
+    migration: LegacyConsensusMigrationRequest;
+}
+export interface ConsensusImportRequest extends ConsensusHistoryRequest {
+    history: ConsensusHistory;
+}
+export interface ConsensusFrozenResult {
+    requestId: string;
+    guildId: string;
+    freeze: LegacyConsensusFreeze;
+}
+export interface ConsensusResult {
+    requestId: string;
+    guildId: string;
+    history: ConsensusHistory;
+}
+export interface ConsensusError {
+    requestId: string;
+    guildId: string;
+    code: string;
+    message: string;
+}

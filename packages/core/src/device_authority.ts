@@ -370,13 +370,15 @@ export class DeviceAuthorityRegistry {
         return this.pins.get(accountPublicKey.toLowerCase());
     }
 
+    trustedPins(): DeviceAuthorityPin[] { return [...this.pins.values()].map(pin => ({...pin})); }
+
     /** Restore only a pin previously verified and committed to the operator's local store. */
     restoreTrustedPin(pin: DeviceAuthorityPin) {
         if (!PUBLIC_KEY_PATTERN.test(pin?.accountPublicKey) || !PUBLIC_KEY_PATTERN.test(pin.authorityPublicKey) ||
             !Number.isSafeInteger(pin.generation) || pin.generation < 1 || !Number.isSafeInteger(pin.revocationEpoch) || pin.revocationEpoch < 0 ||
             !Number.isSafeInteger(pin.activatedAt) || pin.activatedAt < 1) throw new Error('Stored device authority pin is invalid');
         const current = this.pins.get(pin.accountPublicKey);
-        if (current && (current.generation > pin.generation || current.revocationEpoch > pin.revocationEpoch)) return;
+        if (current && (current.generation > pin.generation || (current.generation === pin.generation && current.revocationEpoch > pin.revocationEpoch))) return;
         if (current && current.generation === pin.generation && current.authorityPublicKey !== pin.authorityPublicKey) throw new Error('Stored device authority pin conflicts with memory');
         this.remember({...pin,activatedAt:Math.min(current?.activatedAt ?? pin.activatedAt,pin.activatedAt)});
     }

@@ -79,6 +79,25 @@ async function waitFor(predicate: () => Promise<boolean>, timeoutMs = 5000) {
 }
 
 describe("signed relay heads", () => {
+    it("counts a signer once across duplicate heads and preserves equivocation evidence", async () => {
+        const keys = keyPair();
+        const head = await fakeHead(keys.priv, {
+            relayId: "one-operator", guildId: "continuity", headSeq: 3,
+            headHash: "a".repeat(64), prevHash: "b".repeat(64), checkpointSeq: null, checkpointHash: null,
+        });
+        const alias = await fakeHead(keys.priv, { ...head, relayId: "another-endpoint" });
+        expect(() => assertRelayHeadQuorum("continuity", [head, alias], {
+            minValidHeads: 2, minCanonicalCount: 2,
+        })).toThrow("1/2 valid heads");
+        const alternateEncoding = { ...head, relayPublicKey: Buffer.from(secp.getPublicKey(keys.priv, false)).toString("hex") };
+        alternateEncoding.signature = await sign(keys.priv, relayHeadId(alternateEncoding));
+        expect(verifyRelayHead(alternateEncoding)).toBe(true);
+        expect(() => assertRelayHeadQuorum("continuity", [head, alternateEncoding], {
+            minValidHeads: 2, minCanonicalCount: 2,
+        })).toThrow("1/2 valid heads");
+        const conflict = await fakeHead(keys.priv, { ...head, headHash: "c".repeat(64) });
+        expect(() => assertRelayHeadQuorum("continuity", [head, conflict])).toThrow("conflicts");
+    });
     const relays: RelayServer[] = [];
     const clients: CgpClient[] = [];
 

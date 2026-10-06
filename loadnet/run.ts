@@ -2,6 +2,7 @@ import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { normalizeProfile, type LoadnetProfile } from "./profile";
+import { dockerInvocation } from "./docker";
 
 const positionalArgs = collectPositionalArgs();
 
@@ -57,6 +58,7 @@ function tsxBinArgs(script: string, args: string[] = []) {
 }
 
 function run(command: string, args: string[] = [], stdio: "inherit" | "pipe" = "inherit") {
+    if (command === bin("docker")) ({ command, args } = dockerInvocation(args));
     console.log(`> ${[command, ...args].join(" ")}`);
     const output = execFileSync(command, args, {
         cwd: process.cwd(),
@@ -188,7 +190,8 @@ function logContainerTail(containerId: string | undefined, tail = 200) {
 
 function waitContainer(containerId: string, timeoutMs = 0): Promise<number> {
     return new Promise((resolve, reject) => {
-        const child = spawn(bin("docker"), ["wait", containerId], {
+        const invocation = dockerInvocation(["wait", containerId]);
+        const child = spawn(invocation.command, invocation.args, {
             cwd: process.cwd(),
             stdio: ["ignore", "pipe", "pipe"]
         });
@@ -410,6 +413,7 @@ async function main() {
     try {
         {
             const composeArgs = ["--profile", profileName, "--output", composeFile, "--image", image, "--run-id", runId];
+            composeArgs.push("--data-dir", path.resolve("loadnet", "run-data", runId));
             if (wireFormat !== undefined) {
                 composeArgs.push("--wire-format", wireFormat);
             }

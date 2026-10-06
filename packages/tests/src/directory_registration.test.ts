@@ -8,7 +8,7 @@ import { generatePrivateKey, getPublicKey, sign, hashObject, directoryRegistrati
 
 async function fixture(run: (service: DirectoryService) => Promise<void>) {
     const root = await mkdtemp(join(tmpdir(), 'cgp-registration-'));
-    const service = new DirectoryService(join(root, 'db'));
+    const service = new DirectoryService(join(root, 'db'), {workBits:0});
     try { await run(service); } finally { await service.close(); await rm(root, {recursive:true,force:true}); }
 }
 async function registration(key = generatePrivateKey(), timestamp = Date.now(), relays = ['wss://relay.example']) {
@@ -24,13 +24,13 @@ test('preserves legacy ownership and v2 registrations across database restarts',
     const db = new Level(path);
     await db.put('alice', JSON.stringify({handle:'alice',guildId:'guild',guildPubkey:a.pub,registeredAt:a.timestamp-1,relays:a.relays,registrationSignature:await sign(a.key,hashObject(`REGISTER:alice:guild:${a.timestamp-1}`))}));
     await db.close();
-    let service = new DirectoryService(path);
+    let service = new DirectoryService(path, {workBits:0});
     try {
         expect((await service.getEntry('alice'))!.registrationVersion).toBeUndefined();
         await expect(submit(service,await registration())).rejects.toThrow('owned');
         await submit(service,a);
         await service.close();
-        service = new DirectoryService(path);
+        service = new DirectoryService(path, {workBits:0});
         const lookup = (await service.getLookupProof('alice'))!;
         expect(lookup.entry.registrationVersion).toBe(2);
         expect(lookup.entry.guildPubkey).toBe(a.pub);

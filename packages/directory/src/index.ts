@@ -4,6 +4,9 @@ import { sha256 } from "@noble/hashes/sha256";
 import { GuildId, PublicKeyHex, hashObject, verify, sign, generatePrivateKey, getPublicKey, directoryRegistrationPayload,
     DeviceAuthorityRegistry, deviceAuthorityContinues, verifyDeviceAuthorizedObject, type DeviceAuthorization } from "@cgp/core";
 import { Level } from "level";
+import { admissionNetworkKey } from '@cgp/core';
+import { DIRECTORY_MAX_ENTRIES, DIRECTORY_MAX_ENTRY_BYTES, DIRECTORY_MAX_AUTHORITY_ROOTS } from '@cgp/core';
+import { admissionWorkValid, DIRECTORY_WORK_BITS, DIRECTORY_MAX_HANDLES, DIRECTORY_LEASE_MS, DIRECTORY_GRACE_MS, DIRECTORY_LEASE_MIGRATION_AT, RESERVED_DIRECTORY_HANDLES, handleLeaseState } from '@cgp/core';
 
 export interface DirectoryValue {
     guildId: GuildId;
@@ -14,6 +17,8 @@ export interface DirectoryValue {
     registrationSignature?: string;
     registrationVersion?: number;
     deviceAuthorization?: DeviceAuthorization;
+    leaseExpiresAt?: number;
+    reclaimAfter?: number;
 }
 
 export interface DirectorySnapshot {
@@ -44,12 +49,13 @@ export class DirectoryService {
     private ready: Promise<void>;
     private mutations: Promise<void> = Promise.resolve();
     private entries = new Map<string, DirectoryValue>();
-    private authorities = new DeviceAuthorityRegistry();
+    private authorities = new DeviceAuthorityRegistry(DIRECTORY_MAX_AUTHORITY_ROOTS);
+    private accountRates = new Map<string,{minute:number;count:number}>();
     private treeSize = 0;
     private operatorPrivateKey: Uint8Array;
     public readonly operatorPubkey: PublicKeyHex;
 
-    constructor(dbPath: string = "./directory-db", options: { operatorPrivateKey?: Uint8Array } = {}) {
+    constructor(dbPath: string = "./directory-db", private options: { operatorPrivateKey?: Uint8Array; workBits?: number; maxHandles?: number } = {}) {
         this.db = new Level(dbPath);
         this.tree = new MerkleTree([], sha256);
         this.operatorPrivateKey = options.operatorPrivateKey ?? generatePrivateKey();
@@ -57,7 +63,7 @@ export class DirectoryService {
         this.ready = this.rebuildTree();
     }
 
-    async register(handle: string, guildId: GuildId, guildPubkey: PublicKeyHex, signature: string, timestamp: number, relays?: string[], deviceAuthorization?: DeviceAuthorization) {
+    async register(handle: string, guildId: GuildId, guildPubkey: PublicKeyHex, signature: string, timestamp: number, relays?: string[], deviceAuthorization?: DeviceAuthorization, admissionNonce?: string) {
         await this.ready;
         if (typeof handle !== 'string' || !/^[a-z0-9][a-z0-9/_-]{0,63}$/.test(handle) ||
             typeof guildId !== 'string' || !guildId || guildId.length > 192 ||
@@ -82,9 +88,10 @@ export class DirectoryService {
         }
 
         const value: DirectoryValue = { handle, guildId, guildPubkey, relays: routes, registeredAt: timestamp, registrationSignature: signature,
-            registrationVersion: deviceAuthorization ? 3 : 2, ...(deviceAuthorization ? { deviceAuthorization } : {}) };
+            registrationVersion: deviceAuthorization ? 3 : 2, leaseExpiresAt: timestamp + DIRECTORY_LEASE_MS, reclaimAfter: timestamp + DIRECTORY_LEASE_MS + DIRECTORY_GRACE_MS, ...(deviceAuthorization ? { deviceAuthorization } : {}) };
         const operation = this.mutations.then(async () => {
             const pin = this.authorities.get(guildPubkey);
+            if(deviceAuthorization&&!pin&&this.authorities.trustedPins().length>=DIRECTORY_MAX_AUTHORITY_ROOTS)throw new Error('Directory authority capacity reached');
             if (deviceAuthorization) {
                 if (!deviceAuthorityContinues(deviceAuthorization.binding, pin)) throw new Error('Directory authorization conflicts with the pinned authority');
                 const checked = verifyDeviceAuthorizedObject(payload, signature, deviceAuthorization, { accountPublicKey: guildPubkey,
@@ -92,17 +99,40 @@ export class DirectoryService {
                 if (!checked.ok) throw new Error(checked.error || 'Directory device authorization is invalid');
             } else if (pin) throw new Error('Direct account registration is disabled after device authority activation');
             const previous = this.entries.get(handle);
+            const expired=[...this.entries.values()].filter(entry=>entry.handle!==handle&&handleLeaseState(entry,now)==='reclaimable');
+            const minute=Math.floor(now/60000);
+            for(const [key,row] of this.accountRates)if(row.minute!==minute)this.accountRates.delete(key);
+            const rate=this.accountRates.get(guildPubkey)||{minute,count:0};
+            if(rate.count>=30 || this.accountRates.size>=10000)throw new Error('Directory account rate limit reached');
+            rate.count++;this.accountRates.set(guildPubkey,rate);
+            const sameOwner = previous?.guildPubkey.toLowerCase() === guildPubkey;
+            const newClaim = !sameOwner || handleLeaseState(previous!, now) === 'reclaimable';
+            if (newClaim) {
+                if (!previous && this.entries.size-expired.length >= DIRECTORY_MAX_ENTRIES) throw new Error('Directory capacity reached');
+                if (RESERVED_DIRECTORY_HANDLES.has(handle.split('/')[0])) throw new Error('Reserved directory handle');
+                if (previous && handleLeaseState(previous, now) !== 'reclaimable') throw new Error('Handle is owned by another key');
+                const owned = [...this.entries.values()].filter(entry => entry.guildPubkey === guildPubkey && handleLeaseState(entry, now) !== 'reclaimable').length;
+                if (owned >= (this.options.maxHandles ?? DIRECTORY_MAX_HANDLES)) throw new Error('Directory owner handle quota reached');
+                if (!admissionWorkValid(hashObject(payload), admissionNonce ?? '0', this.options.workBits ?? DIRECTORY_WORK_BITS)) throw new Error('Directory admission work required');
+            }
             if (previous) {
-                if (previous.guildPubkey.toLowerCase() !== guildPubkey) throw new Error('Handle is owned by another key');
                 if (hashObject(previous) === hashObject(value)) return; // Safe idempotent retry.
                 if (timestamp <= (previous.registeredAt ?? 0)) throw new Error('Registration update must be newer');
             }
             const entries = new Map(this.entries);
+            for(const entry of expired)entries.delete(entry.handle);
             entries.set(handle, value);
+            if([...entries.values()].reduce((sum,entry)=>sum+Buffer.byteLength(JSON.stringify(entry)),0)>DIRECTORY_MAX_ENTRY_BYTES)throw new Error('Directory metadata byte budget reached');
             // Build before persistence: a failed write leaves the published snapshot intact.
             const tree = this.treeFor(entries);
-            await this.db.put(handle, JSON.stringify(value));
-            if (deviceAuthorization) this.authorities.verify(payload, signature, guildPubkey, deviceAuthorization, 'publish', now);
+            const candidate = new DeviceAuthorityRegistry(DIRECTORY_MAX_AUTHORITY_ROOTS);
+            const priorPin = this.authorities.get(guildPubkey);
+            if (priorPin) candidate.restoreTrustedPin(priorPin);
+            if (deviceAuthorization) candidate.verify(payload, signature, guildPubkey, deviceAuthorization, 'publish', now);
+            const nextPin = candidate.get(guildPubkey);
+            if (nextPin || expired.length) await this.db.batch([{type:'put' as const,key:handle,value:JSON.stringify(value)},...(nextPin?[{type:'put' as const,key:`!authority:${guildPubkey}`,value:JSON.stringify(nextPin)}]:[]),...expired.map(entry=>({type:'del' as const,key:entry.handle}))]);
+            else await this.db.put(handle, JSON.stringify(value));
+            if (nextPin) this.authorities.restoreTrustedPin(nextPin);
             // No await between publishing entries and tree; readers see one snapshot.
             this.entries = entries;
             this.tree = tree;
@@ -115,13 +145,13 @@ export class DirectoryService {
     async getEntry(handle: string): Promise<DirectoryValue | undefined> {
         await this.ready;
         const entry = this.entries.get(handle);
-        return entry ? structuredClone(entry) : undefined;
+        return entry && handleLeaseState(entry) !== 'reclaimable' ? structuredClone(entry) : undefined;
     }
 
     async getProof(handle: string) {
         await this.ready;
         const entry = this.entries.get(handle);
-        if (!entry) return null;
+        if (!entry || handleLeaseState(entry) === 'reclaimable') return null;
         const leaf = this.hashEntry(entry);
         return this.tree.getHexProof(leaf);
     }
@@ -148,7 +178,7 @@ export class DirectoryService {
     async getLookupProof(handle: string): Promise<DirectoryLookupProof | null> {
         await this.ready;
         const entry = this.entries.get(handle);
-        if (!entry) return null;
+        if (!entry || handleLeaseState(entry) === 'reclaimable') return null;
         return {
             entry: structuredClone(entry),
             proof: this.tree.getHexProof(this.hashEntry(entry)),
@@ -159,8 +189,15 @@ export class DirectoryService {
     private async rebuildTree() {
         const entries = new Map<string, DirectoryValue>();
         // Scan all entries
-        for await (const [, value] of this.db.iterator()) {
+        const pins: any[] = [];
+        for await (const [key, value] of this.db.iterator()) {
+            if (key.startsWith('!authority:')) { pins.push(JSON.parse(value)); continue; }
             const entry = JSON.parse(value);
+            if (entry.leaseExpiresAt === undefined) {
+                entry.leaseExpiresAt = DIRECTORY_LEASE_MIGRATION_AT + DIRECTORY_LEASE_MS;
+                entry.reclaimAfter = entry.leaseExpiresAt + DIRECTORY_GRACE_MS;
+                await this.db.put(entry.handle, JSON.stringify(entry));
+            }
             entries.set(entry.handle, entry);
         }
 
@@ -172,6 +209,10 @@ export class DirectoryService {
                 entry.registrationSignature!, entry.guildPubkey, entry.deviceAuthorization, 'publish', entry.registeredAt!);
             if (!checked.ok) throw new Error('Stored directory device authorization failed verification');
         }
+        for (const pin of pins) this.authorities.restoreTrustedPin(pin);
+        const storedPins=new Set(pins.map(pin=>pin.accountPublicKey));
+        const migratedPins=this.authorities.trustedPins().filter(pin=>!storedPins.has(pin.accountPublicKey)).map(pin=>({type:'put' as const,key:`!authority:${pin.accountPublicKey}`,value:JSON.stringify(pin)}));
+        if(migratedPins.length)await this.db.batch(migratedPins);
         this.tree = this.treeFor(entries);
         this.treeSize = entries.size;
     }
@@ -189,6 +230,7 @@ export class DirectoryService {
         await this.mutations;
         await this.db.close();
     }
+    admissionPolicy() { return { protocol: 'cgp-directory-admission/1', workBits: this.options.workBits ?? DIRECTORY_WORK_BITS, maxHandles: this.options.maxHandles ?? DIRECTORY_MAX_HANDLES, leaseMs: DIRECTORY_LEASE_MS, graceMs: DIRECTORY_GRACE_MS }; }
 }
 
 export function verifyDirectoryLookupProof(
@@ -198,6 +240,8 @@ export function verifyDirectoryLookupProof(
     if (!lookup?.entry || !Array.isArray(lookup.proof) || !lookup.snapshot) {
         return false;
     }
+
+    if (handleLeaseState(lookup.entry) === 'reclaimable') return false;
     if (options.expectedHandle !== undefined && lookup.entry.handle !== options.expectedHandle) {
         return false;
     }
@@ -281,7 +325,19 @@ let service: DirectoryService;
 if (isMainModule) {
     service = new DirectoryService();
 
-    app.use(express.json());
+    app.use(express.json({limit:'32kb'}));
+    const rates=new Map<string,{minute:number;count:number}>();
+    app.use('/register',(req,res,next)=>{
+        const minute=Math.floor(Date.now()/60000),address=req.socket.remoteAddress||'unknown';
+        for(const [key,row] of rates)if(row.minute!==minute)rates.delete(key);
+        for(const [key,limit] of [['all',300],[`ip:${address}`,30],[`network:${admissionNetworkKey(address)}`,90]] as const){
+            const row=rates.get(key)||{minute,count:0};
+            if(row.count>=limit||rates.size>=10000)return res.status(429).set('Retry-After','60').json({error:'Directory registration rate limit reached'});
+            row.count++;rates.set(key,row);
+        }
+        next();
+    });
+    app.get('/policy', (_req, res) => res.json(service.admissionPolicy()));
 
     app.post("/register", async (req, res) => {
         const { handle, guildId, guildPubkey, signature, timestamp, relays, deviceAuthorization } = req.body;
@@ -289,9 +345,10 @@ if (isMainModule) {
             return res.status(400).json({ error: "Missing fields" });
         }
         try {
-            await service.register(handle, guildId, guildPubkey, signature, timestamp, relays, deviceAuthorization);
+            await service.register(handle, guildId, guildPubkey, signature, timestamp, relays, deviceAuthorization, req.body.admissionNonce);
             res.json({ success: true });
         } catch (e: any) {
+            if (e.message.includes('admission work')) return res.status(428).json({ error: e.message, ...service.admissionPolicy() });
             res.status(400).json({ error: e.message });
         }
     });
@@ -311,7 +368,8 @@ if (isMainModule) {
         res.json({ root: snapshot.root, snapshot });
     });
 
-    app.listen(port, () => {
+    const server=app.listen(port, () => {
         console.log(`Directory service listening on port ${port}`);
     });
+    server.requestTimeout=15000;server.headersTimeout=15000;
 }

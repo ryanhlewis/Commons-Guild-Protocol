@@ -1,3 +1,5 @@
+import {verifyArchiveEvent as verifyEvent,withValidatedJsonlCopy} from "./backup-validation.js";
+import {backupRelayStore,restoreRelayStore} from "@cgp/relay/src/store_snapshot";
 import fs from "node:fs";
 import path from "node:path";
 import { once } from "node:events";
@@ -17,7 +19,8 @@ import {
     sign,
     summarizeRelayHeadQuorum,
     verify,
-    verifyRelayHead
+    verifyRelayHead,
+    verifyDeviceAuthorizedObject
 } from "@cgp/core";
 
 function argValue(name: string, fallback?: string) {
@@ -42,36 +45,6 @@ function positiveIntegerArg(name: string, fallback: number, max = Number.MAX_SAF
 
 function command() {
     return process.argv.find((arg, index) => index > 1 && !arg.startsWith("--")) || "help";
-}
-
-function verifyEvent(event: GuildEvent, previous?: GuildEvent) {
-    const errors: string[] = [];
-    if (previous) {
-        if (event.seq !== previous.seq + 1) {
-            errors.push(`seq ${event.seq} does not follow ${previous.seq}`);
-        }
-        if (event.prevHash !== previous.id) {
-            errors.push(`prevHash mismatch at seq ${event.seq}`);
-        }
-    } else {
-        if (event.seq !== 0) {
-            errors.push(`first seq is ${event.seq}, expected 0`);
-        }
-        if (event.prevHash !== null) {
-            errors.push("genesis prevHash must be null");
-        }
-    }
-
-    const expectedId = computeEventId(event);
-    if (expectedId !== event.id) {
-        errors.push(`event id mismatch at seq ${event.seq}`);
-    }
-
-    if (!verify(event.author, hashObject({ body: event.body, author: event.author, createdAt: event.createdAt }), event.signature)) {
-        errors.push(`signature mismatch at seq ${event.seq}`);
-    }
-
-    return errors;
 }
 
 async function* iterateGuildEvents(store: LevelStore, guildId: string): AsyncIterable<GuildEvent> {
@@ -557,9 +530,13 @@ async function runRestoreDb() {
 }
 
 async function runRestoreJsonl() {
+    const input=argValue("input");if(!input)throw Error("restore-jsonl requires --input");
+    return withValidatedJsonlCopy(path.resolve(input), runRestoreJsonlFromValidatedCopy);
+}
+
+async function runRestoreJsonlFromValidatedCopy(input: string) {
     const db = argValue("db");
-    const input = argValue("input");
-    if (!db || !input) throw new Error("restore-jsonl requires --db <path> --input <file>");
+    if (!db) throw new Error("restore-jsonl requires --db <path>");
 
     fs.mkdirSync(path.resolve(db), { recursive: true });
     const store = new LevelStore(path.resolve(db));
@@ -713,14 +690,14 @@ async function runRepairFromQuorum() {
         throw new Error("repair-from-quorum requires --db <leveldb-path> --guild <id> --relays <ws://a,ws://b>");
     }
 
-    const relays = relaySpec.split(",").map((relay) => relay.trim()).filter(Boolean);
+    const relays = [...new Set(relaySpec.split(",").map((relay) => relay.trim()).filter(Boolean))];
     if (relays.length === 0) {
         throw new Error("repair-from-quorum requires at least one relay");
     }
 
     const privateKey = privateKeyFromHex(argValue("private-key-hex"));
     const limit = positiveIntegerArg("limit", 10000, 10000);
-    const minValidHeads = positiveIntegerArg("min-valid-heads", Math.max(1, Math.ceil(relays.length / 2)));
+    const minValidHeads = positiveIntegerArg("min-valid-heads", Math.floor(relays.length / 2) + 1);
     const minCanonicalCount = positiveIntegerArg("min-canonical-count", minValidHeads);
     const requireNoConflicts = !hasFlag("allow-conflicts");
     const timeoutMs = positiveIntegerArg("timeout-ms", 10000);
@@ -884,6 +861,8 @@ function printHelp() {
     console.log(`CGP relay ops
 
 Commands:
+  backup-store --db <stopped-leveldb> --output <new-snapshot-file>
+  restore-store --db <new-distinct-target> --input <snapshot> --expected-sha256 <external-digest> --expected-source <original-db-path>
   verify-log    --db <leveldb-path> [--guild <guild-id>]
   export-guild  --db <leveldb-path> --guild <guild-id> --output <file>
   backup-db     --db <leveldb-path> --output <file>
@@ -900,6 +879,14 @@ Commands:
 
 async function main() {
     switch (command()) {
+        case "backup-store": {
+            const db=argValue("db"),output=argValue("output");if(!db||!output)throw Error("backup-store requires --db and --output");
+            console.log(JSON.stringify(await backupRelayStore(db,output),null,2));return;
+        }
+        case "restore-store": {
+            const db=argValue("db"),input=argValue("input"),sha=argValue("expected-sha256"),source=argValue("expected-source");if(!db||!input||!sha||!source)throw Error("restore-store requires --db, --input, --expected-sha256 and --expected-source");
+            console.log(JSON.stringify(await restoreRelayStore(input,db,sha,source),null,2));return;
+        }
         case "verify-log":
             return await runVerifyLog();
         case "export-guild":

@@ -5,7 +5,7 @@
     "scripts": {
         "dev": "tsx watch src/index.ts",
         "dev:clean": "node scripts/dev-clean.mjs",
-        "build": "tsc"
+        "build": "tsc && node scripts/copy-audit-helper.mjs"
     },
     "dependencies": {
         "@cgp/core": "*",

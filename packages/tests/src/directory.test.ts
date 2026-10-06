@@ -14,7 +14,7 @@ describe("Directory Service", () => {
 
     beforeEach(() => {
         if (fs.existsSync(DB_PATH)) fs.rmSync(DB_PATH, { recursive: true, force: true });
-        service = new DirectoryService(DB_PATH);
+        service = new DirectoryService(DB_PATH, {workBits:0});
     });
 
     afterEach(async () => {
@@ -107,7 +107,7 @@ describe("Directory Service", () => {
     it("requires an operator quorum for portable lookup trust", async () => {
         const secondDbPath = `${DB_PATH}-second`;
         if (fs.existsSync(secondDbPath)) fs.rmSync(secondDbPath, { recursive: true, force: true });
-        const secondService = new DirectoryService(secondDbPath);
+        const secondService = new DirectoryService(secondDbPath, {workBits:0});
         try {
             const handle = "quorum";
             const guildId = hashObject({ name: "directory-quorum" });
@@ -144,7 +144,7 @@ describe("Directory Service", () => {
 
     it("keeps directory discovery available when a minority is stale and defaults to a strict majority", async () => {
         const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cgp-directory-degraded-'));
-        const services = [0, 1, 2].map((index) => new DirectoryService(path.join(root, `db-${index}`)));
+        const services = [0, 1, 2].map((index) => new DirectoryService(path.join(root, `db-${index}`), {workBits:0}));
         try {
             const handle = "degraded";
             const guildId = hashObject({ name: "canonical-directory-entry" });

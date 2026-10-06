@@ -122,6 +122,7 @@ export function verifyRelayWriteCertificate(
                 {
                     accountPublicKey: event.author,
                     requiredCapability: "publish",
+                    now: event.createdAt,
                 },
             ).ok
             : verifyObject(
@@ -151,6 +152,7 @@ export function verifyRelayWriteCertificate(
     if (certificate.proposalId !== proposalId) {
         return false;
     }
+    if (!Array.isArray(certificate.votes)) return false;
     const memberSet = new Set(policy.members);
     const voters = new Set<string>();
     for (const vote of certificate.votes) {
@@ -165,7 +167,10 @@ export function verifyRelayWriteCertificate(
             vote.headHash !== event.prevHash ||
             vote.proposalId !== proposalId ||
             !Number.isSafeInteger(vote.votedAt) ||
-            Math.abs(vote.votedAt - event.createdAt) > 5 * 60 * 1000 ||
+            // An unchanged signed proposal can be retried after a long outage.
+            // The vote must not predate its payload beyond clock skew, but a
+            // later vote is not evidence that the historical payload is invalid.
+            vote.votedAt < event.createdAt - 5 * 60 * 1000 ||
             !verify(
                 relayPublicKey,
                 hashObject(voteSigningPayload(vote)),

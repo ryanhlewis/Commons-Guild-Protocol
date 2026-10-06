@@ -93,6 +93,17 @@ describe("Hollow room relay", () => {
     relay?.close();
   });
 
+  it("issues a shared call start to late joiners", async () => {
+    const roomId = `server:timing-${Date.now()}`;
+    const first = await openJoinedPeer(`ws://127.0.0.1:${port}`, roomId, "first");
+    const second = await openJoinedPeer(`ws://127.0.0.1:${port}`, roomId, "second");
+    try {
+      expect(first.joined.callStartedAt).toBe(first.joined.joinedAt);
+      expect(second.joined.callStartedAt).toBe(first.joined.callStartedAt);
+      expect(second.joined.peers[0].joinedAt).toBe(first.joined.joinedAt);
+    } finally { first.socket.close(); second.socket.close(); }
+  });
+
   it("advertises hollow-relay for Hollow game bridge discovery", async () => {
     const response = await fetch(
       `http://127.0.0.1:${port}/plugins/hollow-relay/relays`,

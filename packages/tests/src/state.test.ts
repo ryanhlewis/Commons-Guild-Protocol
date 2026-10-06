@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { createInitialState, applyEvent, GuildState } from "@cgp/core";
+import { createInitialState, applyEvent, GuildState, validateEvent } from "@cgp/core";
 import { GuildEvent, GuildCreate, ChannelCreate, RoleAssign, BanUser } from "@cgp/core";
 import { computeEventId } from "@cgp/core";
 
@@ -129,5 +129,90 @@ describe("State Reconstruction", () => {
 
         expect(state.bans.has(userId)).toBe(true);
         expect(state.members.has(userId)).toBe(false);
+    });
+
+    it("allows public self-join using only the signed author and grants no roles", () => {
+        const initial = createInitialState(createMockEvent(0, {
+            type: "GUILD_CREATE",
+            guildId,
+            name: "Public guild",
+            access: "public"
+        }, ownerId));
+        const join = createMockEvent(1, { type: "MEMBER_JOIN", guildId }, "joining-user");
+
+        expect(() => validateEvent(initial, join)).not.toThrow();
+        const joined = applyEvent(initial, join);
+        expect(joined.members.get("joining-user")).toEqual({
+            userId: "joining-user",
+            roles: new Set(),
+            joinedAt: join.createdAt
+        });
+        const existing = {
+            ...initial,
+            members: new Map(initial.members).set("joining-user", {
+                userId: "joining-user",
+                roles: new Set(["trusted-role"]),
+                joinedAt: 123
+            })
+        };
+        const repeated = applyEvent(existing, createMockEvent(2, { type: "MEMBER_JOIN", guildId }, "joining-user"));
+        expect(repeated.members.get("joining-user")).toEqual({
+            userId: "joining-user",
+            roles: new Set(["trusted-role"]),
+            joinedAt: 123
+        });
+        expect(() => validateEvent(joined, createMockEvent(2, {
+            type: "MEMBER_JOIN",
+            guildId,
+            userId: ownerId,
+            roleIds: ["owner"]
+        }, "joining-user"))).toThrow(/authenticated author/i);
+        expect(() => validateEvent(initial, createMockEvent(1, {
+            type: "MEMBER_JOIN",
+            guildId: "another-guild"
+        }, "joining-user"))).toThrow(/guildId must match/i);
+    });
+
+    it("rejects self-join to private or banned guilds", () => {
+        const privateState = createInitialState(createMockEvent(0, {
+            type: "GUILD_CREATE",
+            guildId,
+            name: "Private guild",
+            access: "private"
+        }, ownerId));
+        const join = createMockEvent(1, { type: "MEMBER_JOIN", guildId }, "joining-user");
+        expect(() => validateEvent(privateState, join)).toThrow(/public guilds/i);
+
+        const publicState = createInitialState(createMockEvent(0, {
+            type: "GUILD_CREATE",
+            guildId,
+            name: "Public guild",
+            access: "public"
+        }, ownerId));
+        const bannedState = applyEvent(publicState, createMockEvent(1, {
+            type: "BAN_USER",
+            guildId,
+            userId: "joining-user"
+        }, ownerId));
+        expect(() => validateEvent(bannedState, createMockEvent(2, {
+            type: "MEMBER_JOIN",
+            guildId
+        }, "joining-user"))).toThrow(/banned/i);
+    });
+
+    it("restricts party invite snapshots to the relay guild owner", () => {
+        const state = createInitialState(createMockEvent(0, {
+            type: "GUILD_CREATE",
+            guildId,
+            name: "Party metadata",
+            external: { kind: "hollow-party-metadata" }
+        } as any, ownerId));
+        const snapshot = createMockEvent(1, {
+            type: "PARTY_INVITE_SNAPSHOT",
+            guildId,
+            ownerId
+        }, ownerId);
+        expect(() => validateEvent(state, snapshot)).not.toThrow();
+        expect(() => validateEvent(state, createMockEvent(1, snapshot.body, "attacker"))).toThrow(/guild owner/i);
     });
 });

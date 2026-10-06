@@ -78,6 +78,12 @@ export interface MemberUpdate {
     external?: any;
 }
 
+/** A public guild join request. Membership is always derived from event.author. */
+export interface MemberJoin {
+    type: "MEMBER_JOIN";
+    guildId: GuildId;
+}
+
 export interface GuildEvent {
     id: HashHex;                // SHA256 of canonical encoding of `unsigned`
     seq: number;                // monotonically increasing integer >= 0
@@ -572,4 +578,5 @@ export type EventBody =
     | Checkpoint
     | EphemeralPolicyUpdate
     | MemberUpdate
+    | MemberJoin
     | SfuAuthoritySet;

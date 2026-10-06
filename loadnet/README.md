@@ -1,5 +1,14 @@
 # CGP Loadnet
 
+On Windows with Docker Engine installed in Ubuntu WSL and Docker Desktop stopped, opt in to the native engine:
+
+```powershell
+$env:CGP_LOADNET_DOCKER_WSL_DISTRO = 'Ubuntu'
+node node_modules/tsx/dist/cli.mjs loadnet/run.ts --profile=full-clients-smoke
+```
+
+This uses `/usr/bin/docker` inside the selected distribution and translates host bind paths; it does not expose the daemon over TCP or change the global Docker context. The runner stages scratch data under its unique run ID. Use `HOLLOW_DOCKER_WSL_DISTRO=Ubuntu` for Hollow's separate DM/MLS Docker gate. A protocol Loadnet pass is not qualification of the current Hollow UI, deployed endpoints, real TURN/SFU media, or production capacity; those need separately dated results.
+
 ## SFU authority hard gate
 
 The SFU control-plane gate runs five real CGP relay servers and websocket

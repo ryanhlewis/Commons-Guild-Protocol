@@ -271,6 +271,19 @@ export function applyEvent(state: GuildState, event: GuildEvent, options: { muta
     const bodyRecord = body as any;
 
     switch (bodyRecord.type) {
+        case "PARTY_LEADER_TRANSFER": {
+            if (!state.guildId.startsWith("party:") || event.author !== state.ownerId ||
+                typeof bodyRecord.leaderId !== "string" || !/^(02|03)[a-f0-9]{64}$/.test(bodyRecord.leaderId) || bodyRecord.leaderId === event.author) {
+                throw new Error("Invalid party leadership transfer");
+            }
+            const members = ensureMembers();
+            const previous = members.get(state.ownerId);
+            if (previous) members.set(state.ownerId, { ...previous, roles: new Set([...previous.roles].filter(role => role !== "owner")) });
+            const next = members.get(bodyRecord.leaderId);
+            members.set(bodyRecord.leaderId, { userId: bodyRecord.leaderId, joinedAt: next?.joinedAt ?? event.createdAt, ...next, roles: new Set([...(next?.roles ?? []), "owner"]) });
+            newState.ownerId = bodyRecord.leaderId;
+            break;
+        }
         case "GUILD_UPDATE": {
             if (typeof bodyRecord.name === "string" && bodyRecord.name.trim()) {
                 newState.name = bodyRecord.name;
@@ -560,6 +573,17 @@ export function applyEvent(state: GuildState, event: GuildEvent, options: { muta
             if (bodyRecord.isMuted !== undefined) (member as any).isMuted = Boolean(bodyRecord.isMuted);
             if (bodyRecord.isDeafened !== undefined) (member as any).isDeafened = Boolean(bodyRecord.isDeafened);
             ensureMembers().set(targetUserId, member);
+            break;
+        }
+        case "MEMBER_JOIN": {
+            const current = state.members.get(event.author);
+            if (!current) {
+                ensureMembers().set(event.author, {
+                    userId: event.author,
+                    roles: new Set(),
+                    joinedAt: event.createdAt
+                });
+            }
             break;
         }
         case "SFU_AUTHORITY_SET": {

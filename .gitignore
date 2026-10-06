@@ -155,3 +155,4 @@ dist
 .wrangler/
 .svelte-kit/
 /output/
+/.local/

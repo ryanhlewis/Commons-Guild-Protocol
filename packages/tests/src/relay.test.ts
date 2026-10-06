@@ -160,6 +160,35 @@ describe("CGP relay basic messaging", () => {
         await new Promise((res) => setTimeout(res, 200));
     });
 
+    it("accepts a signed public self-join and exposes the author in relay member snapshots", async () => {
+        const ownerPrivateKey = secp.utils.randomPrivateKey();
+        const ownerPublicKey = Buffer.from(secp.getPublicKey(ownerPrivateKey, true)).toString("hex");
+        const joiningPrivateKey = secp.utils.randomPrivateKey();
+        const joiningPublicKey = Buffer.from(secp.getPublicKey(joiningPrivateKey, true)).toString("hex");
+        const owner = new CgpClient({ relays: [relayUrl], keyPair: { pub: ownerPublicKey, priv: ownerPrivateKey } });
+        const joiningClient = new CgpClient({
+            relays: [relayUrl],
+            keyPair: { pub: joiningPublicKey, priv: joiningPrivateKey }
+        });
+        await Promise.all([owner.connect(), joiningClient.connect()]);
+        try {
+            const guildId = await owner.createGuild("Public self-join relay test");
+            await new Promise((resolve) => setTimeout(resolve, 200));
+            await joiningClient.getState(guildId);
+            await joiningClient.publish({ type: "MEMBER_JOIN", guildId });
+            await new Promise((resolve) => setTimeout(resolve, 200));
+            const members = await owner.getMembers(guildId);
+            expect(members).toContainEqual({
+                userId: joiningPublicKey,
+                roles: [],
+                joinedAt: expect.any(Number)
+            });
+        } finally {
+            owner.close();
+            joiningClient.close();
+        }
+    });
+
     it("enforces create-only app objects at the relay boundary", async () => {
         const privateKey = secp.utils.randomPrivateKey();
         const publicKey = Buffer.from(

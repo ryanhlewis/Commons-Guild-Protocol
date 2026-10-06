@@ -1,5 +1,6 @@
 import { hashObject, verify } from "./crypto.js";
 import { HashHex, RelayHead, RelayHeadUnsigned } from "./types.js";
+import { ProjectivePoint } from "@noble/secp256k1";
 
 export interface RelayHeadConflict {
     guildId: string;
@@ -142,7 +143,18 @@ export function summarizeVerifiedRelayHeadQuorum(
     validHeads: RelayHead[],
     invalidHeads: RelayHead[] = []
 ): RelayHeadQuorum {
-    const scopedValidHeads = validHeads.filter((head) => head.guildId === guildId);
+    const allScopedHeads = validHeads.filter((head) => head.guildId === guildId);
+    // A signing identity is one witness even when exposed at several URLs or
+    // when the caller supplies repeated signed responses. Keep all responses
+    // for conflict detection so deduplication cannot hide equivocation.
+    const witnessedKeys = new Set<string>();
+    const scopedValidHeads = allScopedHeads.filter((head) => {
+        // Compressed and uncompressed encodings identify the same curve point.
+        const key = ProjectivePoint.fromHex(head.relayPublicKey).toHex(true);
+        if (witnessedKeys.has(key)) return false;
+        witnessedKeys.add(key);
+        return true;
+    });
     const buckets = new Map<string, { seq: number; hash: HashHex | null; count: number }>();
     let canonical: { seq: number; hash: HashHex | null; count: number } | undefined;
 
@@ -164,7 +176,7 @@ export function summarizeVerifiedRelayHeadQuorum(
         }
     }
 
-    const conflicts = findRelayHeadConflicts(scopedValidHeads);
+    const conflicts = findRelayHeadConflicts(allScopedHeads);
 
     return {
         guildId,

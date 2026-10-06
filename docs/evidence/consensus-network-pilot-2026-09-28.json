@@ -1,0 +1,71 @@
+{
+  "schema": "hollow.consensus-network-pilot.v1",
+  "runId": "consensus-network-1790641850431",
+  "completedAt": "2026-09-29T00:36:01.688Z",
+  "passed": true,
+  "testedProductRevision": "37fddeaa14b31561db028d6ff4cad03e7d1e0922",
+  "workerBundleSha256": "1b0f9d9b74461c59ef35450210e09f1e559918d1558c9defb4b7bcf6f823ed61",
+  "dependencyArchiveSha256": "c50d750d3f689683126cb852cb01ecc6bfc996d578ce9c2a2f9052a623263e6b",
+  "workerTtlMinutes": 30,
+  "physicalMachines": [
+    "CORTOP1",
+    "ECHO",
+    "CORTOP3"
+  ],
+  "voters": [
+    {
+      "newMember": false,
+      "oldMember": true,
+      "role": "A",
+      "machine": "CORTOP1"
+    },
+    {
+      "newMember": true,
+      "oldMember": true,
+      "role": "B",
+      "machine": "ECHO"
+    },
+    {
+      "newMember": true,
+      "oldMember": true,
+      "role": "C",
+      "machine": "CORTOP3"
+    },
+    {
+      "newMember": true,
+      "oldMember": false,
+      "role": "D",
+      "machine": "CORTOP1"
+    }
+  ],
+  "requiredVotes": 2,
+  "checks": [
+    "four authenticated public WSS voter identities on three physical PCs; TLS verification enabled",
+    "private genesis committed and signed outsider history read rejected",
+    "A/B majority accepted without commit, both restarted same LevelDB/key, C recovered exact earlier value over competing request",
+    "ABC→BCD administrator/old-majority/new-majority transition activates, old A refused, new D writes with BCD spanning three PCs",
+    "D alone cannot commit under unchanged BCD 2-of-3 policy; certified prefix unchanged",
+    "healed B/C/D converge on certified history and exact refused request subsequently commits"
+  ],
+  "transientReachabilityFailures": 420,
+  "controllerDnsFallbackObservations": 428,
+  "controllerDnsFallbackSuccesses": 8,
+  "cleanup": {
+    "independentAuditPassed": true,
+    "listenerPortsChecked": 6,
+    "historicalProcessIdsChecked": 12
+  },
+  "earlierAttempt": {
+    "workersStarted": 0,
+    "failure": "Controller local variable shadowing before worker startup",
+    "runId": "consensus-network-1790641839327"
+  },
+  "metadataCorrection": "Original ignored instances retain host=127.0.0.1 due metadata spread; machine and label identify routing. Future controller records routeHost separately. Original evidence was not rewritten.",
+  "scope": [
+    "temporary quick tunnels and foreground SSH workers only",
+    "30-minute worker TTL",
+    "three PCs under one owner; D is a new key on A host, not a new independent operator",
+    "signed RPC test controls and Node client; not browser/physical-media acceptance",
+    "fixture-only exact-host DNS fallback may be recorded; TLS SNI and verification unchanged"
+  ]
+}

@@ -1,6 +1,8 @@
+import {verifyArchiveEvent} from "../../../scripts/backup-validation";
 import { describe, expect, it } from "vitest";
 import {
     DeviceAuthorityRegistry,
+    createRelayWriteCertificate, computeEventId, relayWriteProposalId, verifyRelayWriteCertificate,
     encodeCgpFrame,
     generatePrivateKey,
     getPublicKey,
@@ -93,6 +95,19 @@ async function fixture() {
 }
 
 describe("delegated CGP device authorization", () => {
+    it("rechecks expiry and pinned revocation after identical signatures have been cached", async () => {
+        const value = await fixture(), registry = new DeviceAuthorityRegistry();
+        const payload = { content: 'same signed bytes' };
+        const signature = await value.signPayload(payload);
+        for (let index = 0; index < 3; index++) {
+            expect(registry.verify(payload, signature, value.accountPublicKey, value.authorization, 'publish', NOW + 1).ok).toBe(true);
+        }
+        expect(registry.verify(payload, signature, value.accountPublicKey, value.authorization, 'publish', value.authorization.certificate.expiresAt + 1).ok).toBe(false);
+        const newer = { ...value.authorization, revocation: await value.createRevocation(2) };
+        const newerSignature = await value.signPayload(payload, newer);
+        expect(registry.verify(payload, newerSignature, value.accountPublicKey, newer, 'publish', NOW + 3).ok).toBe(true);
+        expect(registry.verify(payload, signature, value.accountPublicKey, value.authorization, 'publish', NOW + 3).ok).toBe(false);
+    });
     it("verifies account binding, device certificate, and payload together", async () => {
         const value = await fixture();
         const payload = {
@@ -192,4 +207,17 @@ describe("delegated CGP device authorization", () => {
         const encoded = encodeCgpFrame("PUBLISH", payload, "binary-v2");
         expect(parseCgpWireData(encoded).payload).toEqual(payload);
     });
+});
+
+it.each([100,7200000])("verifies historical certificate time boundary %i",async(offset)=>{
+ const value=await fixture();const createdAt=NOW+offset,body={type:"GUILD_CREATE" as const,guildId:"historical-cert",name:"History"};
+ const author=value.accountPublicKey,payload={body,author,createdAt};
+ const event:any={...payload,seq:0,prevHash:null,deviceAuthorization:value.authorization,signature:await value.signPayload(payload)};event.id=computeEventId(event);
+ const keys=[generatePrivateKey(),generatePrivateKey(),generatePrivateKey()];const policy={epoch:"history",members:keys.map(getPublicKey),requiredVotes:2};
+ const proposal={guildId:body.guildId,headSeq:-1,headHash:null,...payload,signature:event.signature,deviceAuthorization:event.deviceAuthorization};const proposalId=relayWriteProposalId(policy.epoch,proposal);
+ const votes=await Promise.all(keys.slice(0,2).map(async key=>{const unsigned={protocol:"cgp/write-vote/1" as const,epoch:policy.epoch,relayPublicKey:getPublicKey(key),guildId:body.guildId,headSeq:-1,headHash:null,proposalId,votedAt:createdAt};return {...unsigned,signature:await sign(key,hashObject(unsigned))};}));
+ event.writeCertificate=createRelayWriteCertificate(policy,proposal,votes);
+ expect(verifyDeviceAuthorizedObject(payload,event.signature,value.authorization,{accountPublicKey:author,requiredCapability:"publish",now:NOW+7200000}).ok).toBe(false);
+ expect(verifyRelayWriteCertificate(event)).toBe(offset===100);
+ expect(verifyArchiveEvent(event).length===0).toBe(offset===100);
 });

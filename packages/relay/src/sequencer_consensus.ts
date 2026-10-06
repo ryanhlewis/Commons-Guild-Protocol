@@ -1,3 +1,4 @@
+import { normalizeRelayVoterMembers } from "./relay_voter_identity";
 import {
   hashObject,
   sign,
@@ -161,17 +162,12 @@ interface GuildRuntime {
   waiters: Map<string, Set<RequestWaiter>>;
 }
 
-function uniqueMembers(members: string[]) {
-  return Array.from(
-    new Set(members.map((member) => member.trim().toLowerCase()).filter(Boolean)),
-  );
-}
 
 export function normalizeRelaySequencerConsensusConfig(
   config: RelaySequencerConsensusConfig,
 ): Required<RelaySequencerConsensusConfig> {
   const epoch = config.epoch?.trim();
-  const members = uniqueMembers(config.members ?? []);
+  const members = normalizeRelayVoterMembers(config.members ?? []);
   if (!epoch) {
     throw new Error("Relay sequencer consensus requires an epoch");
   }
@@ -914,7 +910,7 @@ export class RelaySequencerConsensusCoordinator {
     let requestId: string | undefined;
     while (runtime.queued.length > 0 && !requestId) {
       const candidate = runtime.queued.shift();
-      if (candidate && runtime.queuedIds.delete(candidate)) {
+      if (candidate && runtime.queuedIds.delete(candidate) && runtime.waiters.has(candidate)) {
         requestId = candidate;
       }
     }
@@ -936,6 +932,13 @@ export class RelaySequencerConsensusCoordinator {
       certificate: runtime.leaderCertificate,
       selectedAt: Date.now(),
     });
+    // Storage/signing can outlast the request deadline. No token or proposal
+    // has escaped yet, so abandoning this unissued slot cannot discard votes.
+    if (!runtime.waiters.has(requestId)) {
+      runtime.activeRequestId = undefined;
+      await this.selectNext(runtime);
+      return;
+    }
     this.acceptProposal(runtime, proposal);
     try {
       await this.transport.publish(proposal);
@@ -1055,6 +1058,11 @@ export class RelaySequencerConsensusCoordinator {
           waiters.delete(waiter);
           if (waiters.size === 0) {
             runtime.waiters.delete(requestId);
+            // A deadline cancels only an unselected local queue entry. Never
+            // release an issued token/active slot: it may already have votes.
+            if (!runtime.tokens.has(requestId) && runtime.activeRequestId !== requestId) {
+              runtime.queuedIds.delete(requestId);
+            }
           }
           reject(
             new Error(

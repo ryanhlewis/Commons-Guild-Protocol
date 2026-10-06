@@ -568,6 +568,12 @@ Directory operators **may** periodically commit their `rootHash` to an external 
 
 CGP does **not** require this; it is an optional hardening.
 
+### 4.4 Operator resource admission and handle leases
+
+Public keys establish cryptographic continuity, not uniqueness of humans. Operators may apply signed-account, network and aggregate request/storage budgets and bounded work challenges. Admission failure does not change identity, membership or signed history. See [the implemented operator policy](docs/resource-admission.md).
+
+The reference and Hollow directories include operator-attested `leaseExpiresAt` and `reclaimAfter` in their Merkle leaves. Registration signatures still cover the canonical `cgp-directory-registration/2` payload. Implementations must use matching lease policy and migration anchors when participating in an exact-entry quorum. During recovery grace the old owner may renew; after reclaim the alias can bind to a new root. Reclaim never transfers the former root's profile guild, content, roles, permissions, or device authority. Persist authority/revocation pins independently of replaceable aliases. Clients must reject expired attestations and preserve identity-keyed history when accepting an authenticated alias change.
+
 ---
 
 ## 5. Wire protocol (relays)

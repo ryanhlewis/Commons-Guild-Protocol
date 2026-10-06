@@ -69,7 +69,20 @@ one signed proposal vote per guild head and appends only after collecting the fi
 number of trusted member signatures. `PUBLISH_BATCH` is disabled while this mode is
 active because an unvoted batch would bypass the fence.
 
-An application event may request a portable durable proof by placing the
+Every new append with write quorum enabled now carries a portable certificate.
+Replication and peer catch-up require a valid certificate for the exact configured
+epoch, members and threshold before authority pins or guild state can change.
+Direct plugin bulk append is disabled in this mode, like `PUBLISH_BATCH`; plugins
+must use sequenced publishing. No-quorum deployments retain their existing behavior.
+
+Compatibility boundary: previously stored uncertified quorum logs are not silently
+certified or accepted by a fresh quorum peer. Operators must retain a separately
+verified checkpoint/archive and plan an explicit migration; this change does not
+implement epoch transitions or lower the vote threshold. Existing device-authority
+current-generation/revocation checks remain in force during catch-up, even though
+portable signature proof uses the event time.
+
+An application event may additionally demand a specific portable proof policy by placing the
 relay's exact `cgp/write-quorum/1` policy in its top-level `certifier` field.
 The relay rejects a mismatched policy or an unavailable quorum and attaches a
 `cgp/write-certificate/1` to the committed event. The certificate binds the
@@ -121,10 +134,12 @@ CGP_RELAY_PUBSUB_MODE='redundant'
 The default multi-URL mode remains sharded. Redundant mode publishes and subscribes
 on every configured hub, deduplicating at the relay event/proposal layer.
 
-Treat a membership change as an explicit epoch migration. Bring up the new stable
-keys and pubsub paths first, then deploy the same new epoch configuration to the
-whole relay set. Never independently edit a member list in place: mismatched epochs
-fail closed and can make the write quorum unavailable.
+Live relay membership/epoch migration is not implemented. The configuration is
+a fixed startup policy, not an authenticated transition. Do not rotate member lists
+or epochs as a recovery shortcut: peers enforce the exact configured certificate
+policy and cannot silently reinterpret old history under new voters. Preserve the
+old policy, signed history and vote fences. See `relay-epoch-transition-design.md`
+for required transition invariants and the explicit implementation boundary.
 
 ## SLO Baseline
 
@@ -262,3 +277,86 @@ The maintained Cloudflare target lives in `packages/relay-cloudflare`. It is
 separate from the Node relay so Worker compatibility constraints do not affect
 the normal relay's `ws`/LevelDB/plugin hot path. Use Durable Object SQLite by
 default, or configure D1 when an operator wants a shared SQL backing store.
+
+
+## Offline whole-store recovery
+
+`backup-jsonl` and `backup-db` export event logs, not a complete voting relay.
+Hollow Tauri already provides `scripts/ops/level-backup.mjs`, an encrypted,
+authenticated, streaming full binary-keyspace snapshot/verify/restore/key-rotation
+tool. Prefer that existing tool for protected production backups; it already
+preserves voting and authority records. The new CGP tool is complementary, not a
+replacement or a claim that earlier whole-store tooling was incomplete.
+
+For a **stopped** node, `backup-store` preserves the complete CGP UTF-8 string
+keyspace (and rejects non-UTF-8 binary records rather than corrupting them), including
+write-vote fences, sequencer terms/votes, device-authority pins, derived indexes,
+and records unknown to the current tooling:
+
+```powershell
+npm run ops:relay -- backup-store --db C:/hollow/relay-db --output D:/hollow-backups/store-20260928.json
+npm run ops:relay -- restore-store --db C:/hollow/restore-candidate --input D:/hollow-backups/store-20260928.json --expected-sha256 <externally-retained-digest> --expected-source C:/hollow/relay-db
+```
+
+Retain the digest and exact source identity outside the archive. A digest stored
+only beside an untrusted replacement archive does not authenticate that archive.
+Restore requires a new, distinct target and verifies all records. An interrupted
+restore retains `RESTORE-INCOMPLETE`; relay startup refuses this target. Preserve
+it for diagnosis rather than removing the marker to force startup. The bounded
+snapshot format currently supports at most 256 MiB encoded JSON; larger stores
+need a reviewed physical/streaming snapshot implementation.
+
+This is a full **database** snapshot, not a full machine/community-media backup.
+Back up stable relay keys, exact quorum/sequencer configuration, plugin configuration,
+media blocks and any application recovery material through their separate protected
+procedures. A stale snapshot must never resume voting with the original identity:
+it may omit a later persisted vote and permit a second vote at the same head.
+The original node must be fenced, and the snapshot must be taken after its final
+acknowledged write/vote, or recovery requires a separately reviewed membership
+transition. No automatic promotion of stale backups is provided.
+
+JSONL restore now preflights the complete header, guild boundaries, event scope,
+chain/signatures, declared head/count and footer before creating or changing the
+destination. Delegated signatures are checked at their signed event time. This
+archive check does not override current device revocation pins on a live relay.
+
+The standard relay entrypoint now accepts `CGP_RELAY_PUBSUB_AUTH_TOKEN` for
+single, sharded and redundant WebSocket pubsub adapters. Existing
+`CGP_PUBSUB_TOKEN` fallback remains supported; authenticated pubsub was already
+possible through that legacy variable. CLI subprocess tests exercise all three
+modes against token-protected loopback hubs with a deliberately wrong legacy token.
+
+The CGP snapshot binds the normalized absolute source path using the host platform's
+path rules. This format currently targets same-platform restore with that exact
+source identity; it is not a cross-OS path translation mechanism. For portable
+binary-keyspace encrypted snapshots, use the existing Tauri operations tool.
+
+
+JSONL imports consume a validated private temporary copy, so replacing the caller's
+input path after preflight does not change imported bytes. This prevents that
+preflight/import race; it does not make merges into an existing divergent store
+transactional. Preserve existing stores and prefer fresh targets. The JSONL footer
+is a structural completeness check, not an authenticated external canonical head.
+Use an independently trusted head or an authenticated encrypted whole-store backup
+when restoring authoritative state.
+
+### Retrying writes after quorum loss
+
+A timeout is not proof that no relay voted. Preserve and retry the exact signed
+publication, including its timestamp, client event ID and device authorization.
+Generating a new signature/timestamp for the same application operation can
+conflict with a persisted vote fence. Witnesses revalidate and rebroadcast votes
+for exact retries; they never clear fences for competing proposals. Certificates
+permit a vote later than the signed creation time, so an outage longer than five
+minutes does not itself invalidate an otherwise valid proof. Live authorization
+and live vote freshness checks remain in force.
+
+Sequencer deadlines discard only unissued local queued requests; issued proposals
+retain their slot when quorum is unavailable. The local integration regression
+isolates all three sequencer-enabled relays, rejects three distinct requests,
+heals transport, and commits a fresh broadcast with identical converged history.
+This covers unissued requests, not arbitrary conflicts among already-issued votes.
+If an issued proposal is lost by its client, durable fences store its hash rather
+than the recoverable signed payload. Automatic recovery from such partial-vote
+conflicts still requires a reviewed consensus recovery protocol. Neither timeout
+deletion nor reducing the quorum is safe.

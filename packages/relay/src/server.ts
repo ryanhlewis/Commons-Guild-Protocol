@@ -1,3 +1,4 @@
+import {traceAsyncPhase} from './async_phase_trace.js';
 import { WebSocketServer, WebSocket, RawData } from "ws";
 import { createServer, IncomingMessage, ServerResponse } from "http";
 import { createReadStream } from "fs";
@@ -55,6 +56,8 @@ import {
   type DeviceAuthorization,
 } from "@cgp/core";
 import { LevelStore } from "./store_level";
+import { RelayConsensusService, type RelayConsensusConfig } from './consensus_service';
+import { verifyConsensusHistory, type ConsensusValue, type LegacyConsensusMigrationRequest, type ConsensusHistory } from '@cgp/core';
 import {
   HistoryQuery,
   MemberPageQuery,
@@ -447,6 +450,7 @@ export interface RelayServerOptions {
   fanoutDrainDelayMs?: number;
   instanceId?: string;
   relayPrivateKeyHex?: string;
+  consensusV2?: RelayConsensusConfig;
   pubSubAdapter?: RelayPubSubAdapter;
   writeQuorum?: RelayWriteQuorumConfig | false;
   sequencerConsensus?: RelaySequencerConsensusConfig | false;
@@ -1360,6 +1364,8 @@ export class RelayServer {
   private plugins: RelayPlugin[];
   private pluginCtx: RelayPluginContext;
   private pluginsReady: Promise<void>;
+  private pluginsInitializationCompleted = false;
+  private pluginsInitializationFailed = false;
   private subscriptions = new Map<WebSocket, Map<string, Subscription>>();
   private realtimeSubscriptions = new Map<
     WebSocket,
@@ -1449,11 +1455,13 @@ export class RelayServer {
     unavailable: true,
   };
   private storageEstimatePromise?: Promise<RelayStorageStatus>;
+  private storageEstimateCompleted = false;
   private storageUnestimatedWrittenBytes = 0;
 
   private pruneTimer: NodeJS.Timeout;
   private checkpointTimer?: NodeJS.Timeout;
   private keyPair: { publicKey: string; privateKey: Uint8Array };
+  private consensusV2?: RelayConsensusService;
   private recentPublishAcks = new Map<string, PublishReplayEntry>();
   private recentPublishProofs = new Map<string, PublishProofEntry>();
   private recentKnownEventIds = new Map<string, number>();
@@ -1653,6 +1661,54 @@ export class RelayServer {
       publicKey: getPublicKey(privateKey),
     };
     console.log(`Relay started with public key: ${this.keyPair.publicKey}`);
+    if (options.consensusV2) {
+      if (!this.store.getConsensusState || !this.store.putConsensusState) throw Error('Consensus v2 requires atomic durable state storage');
+      this.consensusV2 = new RelayConsensusService(options.consensusV2, this.keyPair, {
+        getConsensusState: guildId => this.store.getConsensusState!(guildId),
+        putConsensusState: (guildId, state) => this.store.putConsensusState!(guildId, state),
+      }, guildId => ({
+        validateEvent: async (event, prefix, mode) => {
+          try {
+            // Plugin policy bypasses and relay-generated checkpoints require separate
+            // protocol support; they cannot bypass normal v2 event authorization.
+            if (event.body.type === 'CHECKPOINT' || (event.body as any).certifier !== undefined) return false;
+            if (!Number.isFinite(event.createdAt)) return false;
+            const authorities = new DeviceAuthorityRegistry();
+            for (const item of [...prefix, event]) {
+              const verified = authorities.verify({ body: item.body, author: item.author, createdAt: item.createdAt },
+                item.signature, item.author, item.deviceAuthorization, 'publish', item.createdAt);
+              if (!verified.ok) return false;
+            }
+            if (prefix.length) validateEvent(rebuildStateFromEvents(prefix).state, event, { now: event.createdAt });
+            else if (event.body.type !== 'GUILD_CREATE' ||
+                (!this.consensusV2!.config.legacyTrust?.[guildId] && !this.consensusV2!.config.guilds[guildId].administrators.includes(event.author))) return false;
+            if (mode === 'accept') {
+              if (event.createdAt > Date.now() + 300_000) return false;
+              const verified = await this.verifyAccountAuthorization({ body: event.body, author: event.author, createdAt: event.createdAt },
+                event.signature, event.author, event.deviceAuthorization, 'publish');
+              if (!verified.ok) return false;
+            }
+            return true;
+          } catch { return false; }
+        },
+        materialize: async events => {
+          await this.withGuildMutex(guildId, async () => {
+            const existing = await this.store.getLog(guildId);
+            if (existing.length > events.length || existing.some((event, index) => event.id !== events[index]?.id)) {
+              throw Error('Existing app log requires a verified migration bridge; refusing overwrite');
+            }
+            for (const event of events.slice(existing.length)) {
+              await this.store.append(guildId, event);
+              this.broadcast(guildId, event);
+            }
+            this.stateCache.delete(guildId);
+            this.checkpointCache.delete(guildId);
+            this.deviceAuthorityHydrations.delete(guildId);
+            await this.hydrateDeviceAuthorities(guildId);
+          });
+        },
+      }));
+    }
 
     const writeQuorumConfig =
       options.writeQuorum === false
@@ -1676,6 +1732,11 @@ export class RelayServer {
           getWriteVoteFence: (key) => this.store.getWriteVoteFence!(key),
           putWriteVoteFence: (key, proposalId) =>
             this.store.putWriteVoteFence!(key, proposalId),
+          getLegacyConsensusFreeze: guildId => this.store.getLegacyConsensusFreeze?.(guildId),
+          putLegacyConsensusFreeze: async (guildId, record) => {
+            if (!this.store.putLegacyConsensusFreeze) throw Error('Durable legacy retirement storage required');
+            await this.store.putLegacyConsensusFreeze(guildId, record);
+          },
         },
         {
           publish: (vote) =>
@@ -1859,10 +1920,14 @@ export class RelayServer {
         return await this.store.getLog(guildId);
       },
       getState: async (guildId: GuildId) => {
-        return (await this.rebuildGuildState(guildId))?.state ?? null;
+        return (await traceAsyncPhase('rebuildGuildState',()=>this.rebuildGuildState(guildId),value=>{
+          if(value.state!=='complete'||value.durationMs>=1000)console.info('[relay] plugin state phase',JSON.stringify(value));
+        }))?.state ?? null;
       },
     };
-    this.pluginsReady = this.initPlugins();
+    this.pluginsReady = this.initPlugins().then(() => {
+      this.pluginsInitializationCompleted = true;
+    });
 
     this.wss.on("connection", (socket) => this.attachClientSocket(socket));
 
@@ -2118,7 +2183,7 @@ export class RelayServer {
     );
     res.setHeader(
       "Access-Control-Allow-Headers",
-      "Authorization, Content-Type",
+      "Authorization, Content-Type, Range, If-Range",
     );
     res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
     if (req.method === "OPTIONS") {
@@ -2128,11 +2193,11 @@ export class RelayServer {
     }
     const rawUrl = req.url || "/";
     const pathname = rawUrl.split("?")[0] || "/";
-    await this.pluginsReady;
-
     if (await this.handleOpsHttp(req, res, pathname)) {
       return;
     }
+
+    await this.pluginsReady;
 
     if (await this.handlePluginHttp(req, res, rawUrl, pathname)) {
       return;
@@ -2170,7 +2235,10 @@ export class RelayServer {
     }
 
     if (pathname === "/metrics") {
-      await this.refreshStorageStatus(true);
+      // Metrics must not make a scrape wait for a full store walk. Refresh in
+      // the background; writes use the initial quota baseline plus incremental
+      // accounting while later estimates run.
+      void this.refreshStorageStatus(false).catch(() => undefined);
       const body = this.renderPrometheusMetrics();
       res.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
       res.statusCode = 200;
@@ -2182,10 +2250,18 @@ export class RelayServer {
       return true;
     }
 
-    const storage = await this.refreshStorageStatus(true);
+    // Health endpoints report the latest cached estimate and never wait on a
+    // filesystem walk. The first readiness response stays not-ready until an
+    // estimate completes; stale estimates refresh in the background. Write
+    // admission continues to enforce the hard limit before accepting writes.
+    const storage = this.storageStatus;
+    const storageEstimateUnknown = !this.storageEstimateCompleted;
+    if (pathname === "/readyz") {
+      void this.refreshStorageStatus(false).catch(() => undefined);
+    }
     const pubSubReady = !this.pubSubAdapter || this.pubSubAdapter.isReady?.() !== false;
     const ready =
-      !this.closing && this.httpServer.listening && !storage.overSoftLimit && pubSubReady;
+      !this.closing && this.httpServer.listening && this.pluginsInitializationCompleted && !this.pluginsInitializationFailed && !storageEstimateUnknown && !storage.unavailable && !storage.overSoftLimit && pubSubReady;
     const payload = {
       ok: pathname === "/healthz" ? true : ready,
       status: pathname === "/healthz" ? "ok" : ready ? "ready" : "not_ready",
@@ -2207,8 +2283,13 @@ export class RelayServer {
         overSoftLimit: storage.overSoftLimit,
         overHardLimit: storage.overHardLimit,
         unavailable: storage.unavailable,
+        unknown: storageEstimateUnknown,
+        checkedAt: this.storageEstimateCompleted ? storage.checkedAt : null,
+        ageMs: this.storageEstimateCompleted ? Math.max(0, Date.now() - storage.checkedAt) : null,
+        stale: this.storageEstimateCompleted && Date.now() - storage.checkedAt >= this.storagePolicy.estimateIntervalMs,
       },
       closing: this.closing,
+      pluginsReady: this.pluginsInitializationCompleted && !this.pluginsInitializationFailed,
     };
     res.setHeader("Content-Type", "application/json; charset=utf-8");
     res.statusCode = payload.ok ? 200 : 503;
@@ -2275,10 +2356,11 @@ export class RelayServer {
   ): Promise<RelayStorageStatus> {
     if (!this.store.estimateStorage) {
       this.storageStatus = this.emptyStorageStatus();
+      this.storageEstimateCompleted = true;
       return this.storageStatus;
     }
     const now = Date.now();
-    const stale =
+    const stale = !this.storageEstimateCompleted ||
       now - (this.storageStatus.checkedAt || 0) >=
       this.storagePolicy.estimateIntervalMs;
     if (!force && !stale) {
@@ -2288,13 +2370,22 @@ export class RelayServer {
       return this.storageEstimatePromise;
     }
 
+    const writtenBytesAtStart = this.storageUnestimatedWrittenBytes;
     this.storageEstimatePromise = Promise.resolve(this.store.estimateStorage())
       .then((estimate) => {
+        this.storageEstimateCompleted = true;
         this.storageStatus = this.storageStatusFromEstimate(estimate);
-        this.storageUnestimatedWrittenBytes = 0;
+        // Keep write estimates accumulated while this walk was in flight. Some
+        // may already be reflected by the walk, so this can overcount, but it
+        // cannot make a hard-limit decision underestimate accepted writes.
+        this.storageUnestimatedWrittenBytes = Math.max(
+          0,
+          this.storageUnestimatedWrittenBytes - writtenBytesAtStart,
+        );
         return this.storageStatus;
       })
       .catch((error: any) => {
+        this.storageEstimateCompleted = true;
         this.storageStatus = this.storageStatusFromEstimate({
           bytes: this.storageStatus.bytes,
           files: this.storageStatus.files,
@@ -2323,7 +2414,21 @@ export class RelayServer {
     if (hardLimitBytes <= 0) {
       return { ok: true };
     }
-    const storage = await this.refreshStorageStatus(false);
+    let storage = this.storageStatus;
+    if (!this.storageEstimateCompleted) {
+      // The initial estimate establishes the quota baseline. Later refreshes
+      // run in the background; accepted writes are charged incrementally below.
+      storage = await this.refreshStorageStatus(false);
+    } else {
+      void this.refreshStorageStatus(false).catch(() => undefined);
+    }
+    if (storage.unavailable) {
+      return {
+        ok: false,
+        storage,
+        message: "Relay storage usage could not be verified; write rejected.",
+      };
+    }
     const projectedTotal =
       storage.bytes +
       this.storageUnestimatedWrittenBytes +
@@ -2411,6 +2516,18 @@ export class RelayServer {
       "cgp_relay_head_conflict_guilds",
       this.relayHeadConflicts.size,
       "Guilds with relay-head conflict evidence.",
+    );
+    metric(
+      "cgp_relay_storage_estimate_unknown",
+      this.storageEstimateCompleted ? 0 : 1,
+      "Whether the relay has completed its initial storage estimate.",
+    );
+    metric(
+      "cgp_relay_storage_estimate_age_seconds",
+      this.storageEstimateCompleted
+        ? Math.max(0, Date.now() - this.storageStatus.checkedAt) / 1000
+        : 0,
+      "Age of the cached relay storage estimate in seconds.",
     );
     metric(
       "cgp_relay_storage_used_bytes",
@@ -2662,8 +2779,9 @@ export class RelayServer {
   private async initPlugins() {
     for (const plugin of this.plugins) {
       try {
-        await plugin.onInit?.(this.pluginCtx);
+        await traceAsyncPhase('onInit',()=>plugin.onInit?.(this.pluginCtx),value=>{if(value.state==='complete'&&value.durationMs<1000)return;console.info('[relay-plugin-init] plugin='+plugin.name+' phase='+value.phase+' state='+value.state+' durationMs='+value.durationMs);});
       } catch (e: any) {
+        this.pluginsInitializationFailed = true;
         console.error(`Relay plugin ${plugin.name} failed to init:`, e);
       }
     }
@@ -2679,14 +2797,17 @@ export class RelayServer {
       this.keyPair.privateKey,
       hashObject(unsignedForSig),
     );
-    const fullEvent = await this.appendSequencedEvent({
+    const reportPhase=(value:{phase:string;state:string;durationMs:number})=>{
+      if(value.state!=='complete'||value.durationMs>=1000)console.info('[relay] authoritative publish phase',JSON.stringify({eventType:body.type,...value}));
+    };
+    const fullEvent = await traceAsyncPhase('appendSequencedEvent',()=>this.appendSequencedEvent({
       body,
       author,
       signature,
       createdAt,
-    });
+    }),reportPhase);
     if (fullEvent) {
-      await this.runOnEventAppended(fullEvent);
+      await traceAsyncPhase('appendHooks',()=>this.runOnEventAppended(fullEvent),reportPhase);
     }
     return fullEvent;
   }
@@ -2695,6 +2816,10 @@ export class RelayServer {
     events: GuildEvent[],
     options: { broadcast?: boolean; runHooks?: boolean } = {},
   ): Promise<GuildEvent[]> {
+    if (events.some(event => this.consensusV2?.has(event?.body?.guildId))) throw Error('Consensus guilds require certified v2 ingress');
+    if (this.writeQuorumCoordinator) {
+      throw new Error("Direct plugin bulk append is unavailable with write quorum; use sequenced publishing");
+    }
     const shouldBroadcast = options.broadcast !== false;
     const shouldRunHooks = options.runHooks !== false;
     const byGuild = new Map<GuildId, GuildEvent[]>();
@@ -2710,7 +2835,7 @@ export class RelayServer {
 
     const accepted: GuildEvent[] = [];
     for (const [guildId, guildEvents] of byGuild) {
-      await this.withGuildMutex(guildId, async () => {
+      await this.withLegacyGuildMutex(guildId, async () => {
         let lastEvent = await this.store.getLastEvent(guildId);
         const sequenced = guildEvents.map((event) => {
           const nextEvent: GuildEvent = {
@@ -2761,6 +2886,7 @@ export class RelayServer {
   }
 
   public async createCheckpoints() {
+    if (this.consensusV2) return;
     // A relay-local checkpoint is a valid cache optimization only for a
     // single-writer log. In a sequenced quorum guild, two witnesses would
     // otherwise append different relay-authored events at the same head.
@@ -2828,7 +2954,14 @@ export class RelayServer {
         }),
       );
 
-      await this.store.append(guildId, fullEvent);
+      const checkpointWritten = await this.withGuildMutex(guildId, async () => {
+        if (await this.store.getLegacyConsensusFreeze?.(guildId)) return false;
+        const current = await this.store.getLastEvent(guildId);
+        if (current?.id !== lastEvent.id) return false;
+        await this.store.append(guildId, fullEvent);
+        return true;
+      });
+      if (!checkpointWritten) continue;
       this.storageUnestimatedWrittenBytes +=
         this.estimatedPublishBytes(fullEvent);
       this.ensurePubSubHostedGuildReplication(guildId);
@@ -2843,6 +2976,7 @@ export class RelayServer {
   }
 
   public async prune() {
+    if (this.consensusV2) return;
     const guilds = await this.store.getGuildIds();
     const now = Date.now();
 
@@ -2891,13 +3025,18 @@ export class RelayServer {
       }
 
       if (seqsToDelete.length > 0) {
-        if (this.store.deleteEvents) {
-          await this.store.deleteEvents(guildId, seqsToDelete);
-        } else {
-          for (const seq of seqsToDelete) {
-            await this.store.deleteEvent(guildId, seq);
+        const pruned = await this.withGuildMutex(guildId, async () => {
+          if (await this.store.getLegacyConsensusFreeze?.(guildId)) return false;
+          if (this.store.deleteEvents) {
+            await this.store.deleteEvents(guildId, seqsToDelete);
+          } else {
+            for (const seq of seqsToDelete) {
+              await this.store.deleteEvent(guildId, seq);
+            }
           }
-        }
+          return true;
+        });
+        if (!pruned) continue;
         this.stateCache.delete(guildId);
         this.checkpointCache.delete(guildId);
         await this.refreshStorageStatus(true);
@@ -2911,6 +3050,66 @@ export class RelayServer {
     payload: unknown,
   ) {
     if (this.closing) {
+      return;
+    }
+
+    if (['CONSENSUS_RPC', 'CONSENSUS_PUBLISH', 'CONSENSUS_HISTORY', 'CONSENSUS_FREEZE', 'CONSENSUS_IMPORT'].includes(kind)) {
+      const request = objectPayload(payload);
+      try {
+        if (!this.consensusV2) throw Error('Consensus v2 is not configured');
+        if (kind === 'CONSENSUS_RPC') {
+          this.sendFrame(socket, 'CONSENSUS_RPC_RESULT', await this.consensusV2.handleRpc(request as any));
+          return;
+        }
+        const { guildId, requestId, author, createdAt, signature, deviceAuthorization } = request;
+        if (!this.consensusV2.has(guildId) || typeof requestId !== 'string' || requestId.length > 100 ||
+            typeof author !== 'string' || typeof signature !== 'string' || typeof createdAt !== 'number' || !Number.isFinite(createdAt) ||
+            Math.abs(Date.now() - createdAt) > 300_000) throw Error('Invalid signed consensus request');
+        const authorization = await this.verifyAccountAuthorization({ protocol: 'cgp/consensus-read/2', guildId, requestId, createdAt },
+          signature, author, deviceAuthorization as DeviceAuthorization | undefined, 'read');
+        if (!authorization.ok) throw Error('Invalid consensus read authorization');
+        const coordinator = this.consensusV2.coordinator(guildId);
+        if (kind === 'CONSENSUS_FREEZE' || kind === 'CONSENSUS_IMPORT') {
+          const administrators = [...coordinator.anchor.administrators, ...(coordinator.legacyTrust?.administrators ?? [])];
+          if (!administrators.includes(author)) throw Error('Migration operator authorization required');
+          if (kind === 'CONSENSUS_FREEZE') {
+            const migration = request.migration as LegacyConsensusMigrationRequest;
+            if (migration?.guildId !== guildId) throw Error('Migration guild mismatch');
+            this.sendFrame(socket, 'CONSENSUS_FROZEN', { guildId, requestId, freeze: await this.freezeLegacyConsensus(migration) });
+          } else {
+            const imported = request.history as ConsensusHistory;
+            if (imported?.guildId !== guildId) throw Error('Migration history guild mismatch');
+            await this.importConsensusHistory(imported);
+            this.sendFrame(socket, 'CONSENSUS_RESULT', { guildId, requestId, history: await coordinator.history() });
+          }
+          return;
+        }
+        const history = await coordinator.history();
+        const checked = verifyConsensusHistory(history, guildId, coordinator.anchor, coordinator.legacyTrust);
+        if (checked.events.length ? !canReadGuild(rebuildStateFromEvents(checked.events).state, author) : !coordinator.anchor.administrators.includes(author)) {
+          throw Error('Consensus history access denied');
+        }
+        if (kind === 'CONSENSUS_PUBLISH') {
+          const gate = await this.checkStorageWriteGate(this.estimatedPublishBytes(request.value));
+          if (!gate.ok) throw Error('Relay storage limit reached');
+          const result = await this.consensusV2.propose(guildId, request.value as ConsensusValue);
+          // A selected earlier proposal may change membership; recheck before disclosure.
+          const final = verifyConsensusHistory(result, guildId, coordinator.anchor, coordinator.legacyTrust);
+          if (final.events.length && !canReadGuild(rebuildStateFromEvents(final.events).state, author)) throw Error('Consensus history access denied after commit');
+          this.sendFrame(socket, 'CONSENSUS_RESULT', { guildId, requestId, history: result });
+        } else this.sendFrame(socket, 'CONSENSUS_RESULT', { guildId, requestId, history });
+      } catch (error) {
+        this.sendFrame(socket, 'CONSENSUS_ERROR', { guildId: request.guildId, requestId: request.requestId,
+          code: 'CONSENSUS_REJECTED', message: error instanceof Error ? error.message : 'Consensus operation failed' });
+      }
+      return;
+    }
+    const consensusGuardPayload = objectPayload(payload);
+    if (this.consensusV2?.has(consensusGuardPayload.guildId) ||
+        this.consensusV2?.has((consensusGuardPayload.body as any)?.guildId)) {
+      this.sendFrame(socket, 'ERROR', { code: 'CONSENSUS_V2_REQUIRED',
+        message: 'This guild requires the explicitly anchored consensus v2 client protocol',
+        requestId: consensusGuardPayload.requestId, clientEventId: consensusGuardPayload.clientEventId });
       return;
     }
     if (this.verboseLogging) {
@@ -4021,6 +4220,7 @@ export class RelayServer {
   }
 
   private async requestPeerLogCatchup(guildId: GuildId, targetSeq?: number) {
+    if (this.consensusV2?.has(guildId)) return;
     if (this.closing || this.peerUrls.length === 0) {
       return;
     }
@@ -4337,19 +4537,35 @@ export class RelayServer {
   }
 
   private async replicatePubSubEvents(guildId: GuildId, events: GuildEvent[]) {
+    if (this.consensusV2?.has(guildId)) throw Error('Legacy replication cannot append to a consensus v2 guild');
     if (events.length === 0) {
       return [];
     }
 
     await this.hydrateDeviceAuthorities(guildId);
     const ordered = [...events].sort((left, right) => left.seq - right.seq);
-    return await this.withGuildMutex(guildId, async () => {
+    return await this.withLegacyGuildMutex(guildId, async () => {
       let lastEvent = await this.store.getLastEvent(guildId);
       let state = this.stateCache.get(guildId);
       let checkpointEvent = this.checkpointCache.get(guildId);
       const accepted: GuildEvent[] = [];
 
       for (const event of ordered) {
+        // Authenticate the durable commit before authority pins or state can change.
+        if (this.writeQuorumCoordinator) {
+          try {
+            const config = this.writeQuorumCoordinator.config;
+            const policy = normalizeRelayWriteQuorumPolicy(event.writeCertificate?.policy);
+            const expected = normalizeRelayWriteQuorumPolicy({
+              protocol: "cgp/write-quorum/1", epoch: config.epoch,
+              members: config.members, requiredVotes: config.requiredVotes,
+            });
+            if (event.body.guildId !== guildId || hashObject(policy) !== hashObject(expected) ||
+                !verifyRelayWriteCertificate(event, { expectedGuildId: guildId })) continue;
+          } catch {
+            continue;
+          }
+        }
         if (lastEvent && event.seq <= lastEvent.seq) {
           continue;
         }
@@ -6460,6 +6676,10 @@ export class RelayServer {
     for (const item of items) {
       const body = item?.body;
       const targetGuildId = body?.guildId;
+      if (this.consensusV2?.has(targetGuildId)) {
+        sendError(item, 'CONSENSUS_V2_REQUIRED', 'Guild requires certified consensus v2 ingress');
+        continue;
+      }
       if (typeof targetGuildId !== "string" || !targetGuildId.trim()) {
         sendError(item, "VALIDATION_FAILED", "Event body requires a guildId");
         continue;
@@ -6537,7 +6757,7 @@ export class RelayServer {
         continue;
       }
 
-      const groupResults = await this.withGuildMutex(
+      const groupResults = await this.withLegacyGuildMutex(
         targetGuildId,
         async () => {
           const accepted: PublishBatchResult[] = [];
@@ -6865,6 +7085,7 @@ export class RelayServer {
   }
 
   private async validateWriteQuorumProposal(proposal: RelayWriteProposal) {
+    if (this.consensusV2?.has(proposal?.guildId)) return false;
     const body = proposal?.body as EventBody;
     const guildId = proposal?.guildId;
     if (
@@ -7042,6 +7263,9 @@ export class RelayServer {
       onError?: (code: string, message: string) => void;
     } = {},
   ): Promise<GuildEvent | undefined> {
+    const tracePublishPhase=<T>(phase:string,work:()=>Promise<T>|T)=>traceAsyncPhase(phase,work,value=>{
+      if(value.state!=='complete'||value.durationMs>=1000)console.info('[relay] sequenced append phase',JSON.stringify({eventType:p.body.type,...value}));
+    });
     const {
       body,
       author,
@@ -7063,6 +7287,10 @@ export class RelayServer {
 
     if (typeof targetGuildId !== "string" || !targetGuildId.trim()) {
       sendError("VALIDATION_FAILED", "Event body requires a guildId");
+      return undefined;
+    }
+    if (this.consensusV2?.has(targetGuildId)) {
+      sendError('CONSENSUS_V2_REQUIRED', 'Guild requires certified consensus v2 ingress');
       return undefined;
     }
 
@@ -7088,9 +7316,9 @@ export class RelayServer {
       return undefined;
     }
 
-    const storageGate = await this.checkStorageWriteGate(
+    const storageGate = await tracePublishPhase('storageWriteGate',()=>this.checkStorageWriteGate(
       this.estimatedPublishBytes(body),
-    );
+    ));
     if (!storageGate.ok) {
       sendError(
         "RELAY_STORAGE_FULL",
@@ -7099,7 +7327,7 @@ export class RelayServer {
       return undefined;
     }
 
-    await this.hydrateDeviceAuthorities(targetGuildId);
+    await tracePublishPhase('hydrateDeviceAuthorities',()=>this.hydrateDeviceAuthorities(targetGuildId));
     const unsignedForSig = { body, author, createdAt };
     const verifiedAuthorization = await this.verifyAccountAuthorization(
       unsignedForSig,
@@ -7166,8 +7394,8 @@ export class RelayServer {
     let sequencingFinalized = false;
     if (this.sequencerConsensusCoordinator) {
       try {
-        await this.sequencerConsensusReady;
-        sequencingToken = await this.sequencerConsensusCoordinator.sequence({
+        await tracePublishPhase('sequencerConsensusReady',()=>this.sequencerConsensusReady);
+        sequencingToken = await tracePublishPhase('sequencerConsensusSequence',()=>this.sequencerConsensusCoordinator!.sequence({
           guildId: targetGuildId,
           body,
           author,
@@ -7175,7 +7403,7 @@ export class RelayServer {
           deviceAuthorization,
           createdAt,
           clientEventId,
-        });
+        }));
       } catch (error) {
         sendError(
           "SEQUENCER_UNAVAILABLE",
@@ -7209,7 +7437,7 @@ export class RelayServer {
     }
 
     try {
-      return await this.withGuildMutex(targetGuildId, async () => {
+      return await this.withLegacyGuildMutex(targetGuildId, async () => {
       const replay = this.lookupRecentPublishAck(targetGuildId, p);
       if (replay.kind === "mismatch") {
         sequencingFinalized = true;
@@ -7358,7 +7586,6 @@ export class RelayServer {
       }
 
       if (
-        claimedCertifier !== undefined &&
         writeProposal &&
         writeVotes &&
         this.writeQuorumCoordinator
@@ -7630,12 +7857,16 @@ export class RelayServer {
     for (const plugin of this.plugins) {
       try {
         if (plugin.onEventsAppended) {
-          await plugin.onEventsAppended({ events, socket }, this.pluginCtx);
+          await traceAsyncPhase('onEventsAppended',()=>plugin.onEventsAppended!({ events, socket }, this.pluginCtx),value=>{
+            if(value.state!=='complete'||value.durationMs>=1000)console.info('[relay] plugin append phase',JSON.stringify({plugin:plugin.name,eventCount:events.length,...value}));
+          });
           continue;
         }
         if (plugin.onEventAppended) {
           for (const event of events) {
-            await plugin.onEventAppended({ event, socket }, this.pluginCtx);
+            await traceAsyncPhase('onEventAppended',()=>plugin.onEventAppended!({ event, socket }, this.pluginCtx),value=>{
+              if(value.state!=='complete'||value.durationMs>=1000)console.info('[relay] plugin append phase',JSON.stringify({plugin:plugin.name,eventType:event.body.type,...value}));
+            });
           }
         }
       } catch (e: any) {
@@ -8944,6 +9175,29 @@ export class RelayServer {
     );
   }
 
+  private async withLegacyGuildMutex<T>(guildId: GuildId, operation: () => Promise<T>): Promise<T> {
+    return this.withGuildMutex(guildId, async () => {
+      if (this.consensusV2?.has(guildId) || await this.store.getLegacyConsensusFreeze?.(guildId)) {
+        throw Error('Legacy writes are retired for this guild');
+      }
+      return operation();
+    });
+  }
+
+  /** Operator migration API; an administrator threshold signs the exact request. */
+  public async freezeLegacyConsensus(request: LegacyConsensusMigrationRequest) {
+    const config = this.consensusV2?.config;
+    const trust = config?.legacyTrust?.[request.guildId];
+    const anchor = config?.guilds[request.guildId];
+    if (!trust || !anchor || !this.writeQuorumCoordinator) throw Error('Explicit old/new trust and legacy quorum coordinator required');
+    return this.withGuildMutex(request.guildId, () => this.writeQuorumCoordinator!.freezeGuild(request, trust, anchor, () => this.store.getLog(request.guildId)));
+  }
+
+  public async importConsensusHistory(history: ConsensusHistory) {
+    if (!this.consensusV2) throw Error('Consensus v2 is not configured');
+    await this.consensusV2.coordinator(history.guildId).sync(history);
+  }
+
   private async withGuildMutex<T>(
     guildId: GuildId,
     task: () => Promise<T>,
@@ -9028,6 +9282,7 @@ export class RelayServer {
       this.peerCatchupTimer = undefined;
     }
     clearInterval(this.pruneTimer);
+    await this.consensusV2?.close();
     if (this.checkpointTimer) {
       clearInterval(this.checkpointTimer);
     }

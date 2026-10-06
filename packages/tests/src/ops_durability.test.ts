@@ -432,6 +432,10 @@ describe("ops durability and failover", () => {
             expect(healthPayload.storage).not.toHaveProperty("error");
             expect(JSON.stringify(healthPayload)).not.toContain(baseDir);
 
+            await waitFor(async () => {
+                const response = await fetch(`http://localhost:${port}/readyz`);
+                return !(await response.json()).storage.unknown;
+            });
             const ready = await fetch(`http://localhost:${port}/readyz`);
             expect(ready.status).toBe(200);
             const readinessPayload = await ready.json();
@@ -450,6 +454,7 @@ describe("ops durability and failover", () => {
             expect(body).toContain("cgp_relay_uptime_seconds");
             expect(body).toContain("cgp_relay_websocket_clients");
             expect(body).toContain("cgp_relay_event_loop_delay_p99_seconds");
+            expect(body).toContain("cgp_relay_storage_estimate_unknown");
         } finally {
             await relay.close().catch(() => undefined);
         }
@@ -458,7 +463,9 @@ describe("ops durability and failover", () => {
     it("redacts storage paths and errors when a public readiness estimate fails", async () => {
         const privatePath = path.join(baseDir, `ops-http-error-${Date.now()}`);
         const store = new LevelStore(privatePath);
+        let estimateFinished = false;
         store.estimateStorage = async () => {
+            estimateFinished = true;
             throw new Error(`storage scan failed for ${privatePath}`);
         };
         const relay = new RelayServer(0, store, [], {
@@ -470,7 +477,10 @@ describe("ops durability and failover", () => {
             await waitFor(async () => Boolean((relay as any).httpServer.address()));
             const address = (relay as any).httpServer.address();
             const response = await fetch(`http://127.0.0.1:${address.port}/readyz`);
-            const payload = await response.json();
+            expect(response.status).toBe(503);
+            expect((await response.json()).storage.unknown).toBe(true);
+            await waitFor(async () => estimateFinished && !(await (await fetch(`http://127.0.0.1:${address.port}/readyz`)).json()).storage.unknown);
+            const payload = await (await fetch(`http://127.0.0.1:${address.port}/readyz`)).json();
 
             expect(payload.storage.unavailable).toBe(true);
             expect(payload.storage).not.toHaveProperty("path");
@@ -480,6 +490,32 @@ describe("ops durability and failover", () => {
             await relay.close().catch(() => undefined);
         }
     }, 10000);
+
+    it("liveness does not start or await storage scans while readiness and metrics remain fresh", async () => {
+        const store = new LevelStore(path.join(baseDir, `nonblocking-health-${Date.now()}`));
+        const relay = new RelayServer(0, store, [], {enableDefaultPlugins:false, listenHost:"127.0.0.1"});
+        let scans=0, release: ((value:any)=>void)|undefined;
+        try {
+            await waitFor(async()=>Boolean((relay as any).httpServer.address()));
+            store.estimateStorage=async()=>{scans++;return await new Promise<any>(resolve=>{release=resolve;});};
+            const port=(relay as any).httpServer.address().port, url=`http://127.0.0.1:${port}`;
+            const health=await fetch(url+'/healthz',{signal:AbortSignal.timeout(2000)}), initial=await health.json();
+            expect(health.status).toBe(200);expect(scans).toBe(0);
+            expect(initial.storage).toMatchObject({unknown:true,checkedAt:null,ageMs:null});
+            const ready=await fetch(url+'/readyz',{signal:AbortSignal.timeout(1000)});
+            expect(ready.status).toBe(503);
+            expect((await ready.json()).storage.unknown).toBe(true);
+            await waitFor(async()=>scans===1);
+            const live=await fetch(url+'/healthz',{signal:AbortSignal.timeout(2000)});
+            expect(live.status).toBe(200);expect(scans).toBe(1);
+            const metrics=await fetch(url+'/metrics',{signal:AbortSignal.timeout(1000)});
+            expect(metrics.status).toBe(200);expect(scans).toBe(1);
+            release!({bytes:11,files:2,checkedAt:Date.now()});
+            await waitFor(async()=>!(await (await fetch(url+'/healthz')).json()).storage.unknown);
+            const known=await (await fetch(url+'/healthz')).json();
+            expect(known.storage).toMatchObject({unknown:false,bytes:11,files:2,stale:false});expect(scans).toBe(1);
+        } finally {release?.({bytes:0,files:0,checkedAt:Date.now()});await relay.close().catch(()=>undefined);}
+    },10000);
 
     it("can bind its HTTP and WebSocket listener to loopback for tunnel-only origins", async () => {
         const relay = new RelayServer(0, new LevelStore(path.join(baseDir, `loopback-http-${Date.now()}`)), [], {
