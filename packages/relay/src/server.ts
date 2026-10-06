@@ -1364,6 +1364,8 @@ export class RelayServer {
   private plugins: RelayPlugin[];
   private pluginCtx: RelayPluginContext;
   private pluginsReady: Promise<void>;
+  private pluginsInitializationCompleted = false;
+  private pluginsInitializationFailed = false;
   private subscriptions = new Map<WebSocket, Map<string, Subscription>>();
   private realtimeSubscriptions = new Map<
     WebSocket,
@@ -1923,7 +1925,9 @@ export class RelayServer {
         }))?.state ?? null;
       },
     };
-    this.pluginsReady = this.initPlugins();
+    this.pluginsReady = this.initPlugins().then(() => {
+      this.pluginsInitializationCompleted = true;
+    });
 
     this.wss.on("connection", (socket) => this.attachClientSocket(socket));
 
@@ -2189,11 +2193,11 @@ export class RelayServer {
     }
     const rawUrl = req.url || "/";
     const pathname = rawUrl.split("?")[0] || "/";
-    await this.pluginsReady;
-
     if (await this.handleOpsHttp(req, res, pathname)) {
       return;
     }
+
+    await this.pluginsReady;
 
     if (await this.handlePluginHttp(req, res, rawUrl, pathname)) {
       return;
@@ -2257,7 +2261,7 @@ export class RelayServer {
     }
     const pubSubReady = !this.pubSubAdapter || this.pubSubAdapter.isReady?.() !== false;
     const ready =
-      !this.closing && this.httpServer.listening && !storageEstimateUnknown && !storage.unavailable && !storage.overSoftLimit && pubSubReady;
+      !this.closing && this.httpServer.listening && this.pluginsInitializationCompleted && !this.pluginsInitializationFailed && !storageEstimateUnknown && !storage.unavailable && !storage.overSoftLimit && pubSubReady;
     const payload = {
       ok: pathname === "/healthz" ? true : ready,
       status: pathname === "/healthz" ? "ok" : ready ? "ready" : "not_ready",
@@ -2285,6 +2289,7 @@ export class RelayServer {
         stale: this.storageEstimateCompleted && Date.now() - storage.checkedAt >= this.storagePolicy.estimateIntervalMs,
       },
       closing: this.closing,
+      pluginsReady: this.pluginsInitializationCompleted && !this.pluginsInitializationFailed,
     };
     res.setHeader("Content-Type", "application/json; charset=utf-8");
     res.statusCode = payload.ok ? 200 : 503;
@@ -2776,6 +2781,7 @@ export class RelayServer {
       try {
         await traceAsyncPhase('onInit',()=>plugin.onInit?.(this.pluginCtx),value=>{if(value.state==='complete'&&value.durationMs<1000)return;console.info('[relay-plugin-init] plugin='+plugin.name+' phase='+value.phase+' state='+value.state+' durationMs='+value.durationMs);});
       } catch (e: any) {
+        this.pluginsInitializationFailed = true;
         console.error(`Relay plugin ${plugin.name} failed to init:`, e);
       }
     }
