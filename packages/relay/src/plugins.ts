@@ -15,6 +15,7 @@ import { request as httpsRequest } from "https";
 import { once } from "node:events";
 import { spawn } from "node:child_process";
 import { createHash, createHmac, createSign, randomUUID, timingSafeEqual } from "crypto";
+import { isStaticShardGameWithdrawn } from "./static_shard_withdrawal.js";
 import { createReadStream, createWriteStream } from "node:fs";
 import { appendFile, mkdir, readFile, readdir, rename, rm, stat, lstat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -6627,6 +6628,7 @@ export function createStaticShardSeedPlugin(
     publisher: StaticShardPublisherProof | undefined,
     options: { requireSigned: boolean },
   ) => {
+    if (isStaticShardGameWithdrawn(gameId)) throw new AdmissionError("Game withdrawn by relay operator", 410);
     if (options.requireSigned && !publisher) {
       throw new Error(
         `Static shard upload ${gameId} requires a signed ${STATIC_SHARD_PUBLISHER_PROTOCOL} publisher proof.`,
@@ -6811,6 +6813,7 @@ export function createStaticShardSeedPlugin(
   };
 
   const rememberRelease = (release: IngestedStaticShardRelease) => {
+    if (isStaticShardGameWithdrawn(release.id)) return;
     const key = staticShardReleaseKey(release.id, release.version);
     rememberPublisher(release);
     if (!latestReleaseKeyByGameId.has(release.id)) {
@@ -8562,6 +8565,12 @@ export function createStaticShardSeedPlugin(
       }
       await initPromise;
       const action = pathSegments[1] || "status";
+      const requestedGame = action === "play" ? pathSegments[2]
+        : action === "files" && pathSegments[2] === "games" ? pathSegments[3] : "";
+      if (requestedGame && isStaticShardGameWithdrawn(decodeURIComponent(requestedGame))) {
+        sendJson(res, 410, { ok: false, error: "Game withdrawn by relay operator" });
+        return true;
+      }
       // Quotas must be restored before accepting new bytes. Catalog reads and
       // unrelated chat/voice traffic do not need to wait for filesystem scans.
       if (req.method === "POST") await restoreAdmissions;
